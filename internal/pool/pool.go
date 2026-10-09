@@ -1,0 +1,430 @@
+// Package pool tracks a fleet of inference backends and hands out
+// concurrency slots on them. When every suitable backend is full, callers
+// wait in a single FIFO line instead of piling onto an overloaded GPU.
+package pool
+
+import (
+	"container/list"
+	"context"
+	"errors"
+	"log/slog"
+	"net/url"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+)
+
+var (
+	// ErrQueueFull means too many requests are already waiting.
+	ErrQueueFull = errors.New("request queue is full")
+	// ErrNoBackend means no healthy backend can serve the request at all
+	// (wrong model, prompt too long, or everything is down), so waiting is pointless.
+	ErrNoBackend = errors.New("no healthy backend can serve this request")
+)
+
+// Backend is one inference server. Mutable fields are guarded by Pool.mu.
+type Backend struct {
+	Name             string
+	URL              *url.URL
+	Tier             string
+	MaxConcurrency   int
+	MaxContextTokens int
+	APIKey           string
+	index            int
+	models           map[string]bool
+
+	inflight   int
+	checked    bool
+	healthy    bool
+	okStreak   int
+	failStreak int
+	discovered map[string]bool
+	lastErr    string
+}
+
+// Request is what the scheduler needs to know to place a request.
+type Request struct {
+	Model        string
+	PromptTokens int
+	MaxTokens    int
+	// Preferred names the backend believed to hold this prompt's prefix in cache.
+	Preferred string
+	// Exclude lists backends that already failed this request.
+	Exclude map[string]bool
+}
+
+// Lease is a held concurrency slot. Release must be called exactly once
+// when the upstream response is finished; extra calls are ignored.
+type Lease struct {
+	Backend *Backend
+	// Affinity is true when the request went to its Preferred backend.
+	Affinity bool
+	// Waited is how long the request queued for the slot.
+	Waited time.Duration
+	pool   *Pool
+	once   sync.Once
+}
+
+func (l *Lease) Release() {
+	l.once.Do(func() {
+		p := l.pool
+		p.mu.Lock()
+		l.Backend.inflight--
+		p.dispatchLocked(false)
+		p.mu.Unlock()
+	})
+}
+
+type Options struct {
+	MaxWaiting           int
+	AffinityMaxImbalance float64
+	LargeRequestTokens   int
+	UnhealthyThreshold   int
+	HealthyThreshold     int
+	// PassiveHealth lets request failures mark a backend down. It should only
+	// be on when active checks run, otherwise a backend could never recover.
+	PassiveHealth bool
+}
+
+type Pool struct {
+	mu       sync.Mutex
+	backends []*Backend
+	byName   map[string]*Backend
+	waiters  *list.List
+	opts     Options
+	log      *slog.Logger
+}
+
+type waiter struct {
+	req   Request
+	start time.Time
+	el    *list.Element
+	ch    chan result
+}
+
+type result struct {
+	lease *Lease
+	err   error
+}
+
+func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
+	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
+	for i, cb := range backends {
+		u, err := url.Parse(cb.URL)
+		if err != nil {
+			return nil, err
+		}
+		b := &Backend{
+			Name:             cb.Name,
+			URL:              u,
+			Tier:             cb.Tier,
+			MaxConcurrency:   cb.MaxConcurrency,
+			MaxContextTokens: cb.MaxContextTokens,
+			APIKey:           cb.APIKey,
+			index:            i,
+			models:           map[string]bool{},
+			healthy:          true, // optimistic until the first check says otherwise
+		}
+		for _, m := range cb.Models {
+			b.models[m] = true
+		}
+		p.backends = append(p.backends, b)
+		p.byName[b.Name] = b
+	}
+	return p, nil
+}
+
+// Backends returns the configured backends in config order.
+func (p *Pool) Backends() []*Backend { return p.backends }
+
+// Acquire returns a slot on the best backend for req, waiting in line if
+// every suitable backend is at capacity. It gives up when ctx is done.
+func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
+	start := time.Now()
+	p.mu.Lock()
+	if p.waiters.Len() == 0 {
+		b, aff, err := p.pick(req)
+		if err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
+		if b != nil {
+			l := p.grantLocked(b, aff, start)
+			p.mu.Unlock()
+			return l, nil
+		}
+	} else if !p.servableLocked(req) {
+		p.mu.Unlock()
+		return nil, ErrNoBackend
+	}
+	if p.waiters.Len() >= p.opts.MaxWaiting {
+		p.mu.Unlock()
+		return nil, ErrQueueFull
+	}
+	w := &waiter{req: req, start: start, ch: make(chan result, 1)}
+	w.el = p.waiters.PushBack(w)
+	p.dispatchLocked(false)
+	p.mu.Unlock()
+
+	select {
+	case r := <-w.ch:
+		return r.lease, r.err
+	case <-ctx.Done():
+		p.mu.Lock()
+		if w.el != nil {
+			p.waiters.Remove(w.el)
+			w.el = nil
+			p.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		p.mu.Unlock()
+		// A slot was granted while we were giving up; hand it back.
+		if r := <-w.ch; r.lease != nil {
+			r.lease.Release()
+		}
+		return nil, ctx.Err()
+	}
+}
+
+// QueueDepth reports how many requests are waiting for a slot.
+func (p *Pool) QueueDepth() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waiters.Len()
+}
+
+func (p *Pool) grantLocked(b *Backend, affinity bool, start time.Time) *Lease {
+	b.inflight++
+	return &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p}
+}
+
+// dispatchLocked hands freed slots to waiters in arrival order. A waiter that
+// cannot use any free backend is skipped, so one request needing a big GPU
+// does not hold up small requests that fit elsewhere. With checkAll, waiters
+// are also re-checked for backends having become unservable.
+func (p *Pool) dispatchLocked(checkAll bool) {
+	for el := p.waiters.Front(); el != nil; {
+		next := el.Next()
+		if !checkAll && !p.anyFreeLocked() {
+			return
+		}
+		w := el.Value.(*waiter)
+		b, aff, err := p.pick(w.req)
+		switch {
+		case err != nil:
+			p.waiters.Remove(el)
+			w.el = nil
+			w.ch <- result{err: err}
+		case b != nil:
+			p.waiters.Remove(el)
+			w.el = nil
+			w.ch <- result{lease: p.grantLocked(b, aff, w.start)}
+		}
+		el = next
+	}
+}
+
+func (p *Pool) anyFreeLocked() bool {
+	for _, b := range p.backends {
+		if b.healthy && b.inflight < b.MaxConcurrency {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Backend) serves(model string) bool {
+	if model == "" {
+		return true
+	}
+	if len(b.models) > 0 {
+		return b.models[model]
+	}
+	if len(b.discovered) > 0 {
+		return b.discovered[model]
+	}
+	return true // unknown model list: let the backend decide
+}
+
+func (b *Backend) fits(r Request) bool {
+	return b.MaxContextTokens == 0 || r.PromptTokens+r.MaxTokens <= b.MaxContextTokens
+}
+
+func (b *Backend) utilization() float64 {
+	return float64(b.inflight) / float64(b.MaxConcurrency)
+}
+
+func (p *Pool) eligible(b *Backend, r Request) bool {
+	return b.healthy && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r)
+}
+
+func (p *Pool) servableLocked(r Request) bool {
+	for _, b := range p.backends {
+		if p.eligible(b, r) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	largeOrder = []string{config.TierHeavy, config.TierStandard, config.TierLight, config.TierReserve}
+	smallOrder = []string{config.TierLight, config.TierStandard, config.TierHeavy, config.TierReserve}
+)
+
+// pick chooses a backend with a free slot. It returns (nil, false, nil) when
+// suitable backends exist but are all full, and ErrNoBackend when none exist.
+//
+// Order of preference:
+//  1. The backend holding the prompt's prefix cache, unless it is noticeably
+//     busier than the least-loaded alternative.
+//  2. The right class of hardware for the request size: heavy nodes for big
+//     prompts, light nodes for small ones, reserve nodes only as a last resort.
+//  3. Within a class, the least utilised backend.
+func (p *Pool) pick(r Request) (*Backend, bool, error) {
+	var free []*Backend
+	servable := false
+	for _, b := range p.backends {
+		if !p.eligible(b, r) {
+			continue
+		}
+		servable = true
+		if b.inflight < b.MaxConcurrency {
+			free = append(free, b)
+		}
+	}
+	if !servable {
+		return nil, false, ErrNoBackend
+	}
+	if len(free) == 0 {
+		return nil, false, nil
+	}
+
+	minUtil := 1.0
+	for _, b := range free {
+		minUtil = min(minUtil, b.utilization())
+	}
+	if r.Preferred != "" {
+		for _, b := range free {
+			if b.Name == r.Preferred && b.utilization() <= minUtil+p.opts.AffinityMaxImbalance {
+				return b, true, nil
+			}
+		}
+	}
+
+	order := smallOrder
+	if r.PromptTokens >= p.opts.LargeRequestTokens {
+		order = largeOrder
+	}
+	for _, tier := range order {
+		var best *Backend
+		for _, b := range free {
+			if b.Tier == tier && (best == nil || better(b, best)) {
+				best = b
+			}
+		}
+		if best != nil {
+			return best, false, nil
+		}
+	}
+	return nil, false, nil // unreachable: every free backend has a known tier
+}
+
+func better(a, b *Backend) bool {
+	if ua, ub := a.utilization(), b.utilization(); ua != ub {
+		return ua < ub
+	}
+	if fa, fb := a.MaxConcurrency-a.inflight, b.MaxConcurrency-b.inflight; fa != fb {
+		return fa > fb
+	}
+	return a.index < b.index
+}
+
+// Observe records a health signal for b: from an active check or, when
+// passive is true, from a real request. Consecutive failures past the
+// threshold take it out of rotation; consecutive successes bring it back.
+func (p *Pool) Observe(b *Backend, ok, passive bool, errMsg string) {
+	if passive && !p.opts.PassiveHealth {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	was := b.healthy
+	if !ok {
+		b.lastErr = errMsg
+	}
+	switch {
+	case !b.checked && !passive:
+		b.checked = true
+		b.healthy = ok
+	case ok:
+		b.failStreak = 0
+		b.okStreak++
+		if !b.healthy && b.okStreak >= p.opts.HealthyThreshold {
+			b.healthy = true
+		}
+	default:
+		b.okStreak = 0
+		b.failStreak++
+		if b.healthy && b.failStreak >= p.opts.UnhealthyThreshold {
+			b.healthy = false
+		}
+	}
+	if b.healthy != was {
+		if b.healthy {
+			p.log.Info("backend is healthy", "backend", b.Name)
+		} else {
+			p.log.Warn("backend is unhealthy", "backend", b.Name, "error", b.lastErr)
+		}
+		p.dispatchLocked(true)
+	}
+}
+
+// SetDiscoveredModels records the models a backend reported serving.
+func (p *Pool) SetDiscoveredModels(b *Backend, models []string) {
+	set := make(map[string]bool, len(models))
+	for _, m := range models {
+		set[m] = true
+	}
+	p.mu.Lock()
+	b.discovered = set
+	p.mu.Unlock()
+}
+
+// Status is a point-in-time view of one backend.
+type Status struct {
+	Name             string   `json:"name"`
+	URL              string   `json:"url"`
+	Tier             string   `json:"tier"`
+	Healthy          bool     `json:"healthy"`
+	Inflight         int      `json:"inflight"`
+	MaxConcurrency   int      `json:"max_concurrency"`
+	MaxContextTokens int      `json:"max_context_tokens,omitempty"`
+	Models           []string `json:"models"`
+	LastError        string   `json:"last_error,omitempty"`
+}
+
+func (p *Pool) Snapshot() []Status {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]Status, 0, len(p.backends))
+	for _, b := range p.backends {
+		src := b.models
+		if len(src) == 0 {
+			src = b.discovered
+		}
+		models := make([]string, 0, len(src))
+		for m := range src {
+			models = append(models, m)
+		}
+		slices.Sort(models)
+		out = append(out, Status{
+			Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, Healthy: b.healthy,
+			Inflight: b.inflight, MaxConcurrency: b.MaxConcurrency,
+			MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
+		})
+	}
+	return out
+}

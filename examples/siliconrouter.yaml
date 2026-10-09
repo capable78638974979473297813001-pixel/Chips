@@ -1,0 +1,66 @@
+# SiliconRouter configuration reference.
+# Every setting except `backends` is optional; the values shown are the defaults.
+
+listen: ":8080"
+max_body_bytes: 16777216          # reject request bodies larger than this (16 MiB)
+
+# Protect the router with bearer keys. Leave both empty for an open router.
+auth:
+  api_keys: []
+  api_keys_env: SILICONROUTER_API_KEYS   # comma-separated keys from the environment
+
+# Your inference servers. Anything that speaks the OpenAI API works:
+# vLLM, SGLang, llama.cpp server, Ollama, TGI, LM Studio, etc.
+backends:
+  - name: h100-node-1
+    url: http://10.0.0.11:8000      # vLLM
+    tier: heavy                     # heavy | standard | light | reserve
+    max_concurrency: 64             # requests this server handles at once; the rest queue in the router
+    max_context_tokens: 131072      # skip this node for prompts that would not fit (0 = no limit)
+    models: [llama-3.1-70b]         # omit to auto-discover from GET /v1/models
+    api_key_env: H100_API_KEY       # optional bearer token sent to this backend
+
+  - name: mac-studio-2
+    url: http://10.0.0.12:11434     # Ollama
+    tier: standard
+    max_concurrency: 8
+    max_context_tokens: 32768
+
+  - name: mi300-reserve-3
+    url: http://10.0.0.13:8000      # vLLM on ROCm
+    tier: reserve                   # only used when every other node is full or down
+    max_concurrency: 32
+
+routing:
+  # Send follow-up turns of a conversation to the node that already has the
+  # earlier turns in its KV cache, so it skips recomputing them.
+  prefix_affinity: true
+  block_chars: 256                  # prefix matching granularity
+  max_blocks: 256                   # match on at most the first 64 KiB of a prompt
+  affinity_ttl: 30m                 # forget prefixes not seen for this long
+  affinity_capacity: 200000         # prefixes remembered (LRU)
+  # Give up the cache hit if the caching node is this much busier (fraction of
+  # its capacity) than the least busy alternative. Lower = more even load,
+  # higher = more cache reuse.
+  affinity_max_imbalance: 0.5
+  large_request_tokens: 2048        # prompts above this prefer heavy nodes; below, light nodes
+  chars_per_token: 4                # for size estimates; no tokenizer needed
+
+queue:
+  max_waiting: 1024                 # beyond this, answer 429 + Retry-After immediately
+  max_wait: 30s                     # how long a request may wait for a free slot
+
+retry:
+  max_attempts: 3                   # tries across different backends before giving up
+
+health:
+  disabled: false
+  path: /v1/models                  # Ollama's native /api/tags also works
+  interval: 5s
+  timeout: 2s
+  unhealthy_threshold: 3            # consecutive failures before a node is pulled
+  healthy_threshold: 2              # consecutive successes before it returns
+
+upstream:
+  dial_timeout: 5s
+  response_header_timeout: 0s       # 0 = none; non-streaming replies only send headers when generation ends

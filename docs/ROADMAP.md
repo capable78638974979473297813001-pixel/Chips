@@ -1,0 +1,66 @@
+# Roadmap
+
+## Built (v0.1)
+
+- OpenAI-compatible reverse proxy covering chat, completions and embeddings, with streaming
+- Per-backend concurrency limits and one fair FIFO queue, with 429 backpressure when the queue is full
+- Prefix-cache-aware routing (conversation stickiness), with a guard against load imbalance
+- Hardware tiers (heavy / standard / light / reserve) and context-size filtering
+- Model discovery and model-based routing across mixed engines (vLLM, Ollama, llama.cpp, ...)
+- Active and passive health checks, plus automatic retry on a different backend
+- Prometheus metrics, an admin status endpoint, API-key auth, and graceful shutdown
+- `mockllm` simulator and `srbench` load generator for demos without GPUs
+
+## Next
+
+| Feature | Why it matters |
+|---|---|
+| Real tokenizers (optional, per model) | Exact token counts for context limits and billing |
+| Per-key rate limits and quotas | Multi-team fairness; stops one team starving the others |
+| Priority classes | Interactive chat ahead of batch jobs in the queue |
+| Config hot-reload, plus backend add/remove via API | Scale the fleet without a restart |
+| Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real GPU memory pressure, not just request counts |
+| Shared routing state across router replicas (gossip or Redis) | Run the router itself highly available without losing cache affinity |
+| OpenTelemetry tracing | Per-request timing: queue, TTFT, generation |
+| Grafana dashboard | Shows the ROI story at a glance |
+
+## Research track (hard, and not promised)
+
+These came up in the original concept. They are real techniques, but they live **inside the
+inference engine** or need deep integration with it. A proxy alone cannot do them:
+
+- **Moving KV cache between servers.** Possible between engines of the same kind (e.g. vLLM with
+  LMCache, or disaggregated prefill/decode in vLLM and SGLang). Moving KV cache between different
+  vendors' hardware (NVIDIA → AMD → Apple) isn't practical, because cache layouts differ by engine,
+  model and precision. Plan: integrate with LMCache/NIXL-based setups instead of reinventing them.
+- **Prefill/decode split** (prefill on one node, decode on another). Same answer: orchestrate the
+  engines that support it, and route the two phases to the right pools.
+- **Speculative decoding.** It needs the draft and target models in the same engine, sharing
+  tokenizers and running tight verification loops. vLLM and SGLang already support it. The router's
+  role is to send traffic to backends configured for it, not to run a draft model itself.
+
+Keeping this list honest matters when selling to infrastructure engineers. They will test every
+claim.
+
+## Open core: what's free vs. paid
+
+**Free (Apache 2.0): everything a single team needs to run in production.** Everything in "Built"
+above stays free. This is what gets developers to adopt it.
+
+**SiliconRouter Enterprise (commercial license):**
+
+- Multi-replica HA router with shared affinity state
+- SSO/OIDC, per-team keys, quotas, chargeback reports and audit logs
+- Policy controls: data residency rules, model allow-lists, PII redaction hooks
+- KV-aware routing using live engine telemetry, plus LMCache/disaggregated-serving orchestration
+- Management UI and fleet dashboards
+- Support SLA and long-term support releases
+
+**Services:** cluster design and tuning engagements, and benchmark-backed ROI reports on the
+customer's own hardware.
+
+**Go-to-market sequence:**
+
+1. Publish benchmarks from real hardware: `srbench` on vLLM with an open model, router on vs. off.
+2. Write integration guides for vLLM, Ollama and llama.cpp, plus a Helm chart.
+3. Sell Enterprise to the teams that are already running the free version in production.

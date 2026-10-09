@@ -1,0 +1,7 @@
+listen: ":8080"
+backends:
+  - {name: h100-node-1, url: "http://h100:9000", tier: heavy, max_concurrency: 8}
+  - {name: mac-studio-2, url: "http://mac:9000", tier: standard, max_concurrency: 4}
+  - {name: mi300-reserve-3, url: "http://mi300:9000", tier: reserve, max_concurrency: 4}
+health:
+  interval: 2s

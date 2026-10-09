@@ -1,0 +1,17 @@
+# Local demo: three mock GPU servers (see `make demo`).
+listen: ":8080"
+backends:
+  - name: h100-node-1
+    url: http://127.0.0.1:9001
+    tier: heavy
+    max_concurrency: 8
+  - name: mac-studio-2
+    url: http://127.0.0.1:9002
+    tier: standard
+    max_concurrency: 4
+  - name: mi300-reserve-3
+    url: http://127.0.0.1:9003
+    tier: reserve
+    max_concurrency: 4
+health:
+  interval: 2s

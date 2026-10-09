@@ -1,0 +1,20 @@
+# Demo cluster: SiliconRouter in front of three simulated GPU servers.
+#   docker compose -f deploy/docker-compose.yaml up --build
+#   curl localhost:8080/admin/backends
+services:
+  router:
+    build: ..
+    command: ["-config", "/etc/siliconrouter/demo.yaml"]
+    volumes:
+      - ./demo-compose.yaml:/etc/siliconrouter/demo.yaml:ro
+    ports: ["8080:8080"]
+    depends_on: [h100, mac, mi300]
+  h100:
+    build: ..
+    entrypoint: ["/usr/local/bin/mockllm", "-addr", ":9000", "-name", "h100", "-prefill-tps", "3000", "-decode-tps", "400", "-max-concurrency", "8"]
+  mac:
+    build: ..
+    entrypoint: ["/usr/local/bin/mockllm", "-addr", ":9000", "-name", "mac-studio", "-prefill-tps", "1500", "-decode-tps", "200", "-max-concurrency", "4"]
+  mi300:
+    build: ..
+    entrypoint: ["/usr/local/bin/mockllm", "-addr", ":9000", "-name", "mi300", "-prefill-tps", "2000", "-decode-tps", "300", "-max-concurrency", "4"]
