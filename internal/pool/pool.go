@@ -9,8 +9,10 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,8 @@ type Backend struct {
 	MaxConcurrency   int
 	MaxContextTokens int
 	APIKey           string
+	APIKeyHeader     string
+	HealthPath       string
 	// AgentURL is the chipagent on this backend's machine, or nil.
 	AgentURL *url.URL
 	// AutoTier means Tier comes from the hardware chipagent reports.
@@ -144,6 +148,8 @@ func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, erro
 			MaxConcurrency:   cb.MaxConcurrency,
 			MaxContextTokens: cb.MaxContextTokens,
 			APIKey:           cb.APIKey,
+			APIKeyHeader:     cb.APIKeyHeader,
+			HealthPath:       cb.HealthPath,
 			AgentURL:         agent,
 			index:            i,
 			models:           map[string]bool{},
@@ -259,6 +265,17 @@ func (p *Pool) anyFreeLocked() bool {
 		}
 	}
 	return false
+}
+
+// SetAuth adds this backend's credentials to an outgoing request.
+func (b *Backend) SetAuth(h http.Header) {
+	switch {
+	case b.APIKey == "":
+	case b.APIKeyHeader == "" || strings.EqualFold(b.APIKeyHeader, "Authorization"):
+		h.Set("Authorization", "Bearer "+b.APIKey)
+	default:
+		h.Set(b.APIKeyHeader, b.APIKey)
+	}
 }
 
 func (b *Backend) serves(model string) bool {
@@ -458,7 +475,7 @@ func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
 	}
 	if tier := p.opts.Tiers.Tier(r); tier != b.Tier {
 		p.log.Info("backend tier set from hardware", "backend", b.Name, "tier", tier, "was", b.Tier,
-			"vendors", r.Vendors(), "accelerators", len(r.Devices), "memory_gib", r.MemoryTotal()>>30)
+			"vendors", r.Vendors(), "accelerators", len(r.Accelerators()), "memory_gib", r.MemoryTotal()>>30)
 		b.Tier = tier
 	}
 }
@@ -466,6 +483,7 @@ func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
 // HardwareStatus summarizes what chipagent reported for a backend.
 type HardwareStatus struct {
 	Hostname           string            `json:"hostname,omitempty"`
+	Host               *hardware.Host    `json:"host,omitempty"`
 	Vendors            []string          `json:"vendors"`
 	Accelerators       int               `json:"accelerators"`
 	MemoryTotalBytes   uint64            `json:"memory_total_bytes"`
@@ -487,8 +505,11 @@ func (b *Backend) hardwareStatus() *HardwareStatus {
 		return hs
 	}
 	hs.Hostname = b.hw.Hostname
-	hs.Vendors = b.hw.Vendors()
-	hs.Accelerators = len(b.hw.Devices)
+	hs.Host = b.hw.Host
+	if v := b.hw.Vendors(); v != nil {
+		hs.Vendors = v
+	}
+	hs.Accelerators = len(b.hw.Accelerators())
 	hs.MemoryTotalBytes = b.hw.MemoryTotal()
 	hs.MemoryUsedBytes = b.hw.MemoryUsed()
 	if u, ok := b.gpuBusy(); ok {

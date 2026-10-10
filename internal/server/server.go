@@ -78,17 +78,23 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			emit(boolFloat(st.Healthy), st.Name, st.Tier)
 		}
 	})
-	reg.NewGaugeFunc("siliconrouter_backend_accelerators", "Accelerators chipagent reports per backend, by vendor.", []string{"backend", "vendor"}, func(emit func(float64, ...string)) {
+	reg.NewGaugeFunc("siliconrouter_backend_accelerators", "Devices chipagent reports per backend, by vendor and kind (gpu, npu, accelerator, display).", []string{"backend", "vendor", "kind"}, func(emit func(float64, ...string)) {
 		for _, st := range p.Snapshot() {
 			if st.Hardware == nil {
 				continue
 			}
-			count := map[string]int{}
+			type key struct{ vendor, kind string }
+			count := map[key]int{}
+			var keys []key
 			for _, d := range st.Hardware.Devices {
-				count[d.Vendor]++
+				k := key{d.Vendor, d.Kind}
+				if count[k] == 0 {
+					keys = append(keys, k)
+				}
+				count[k]++
 			}
-			for _, v := range st.Hardware.Vendors {
-				emit(float64(count[v]), st.Name, v)
+			for _, k := range keys {
+				emit(float64(count[k]), st.Name, k.vendor, k.kind)
 			}
 		}
 	})
@@ -122,7 +128,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	})
 	s.mux.Handle("GET /admin/backends", s.requireAuth(http.HandlerFunc(s.handleBackends)))
 	s.mux.Handle("GET /v1/models", s.requireAuth(http.HandlerFunc(s.handleModels)))
-	s.mux.Handle("POST /v1/", s.requireAuth(http.HandlerFunc(s.handleInference)))
+	// Everything else is forwarded, so any HTTP inference API works: OpenAI,
+	// Anthropic, Ollama, TGI, Triton/KServe, Gemini-style, or a custom one.
+	s.mux.Handle("/", s.requireAuth(http.HandlerFunc(s.handleInference)))
 	return s
 }
 
@@ -133,8 +141,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if ok {
+		if got := clientKey(r.Header); got != "" {
 			for _, k := range s.cfg.Auth.APIKeys {
 				if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
 					next.ServeHTTP(w, r)
@@ -145,6 +152,20 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		s.rejected.Inc("unauthorized")
 		writeError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 	})
+}
+
+// clientKeyHeaders carry a caller's API key: OpenAI-style bearer tokens,
+// Anthropic's x-api-key and Azure OpenAI's api-key.
+var clientKeyHeaders = []string{"Authorization", "X-Api-Key", "Api-Key"}
+
+func clientKey(h http.Header) string {
+	if k, ok := strings.CutPrefix(h.Get("Authorization"), "Bearer "); ok {
+		return k
+	}
+	if k := h.Get("X-Api-Key"); k != "" {
+		return k
+	}
+	return h.Get("Api-Key")
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
@@ -204,12 +225,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "could not read request body")
 		return
 	}
-	info, err := prompt.Parse(body)
-	if err != nil {
-		s.rejected.Inc("bad_request")
-		writeError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object: "+err.Error())
-		return
-	}
+	info := prompt.Inspect(r.URL.Path, r.Header.Get("Content-Type"), body)
 
 	rc := s.cfg.Routing
 	req := pool.Request{
@@ -361,12 +377,12 @@ func (s *Server) forward(r *http.Request, b *pool.Backend, body []byte) (*http.R
 		out.Header.Del(h)
 	}
 	out.Header.Del(SessionHeader)
-	switch {
-	case b.APIKey != "":
-		out.Header.Set("Authorization", "Bearer "+b.APIKey)
-	case len(s.cfg.Auth.APIKeys) > 0:
-		out.Header.Del("Authorization") // the router's key is not the backend's
+	if len(s.cfg.Auth.APIKeys) > 0 {
+		for _, h := range clientKeyHeaders {
+			out.Header.Del(h) // the router's key is not the backend's
+		}
 	}
+	b.SetAuth(out.Header)
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
 			ip = prior + ", " + ip

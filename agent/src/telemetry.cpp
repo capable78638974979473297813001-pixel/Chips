@@ -49,15 +49,23 @@ std::string Num(const std::optional<double>& v) {
 
 }  // namespace
 
-std::string RenderTelemetry(const std::vector<Device>& devices, const std::string& hostname,
+std::string RenderTelemetry(const std::vector<Device>& devices, const Host& host,
                             const std::string& version) {
   std::string out = "{\"schema\":1,\"agent\":\"chipagent\",\"version\":" + Str(version) +
-                    ",\"hostname\":" + Str(hostname) + ",\"devices\":[";
+                    ",\"hostname\":" + Str(host.hostname);
+  out += ",\"host\":{\"os\":" + Str(host.os) + ",\"arch\":" + Str(host.arch) + ",\"cpu\":" + Str(host.cpu);
+  out += ",\"logical_cpus\":" + std::to_string(host.logical_cpus);
+  out += ",\"memory_total_bytes\":" + std::to_string(host.memory_total_bytes);
+  out += ",\"memory_used_bytes\":" + std::to_string(host.memory_used_bytes);
+  out += ",\"cpu_features\":[";
+  for (size_t i = 0; i < host.cpu_features.size(); ++i) out += (i ? "," : "") + Str(host.cpu_features[i]);
+  out += "]},\"devices\":[";
   for (size_t i = 0; i < devices.size(); ++i) {
     const Device& d = devices[i];
     if (i > 0) out += ',';
     out += "{\"index\":" + std::to_string(i);
     out += ",\"vendor\":" + Str(d.vendor);
+    out += ",\"kind\":" + Str(d.kind);
     out += ",\"name\":" + Str(d.name);
     out += ",\"id\":" + Str(d.id);
     out += ",\"source\":" + Str(d.source);

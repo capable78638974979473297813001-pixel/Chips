@@ -40,8 +40,14 @@ func TestFetchGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Hostname != "gpu-node-1" || len(r.Devices) != 2 {
+	if r.Hostname != "gpu-node-1" || len(r.Devices) != 3 || len(r.Accelerators()) != 2 {
 		t.Fatalf("got %+v", r)
+	}
+	if h := r.Host; h == nil || h.Arch != "x86_64" || h.LogicalCPUs != 192 || !slices.Contains(h.CPUFeatures, "avx512_bf16") {
+		t.Errorf("host = %+v", h)
+	}
+	if r.Devices[0].Kind != KindGPU || r.Devices[2].Kind != KindDisplay {
+		t.Errorf("kinds = %q %q", r.Devices[0].Kind, r.Devices[2].Kind)
 	}
 	if got, want := r.Vendors(), []string{"amd", "nvidia"}; !slices.Equal(got, want) {
 		t.Errorf("vendors = %v, want %v", got, want)
@@ -52,7 +58,8 @@ func TestFetchGolden(t *testing.T) {
 	if got := r.MemoryUsed(); got != gib {
 		t.Errorf("memory used = %d", got)
 	}
-	// Only the H100 reports utilization; the MI300X's null must not count as 0.
+	// Only the H100 reports utilization; the MI300X's null must not count as 0,
+	// and the BMC display adapter is not an accelerator at all.
 	if u, ok := r.Utilization(); !ok || u != 35 {
 		t.Errorf("utilization = %v, %v; want 35", u, ok)
 	}
@@ -84,6 +91,9 @@ func TestTier(t *testing.T) {
 		want    string
 	}{
 		{"cpu only", nil, config.TierLight},
+		{"bmc display only", []Device{{Vendor: "aspeed", Kind: KindDisplay}}, config.TierLight},
+		{"gaudi", []Device{{Vendor: "habana", Kind: KindAccelerator}}, config.TierStandard},
+		{"chipagent 0.1 (no kind)", []Device{dev("nvidia", 80, false)}, config.TierHeavy},
 		{"h100", []Device{dev("nvidia", 80, false)}, config.TierHeavy},
 		{"mi300x", []Device{dev("amd", 192, false)}, config.TierHeavy},
 		{"3x l4 adds up", []Device{dev("nvidia", 24, false), dev("nvidia", 24, false), dev("nvidia", 24, false)}, config.TierHeavy},

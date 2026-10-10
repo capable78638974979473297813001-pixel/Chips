@@ -1,10 +1,18 @@
 // Unit tests for chipagent. No framework: each CHECK failure prints and the
 // process exits non-zero at the end.
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define close closesocket
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdlib>
@@ -40,10 +48,20 @@ static int failures = 0;
     }                                                                                     \
   } while (0)
 
+#ifndef _WIN32  // helpers for the Linux /sys and /proc fixtures
 static void Write(const fs::path& p, const std::string& content) {
   fs::create_directories(p.parent_path());
-  std::ofstream(p) << content;
+  std::ofstream(p, std::ios::binary) << content;
 }
+
+static fs::path TempDir(const std::string& tag) {
+  auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  fs::path p = fs::temp_directory_path() / ("chipagent-" + tag + "-" + std::to_string(stamp));
+  fs::remove_all(p);
+  return p;
+}
+
+#endif
 
 static std::string ReadFile(const fs::path& p) {
   std::ifstream f(p);
@@ -68,9 +86,18 @@ static void TestSimulated() {
   CHECK(!ds[0].unified_memory);
   CHECK(ds[1].unified_memory);
   CHECK(!ds[1].utilization_percent);
+  CHECK_EQ(ds[0].kind, std::string("gpu"));
+
+  auto tpu = chipagent::OpenSimulated({"google:TPU v5e:16::accelerator"}, &err);
+  CHECK(tpu != nullptr);
+  if (tpu) {
+    auto t = tpu->Devices();
+    CHECK_EQ(t[0].kind, std::string("accelerator"));
+    CHECK(!t[0].utilization_percent);
+  }
 
   for (const char* bad : {"nvidia", "nvidia:H100", ":H100:80", "nvidia:H100:lots", "nvidia:H100:-1",
-                          "nvidia:H100:80:1:2"}) {
+                          "nvidia:H100:80:1:2", "nvidia:H100:80:1:gpu:x", "google:TPU:16::quantum"}) {
     err.clear();
     CHECK(chipagent::OpenSimulated({bad}, &err) == nullptr);
     CHECK(!err.empty());
@@ -88,74 +115,202 @@ static void TestGoldenTelemetry() {
   devices[1].memory_used_bytes = 1073741824;
   devices[1].temperature_c = 48.5;
   devices[1].power_watts = 301.25;
-  std::string got = chipagent::RenderTelemetry(devices, "gpu-node-1", "0.1.0");
+  chipagent::Host host;
+  host.hostname = "gpu-node-1";
+  host.os = "linux";
+  host.arch = "x86_64";
+  host.cpu = "AMD EPYC 9654 96-Core Processor";
+  host.logical_cpus = 192;
+  host.memory_total_bytes = 1649267441664;
+  host.memory_used_bytes = 68719476736;
+  host.cpu_features = {"avx2", "avx512f", "avx512_bf16"};
+  devices.push_back(chipagent::Device{});
+  devices[2].vendor = "aspeed";
+  devices[2].kind = "display";
+  devices[2].name = "ASPEED BMC graphics [1a03:2000]";
+  devices[2].id = "0000:02:00.0";
+  devices[2].source = "sysfs";
+  std::string got = chipagent::RenderTelemetry(devices, host, "0.2.0");
   std::string want = ReadFile(fs::path(TESTDATA_DIR) / "telemetry.json");
   CHECK_EQ(got, want);
 }
 
-static void TestSysfs() {
-  fs::path root = fs::temp_directory_path() / ("chipagent-sysfs-" + std::to_string(getpid()));
-  fs::remove_all(root);
-  fs::path pci = root / "sys/devices/pci0000:00";
-  fs::path drm = root / "sys/class/drm";
-  auto card = [&](const std::string& name, const std::string& bus) {
-    fs::create_directories(pci / bus);
-    fs::create_directories(drm / name);
-    fs::create_symlink(fs::path("../../../devices/pci0000:00") / bus, drm / name / "device");
+static void TestClassifyPci() {
+  auto c = chipagent::ClassifyPci;
+  CHECK_EQ(c(0x10de, 0x2330, 0x030200).kind, std::string("gpu"));
+  CHECK_EQ(c(0x1002, 0x74a1, 0x120000).name, std::string("AMD Instinct MI300X"));
+  CHECK_EQ(c(0x8086, 0x7d1d, 0x120000).kind, std::string("npu"));            // Intel NPU
+  CHECK_EQ(c(0x1da3, 0x1020, 0x120000).vendor, std::string("habana"));       // Gaudi
+  CHECK_EQ(c(0x1d0f, 0x7064, 0x0b4000).kind, std::string("accelerator"));    // Inferentia as co-processor
+  CHECK_EQ(c(0x1d0f, 0x1111, 0x030000).kind, std::string("display"));        // EC2 VGA
+  CHECK_EQ(c(0x19e5, 0xd801, 0x120000).kind, std::string("npu"));            // Ascend
+  CHECK_EQ(c(0x19e5, 0x1711, 0x030000).kind, std::string("display"));        // Huawei BMC
+  CHECK_EQ(c(0x121a, 0x0001, 0x030000).kind, std::string("display"));        // 3dfx Voodoo, 1996
+  CHECK_EQ(c(0x12d2, 0x0018, 0x030000).kind, std::string("display"));        // Riva 128, 1997
+  CHECK_EQ(c(0x1ed5, 0x0101, 0x030200).vendor, std::string("pci-1ed5"));     // unknown maker
+  CHECK_EQ(c(0x1ed5, 0x0101, 0x030200).kind, std::string("gpu"));
+  CHECK(c(0x8086, 0x1572, 0x020000).vendor.empty());                         // a NIC
+}
+
+#ifndef _WIN32  // PCI addresses contain ':', which Windows filenames cannot
+static void TestPci() {
+  fs::path root = TempDir("pci");
+  fs::path pci = root / "sys/bus/pci/devices";
+  auto dev = [&](const std::string& bus, const char* vendor, const char* device, const char* cls) {
+    Write(pci / bus / "vendor", std::string(vendor) + "\n");
+    Write(pci / bus / "device", std::string(device) + "\n");
+    Write(pci / bus / "class", std::string(cls) + "\n");
     return pci / bus;
   };
-
-  fs::path amd = card("card1", "0000:03:00.0");
-  Write(amd / "vendor", "0x1002\n");
-  Write(amd / "device", "0x74a1\n");
+  fs::path amd = dev("0000:03:00.0", "0x1002", "0x74a1", "0x120000");
   Write(amd / "mem_info_vram_total", "206141652992\n");
   Write(amd / "mem_info_vram_used", "1073741824\n");
   Write(amd / "gpu_busy_percent", "42\n");
   Write(amd / "hwmon/hwmon3/temp1_input", "51000\n");
   Write(amd / "hwmon/hwmon3/power1_average", "350000000\n");
+  dev("0000:00:02.0", "0x8086", "0x56a0", "0x030000");  // Intel Arc
+  dev("0000:41:00.0", "0x10de", "0x2330", "0x030200");  // H100
+  dev("0000:02:00.0", "0x1a03", "0x2000", "0x030000");  // ASPEED BMC
+  dev("0000:51:00.0", "0x1da3", "0x1020", "0x120000");  // Gaudi
+  dev("0000:00:1f.6", "0x8086", "0x15bc", "0x020000");  // Ethernet: ignored
+  Write(pci / "0000:00:00.0" / "vendor", "0x8086\n");  // no class file: ignored
 
-  fs::path intel = card("card0", "0000:00:02.0");
-  Write(intel / "vendor", "0x8086\n");
-  Write(intel / "device", "0x56a0\n");
-
-  fs::path nv = card("card2", "0000:41:00.0");
-  Write(nv / "vendor", "0x10de\n");
-  Write(nv / "device", "0x2330\n");
-
-  fs::path bmc = card("card3", "0000:02:00.0");  // ASPEED display adapter
-  Write(bmc / "vendor", "0x1a03\n");
-
-  fs::create_directories(drm / "card1-DP-1");  // connectors are not devices
-  fs::create_directories(drm / "renderD128");
-
-  auto ds = chipagent::OpenSysfs(root.string(), true)->Devices();
-  CHECK_EQ(ds.size(), size_t(2));
-  if (ds.size() == 2) {
+  auto ds = chipagent::OpenPci(root.string(), true)->Devices();
+  CHECK_EQ(ds.size(), size_t(4));
+  if (ds.size() == 4) {
     CHECK_EQ(ds[0].vendor, std::string("intel"));
     CHECK_EQ(ds[0].name, std::string("Intel GPU [8086:56a0]"));
-    CHECK_EQ(ds[0].memory_total_bytes, uint64_t(0));
-    CHECK_EQ(ds[1].vendor, std::string("amd"));
-    CHECK_EQ(ds[1].name, std::string("AMD Instinct MI300X"));
-    CHECK_EQ(ds[1].id, std::string("0000:03:00.0"));
-    CHECK_EQ(ds[1].memory_total_bytes, uint64_t(206141652992));
-    CHECK_EQ(ds[1].memory_used_bytes, uint64_t(1073741824));
-    CHECK(ds[1].utilization_percent && *ds[1].utilization_percent == 42);
-    CHECK(ds[1].temperature_c && *ds[1].temperature_c == 51);
-    CHECK(ds[1].power_watts && *ds[1].power_watts == 350);
+    CHECK_EQ(ds[1].kind, std::string("display"));
+    CHECK_EQ(ds[2].vendor, std::string("amd"));
+    CHECK_EQ(ds[2].name, std::string("AMD Instinct MI300X"));
+    CHECK_EQ(ds[2].id, std::string("0000:03:00.0"));
+    CHECK_EQ(ds[2].memory_total_bytes, uint64_t(206141652992));
+    CHECK_EQ(ds[2].memory_used_bytes, uint64_t(1073741824));
+    CHECK(ds[2].utilization_percent && *ds[2].utilization_percent == 42);
+    CHECK(ds[2].temperature_c && *ds[2].temperature_c == 51);
+    CHECK(ds[2].power_watts && *ds[2].power_watts == 350);
+    CHECK_EQ(ds[3].vendor, std::string("habana"));
+    CHECK_EQ(ds[3].kind, std::string("accelerator"));
   }
 
-  // product_name wins over the built-in ID table.
+  // product_name wins over the built-in ID table; NVIDIA is listed when NVML is absent.
   Write(amd / "product_name", "AMD Instinct MI300X OAM\n");
-  ds = chipagent::OpenSysfs(root.string(), false)->Devices();
-  CHECK_EQ(ds.size(), size_t(3));
-  if (ds.size() == 3) {
-    CHECK_EQ(ds[1].name, std::string("AMD Instinct MI300X OAM"));
-    CHECK_EQ(ds[2].vendor, std::string("nvidia"));
-    CHECK_EQ(ds[2].source, std::string("sysfs"));
+  ds = chipagent::OpenPci(root.string(), false)->Devices();
+  CHECK_EQ(ds.size(), size_t(5));
+  if (ds.size() == 5) {
+    CHECK_EQ(ds[2].name, std::string("AMD Instinct MI300X OAM"));
+    CHECK_EQ(ds[3].vendor, std::string("nvidia"));
+    CHECK_EQ(ds[3].source, std::string("sysfs"));
   }
-
-  CHECK(chipagent::OpenSysfs((root / "missing").string(), true)->Devices().empty());
+  CHECK(chipagent::OpenPci((root / "missing").string(), true)->Devices().empty());
   fs::remove_all(root);
+}
+
+static void TestDeviceTree() {
+  fs::path root = TempDir("dt");
+  CHECK(chipagent::OpenDeviceTree(root.string())->Devices().empty());
+  Write(root / "proc/device-tree/compatible", std::string("nvidia,p3737-0000+p3701-0005\0nvidia,tegra234\0", 46));
+  Write(root / "proc/device-tree/model", std::string("NVIDIA Jetson AGX Orin Developer Kit\0", 37));
+  Write(root / "proc/meminfo", "MemTotal:       65536000 kB\nMemFree: 1 kB\n");
+  auto ds = chipagent::OpenDeviceTree(root.string())->Devices();
+  CHECK_EQ(ds.size(), size_t(1));
+  if (!ds.empty()) {
+    CHECK_EQ(ds[0].name, std::string("NVIDIA Jetson AGX Orin Developer Kit"));
+    CHECK(ds[0].unified_memory);
+    CHECK_EQ(ds[0].memory_total_bytes, uint64_t(65536000) * 1024);
+  }
+  fs::remove_all(root);
+}
+
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)  // ReadHost reads /proc only here; macOS uses sysctl
+static bool Has(const std::vector<std::string>& v, const std::string& x) {
+  return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+static void TestReadHostFromProc() {
+  fs::path root = TempDir("host");
+  Write(root / "proc/cpuinfo", "processor\t: 0\nmodel name\t: Test CPU\nflags\t\t: fpu avx2\n\n");
+  Write(root / "proc/meminfo", "MemTotal:       1000 kB\nMemFree:          10 kB\nMemAvailable:     400 kB\n");
+  chipagent::Host h = chipagent::ReadHost(root.string());
+  CHECK_EQ(h.cpu, std::string("Test CPU"));
+  CHECK_EQ(h.memory_total_bytes, uint64_t(1000 * 1024));
+  CHECK_EQ(h.memory_used_bytes, uint64_t(600 * 1024));
+  CHECK(Has(h.cpu_features, "avx2"));
+  fs::remove_all(root);
+}
+#endif
+
+// Real /proc/cpuinfo excerpts; every architecture names its CPU differently.
+static void TestParseCpuinfo() {
+  struct Case {
+    const char* arch;
+    const char* text;
+    const char* name;
+    std::vector<std::string> features;
+  };
+  const Case cases[] = {
+      {"x86_64",
+       "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8480+\n"
+       "flags\t\t: fpu sse2 avx avx2 fma avx512f avx512_bf16 amx_tile amx_bf16 hypervisor\n\n"
+       "processor\t: 1\nmodel name\t: Other\n",
+       "Intel(R) Xeon(R) Platinum 8480+", {"sse2", "avx", "avx2", "fma", "avx512f", "avx512_bf16", "amx_tile", "amx_bf16"}},
+      {"i686 (1999)",
+       "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Pentium III (Coppermine)\nflags\t\t: fpu mmx sse\n",
+       "Pentium III (Coppermine)", {}},
+      {"aarch64",
+       "processor\t: 0\nBogoMIPS\t: 243.75\nFeatures\t: fp asimd evtstrm aes asimddp sve i8mm bf16\n"
+       "CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0xd40\n\n",
+       "Arm Neoverse V1", {"asimd", "asimddp", "sve", "i8mm", "bf16"}},
+      {"aarch64 unknown part",
+       "processor\t: 0\nFeatures\t: fp asimd\nCPU implementer\t: 0xc0\nCPU part\t: 0xac3\n",
+       "Ampere CPU part 0xac3", {"asimd"}},
+      {"armv7 (old kernel)",
+       "Processor\t: ARMv7 Processor rev 4 (v7l)\nprocessor\t: 0\nBogoMIPS\t: 38.40\n\n"
+       "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4\nHardware\t: BCM2709\n",
+       "ARMv7 Processor rev 4 (v7l)", {"neon", "vfpv4"}},
+      {"ppc64le",
+       "processor\t: 0\ncpu\t\t: POWER9 (raw), altivec supported\nclock\t\t: 3800.000000MHz\n\n",
+       "POWER9 (raw), altivec supported", {"altivec"}},
+      {"riscv64",
+       "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdcv_zicsr_zifencei\nmmu\t\t: sv39\n"
+       "uarch\t\t: thead,c908\n\n",
+       "thead,c908", {"rvv"}},
+      {"riscv64 no uarch", "processor\t: 0\nhart\t\t: 1\nisa\t\t: rv64imafdc\n", "RISC-V rv64imafdc", {}},
+      {"s390x",
+       "vendor_id       : IBM/S390\n# processors    : 4\nfeatures\t: esan3 zarch stfle msa vx vxd vxe gs\n"
+       "processor 0: version = FF,  identification = 0B9A08,  machine = 8561\n",
+       "IBM Z (machine 8561)", {"vx", "vxe"}},
+      {"mips", "system type\t\t: MediaTek MT7621\nprocessor\t\t: 0\ncpu model\t\t: MIPS 1004Kc V2.15\n",
+       "MIPS 1004Kc V2.15", {}},
+      {"loongarch64", "system type\t\t: generic-loongson-machine\n\nprocessor\t\t: 0\nModel Name\t\t: Loongson-3A5000\n"
+       "Features\t\t: cpucfg lam ual fpu lsx lasx\n",
+       "Loongson-3A5000", {"lsx", "lasx"}},
+      {"sparc64", "cpu\t\t: UltraSparc T2 (Niagara2)\nfpu\t\t: UltraSparc T2 integrated FPU\n",
+       "UltraSparc T2 (Niagara2)", {}},
+  };
+  for (const auto& c : cases) {
+    std::string name;
+    std::vector<std::string> features;
+    chipagent::ParseCpuinfo(c.text, &name, &features);
+    if (name != c.name || features != c.features) {
+      std::cerr << "cpuinfo " << c.arch << ": got \"" << name << "\" [";
+      for (const auto& f : features) std::cerr << f << " ";
+      std::cerr << "]\n";
+      ++failures;
+    }
+  }
+}
+
+static void TestReadHostLive() {
+  chipagent::Host h = chipagent::ReadHost("/");
+  CHECK(!h.os.empty());
+  CHECK(!h.arch.empty());
+  CHECK(h.logical_cpus > 0);
+  CHECK(h.memory_total_bytes > 0);
+  std::cout << "this machine: " << h.os << "/" << h.arch << " \"" << h.cpu << "\", " << h.logical_cpus
+            << " CPUs\n";
 }
 
 static void TestNvml() {
@@ -180,7 +335,7 @@ static void TestNvml() {
 }
 
 static std::string HttpGet(int port, const std::string& request) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  auto fd = socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(static_cast<uint16_t>(port));
@@ -189,10 +344,10 @@ static std::string HttpGet(int port, const std::string& request) {
     close(fd);
     return "";
   }
-  send(fd, request.data(), request.size(), 0);
+  send(fd, request.data(), static_cast<int>(request.size()), 0);
   std::string out;
   char buf[4096];
-  for (ssize_t n; (n = recv(fd, buf, sizeof buf, 0)) > 0;) out.append(buf, static_cast<size_t>(n));
+  for (int n; (n = static_cast<int>(recv(fd, buf, sizeof buf, 0))) > 0;) out.append(buf, static_cast<size_t>(n));
   close(fd);
   return out;
 }
@@ -231,11 +386,22 @@ static void TestHttp() {
 }
 
 int main() {
+#ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
+#endif
   TestJsonEscape();
   TestSimulated();
   TestGoldenTelemetry();
-  TestSysfs();
+  TestClassifyPci();
+#ifndef _WIN32
+  TestPci();
+  TestDeviceTree();
+#endif
+#if !defined(_WIN32) && !defined(__APPLE__)
+  TestReadHostFromProc();
+#endif
+  TestParseCpuinfo();
+  TestReadHostLive();
   TestNvml();
   TestHttp();
   if (failures) {

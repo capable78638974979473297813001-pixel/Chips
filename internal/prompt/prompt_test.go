@@ -80,3 +80,73 @@ func TestEstimateTokens(t *testing.T) {
 		t.Error("unexpected estimate")
 	}
 }
+
+func TestInspectAPIStyles(t *testing.T) {
+	cases := []struct {
+		name, path, ctype, body string
+		model                   string
+		maxTokens               int
+		text                    []string
+	}{
+		{"anthropic messages", "/v1/messages", "application/json",
+			`{"model":"claude-like","max_tokens":64,"system":[{"type":"text","text":"be terse"}],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`,
+			"claude-like", 64, []string{"be terse", "hello"}},
+		{"ollama chat", "/api/chat", "application/json",
+			`{"model":"llama3","options":{"num_predict":32},"messages":[{"role":"user","content":"hi"}]}`,
+			"llama3", 32, []string{"hi"}},
+		{"ollama generate", "/api/generate", "application/json",
+			`{"model":"llama3","system":"sys","prompt":"why"}`, "llama3", 0, []string{"sys", "why"}},
+		{"tgi", "/generate_stream", "application/json",
+			`{"inputs":"once upon","parameters":{"max_new_tokens":20}}`, "", 20, []string{"once upon"}},
+		{"gemini", "/v1beta/models/gemma-2:generateContent", "application/json",
+			`{"systemInstruction":{"parts":[{"text":"rules"}]},"contents":[{"role":"user","parts":[{"text":"q"}]}],"generationConfig":{"maxOutputTokens":9}}`,
+			"gemma-2", 9, []string{"rules", "q"}},
+		{"triton", "/v2/models/resnet50/infer", "application/json",
+			`{"inputs":[{"name":"x","shape":[1],"datatype":"FP32","data":[1]}]}`, "resnet50", 0, nil},
+		{"kserve v1", "/v1/models/sklearn-iris:predict", "application/json",
+			`{"instances":[[6.8,2.8,4.8,1.4]]}`, "sklearn-iris", 0, []string{"6.8"}},
+		{"azure openai", "/openai/deployments/gpt-prod/chat/completions", "application/json",
+			`{"messages":[{"role":"user","content":"x"}]}`, "gpt-prod", 0, []string{"x"}},
+		{"body model wins over path", "/v2/models/a/generate", "application/json",
+			`{"model":"b"}`, "b", 0, nil},
+		{"form", "/v1/thing", "application/x-www-form-urlencoded", "model=whisper&x=1", "whisper", 0, nil},
+		{"binary", "/v2/models/yolo/infer", "application/octet-stream", "\x00\x01\x02", "yolo", 0, nil},
+		{"wrong field type", "/v1/chat/completions", "application/json",
+			`{"model":"m","max_tokens":"lots","messages":"not a list"}`, "m", 0, nil},
+	}
+	for _, c := range cases {
+		info := Inspect(c.path, c.ctype, []byte(c.body))
+		if info.Model != c.model || info.MaxTokens != c.maxTokens {
+			t.Errorf("%s: model=%q max=%d, want %q %d", c.name, info.Model, info.MaxTokens, c.model, c.maxTokens)
+		}
+		for _, want := range c.text {
+			if !strings.Contains(info.Text, want) {
+				t.Errorf("%s: text %q missing %q", c.name, info.Text, want)
+			}
+		}
+	}
+	if !Inspect("/generate_stream", "application/json", []byte(`{}`)).Stream {
+		t.Error("TGI streaming path not detected")
+	}
+}
+
+func TestInspectMultipartAudio(t *testing.T) {
+	body := "--XYZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF....\r\n" +
+		"--XYZ\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3\r\n--XYZ--\r\n"
+	if got := Inspect("/v1/audio/transcriptions", "multipart/form-data; boundary=XYZ", []byte(body)).Model; got != "whisper-large-v3" {
+		t.Errorf("model = %q", got)
+	}
+}
+
+func TestModelFromPath(t *testing.T) {
+	for path, want := range map[string]string{
+		"/v1/models":                       "",
+		"/v1/chat/completions":             "",
+		"/v2/models/bert/versions/1/infer": "bert",
+		"/v1/models/m:predict":             "m",
+	} {
+		if got := ModelFromPath(path); got != want {
+			t.Errorf("%s: %q, want %q", path, got, want)
+		}
+	}
+}

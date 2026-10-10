@@ -1,38 +1,71 @@
-# Mixing NVIDIA, AMD, Intel and Apple hardware
+# Mixing hardware from any vendor
 
-Every vendor reports its hardware differently. NVIDIA uses the NVML library, AMD's `amdgpu` driver
-and Intel's drivers publish files under Linux sysfs, and Apple exposes unified memory through
-`sysctl`. A team running all of them would normally write and maintain a separate inventory script
-for each vendor, then hand-tag every server in the router config.
+Every vendor reports its hardware differently. NVIDIA uses NVML, AMD publishes files under Linux
+sysfs, Windows exposes GPUs through DXGI, Apple uses `sysctl`, and most AI accelerators (Gaudi,
+Inferentia, TPU, Ascend, ...) have no common monitoring interface at all. A team running several
+of them would normally maintain a separate inventory script per vendor and hand-tag every server
+in the router config.
 
-**chipagent** replaces that. It is a small C++17 program that runs on each GPU server, reads
-whichever vendor interfaces are present, and serves one JSON schema. SiliconRouter polls it and:
+**chipagent** replaces that. It is a small C++17 program that runs on each server, reads
+whichever interfaces are present, and serves one JSON schema. SiliconRouter polls it and:
 
 - **Assigns tiers automatically.** A backend with `tier: auto` is classified from the hardware it
   reports, so adding a new node means adding its two URLs, not working out where it fits.
 - **Sees load the router can't.** If a training job or another service is using a node's GPUs,
   the router can't see that load from its own request counts. When two nodes in a tier have the
   same load in the router, the one whose accelerators are at least 10 points less busy wins.
-- **Shows one inventory.** `/admin/backends` and `/metrics` list every node's vendor, devices,
+- **Shows one inventory.** `/admin/backends` and `/metrics` list every node's CPU, devices,
   memory and utilization in the same format, whatever the vendor.
 
-## What chipagent reads
+## What chipagent detects
 
-| Vendor | Interface | Reports |
+**Every machine** reports its host: OS, CPU architecture, CPU model, core count, RAM, and the CPU
+instruction-set extensions that matter for CPU inference (AVX2/AVX-512/AMX on x86, NEON/SVE on Arm,
+AltiVec/VSX on POWER, vector facilities on IBM Z, RVV on RISC-V, LSX/LASX on LoongArch). A machine
+with no accelerator is still capacity for CPU inference (llama.cpp and similar).
+
+**Every PCI GPU and AI accelerator** is detected by its PCI vendor ID and class code, including
+makers chipagent has never heard of. Each device gets a `kind`:
+
+| Kind | Meaning | Examples |
 |---|---|---|
-| NVIDIA | NVML (`libnvidia-ml.so.1`, ships with the driver), loaded at runtime | name, UUID, memory total/used, GPU utilization, temperature, power |
-| AMD | `amdgpu` sysfs: `/sys/class/drm/cardN/device` | name (from `product_name` or a built-in ID table), PCI address, VRAM total/used, `gpu_busy_percent`, hwmon temperature and power |
-| Intel | DRM sysfs | detected with PCI ID; memory and utilization are not read yet |
-| Apple silicon | `sysctl` + Mach VM statistics | chip name, unified memory total/used |
-| Any NVIDIA card when NVML is missing | DRM sysfs | detected with PCI ID only |
+| `gpu` | general-purpose GPU | NVIDIA, AMD, Intel Arc, Qualcomm, unknown vendors' GPUs |
+| `npu` | neural processing unit | Intel NPU, Huawei Ascend |
+| `accelerator` | dedicated AI or compute card | Intel Gaudi, AWS Inferentia/Trainium, Google TPU, Tenstorrent, FPGAs |
+| `display` | display-only, **not** AI capacity | server BMC graphics (ASPEED, Matrox), VM adapters (QEMU, VMware, Hyper-V, VirtualBox, virtio), and 1990s–2000s chips from before GPU compute existed (3dfx, S3, Riva 128, ...) |
 
-The build needs no CUDA toolkit, ROCm or vendor SDK. NVML is loaded with `dlopen`, so the same
-binary runs on NVIDIA, AMD, Intel and CPU-only Linux machines.
+How much detail each vendor gets:
 
-Status: the NVML path is tested against a stand-in library that exports the real NVML C functions,
-and the sysfs path against a fake `/sys` tree. CI builds and tests on Linux and macOS (Apple
-silicon). Real-hardware testing on each vendor is still to do; please report anything that reads
-wrong on your machines.
+| Hardware | Read through | Identity | Memory | Utilization | Temp/power |
+|---|---|---|---|---|---|
+| NVIDIA (Linux, Windows) | NVML, loaded at runtime | ✓ | ✓ | ✓ | ✓ |
+| AMD (Linux) | `amdgpu` sysfs | ✓ | ✓ | ✓ | ✓ |
+| NVIDIA Jetson (Linux) | device tree | ✓ | ✓ (shared RAM) | – | – |
+| Apple silicon (macOS) | `sysctl` + Mach | ✓ | ✓ (unified) | – | – |
+| Any GPU on Windows 7+ | DXGI | ✓ | ✓ (dedicated VRAM) | – | – |
+| Intel Macs' GPUs | IOKit | ✓ | where macOS reports it | – | – |
+| Every other PCI device (Linux) | PCI sysfs | ✓ | – | – | – |
+
+"–" means chipagent reports `null`, and the router treats the reading as unknown. A device whose
+memory is unknown is still counted, and tiers as `standard`.
+
+No vendor SDK is needed to build or run it. NVML is loaded at runtime when it is present, so one
+binary covers machines with and without NVIDIA drivers.
+
+### Where it is verified
+
+| Platform | How it was tested |
+|---|---|
+| Linux x86_64 | Full test suite, with AddressSanitizer/UBSan |
+| Linux aarch64, armv7, i686, ppc64le, s390x, riscv64, mips | Full test suite under QEMU emulation (`make agent-cross`, run in CI). s390x and MIPS are big-endian. |
+| Windows x86_64 | Full test suite, both MinGW (under Wine) and MSVC (CI) |
+| macOS, Apple silicon | Full test suite (CI) |
+| macOS, Intel | Compiled; the IOKit GPU path has not run on an Intel Mac |
+
+Vendor code paths are tested against fakes: a stand-in NVML library that exports the real C
+functions, and fake `/sys` and `/proc` trees, including `/proc/cpuinfo` samples from 12 CPU
+families. **None of it has run on real NVIDIA, AMD, Gaudi, TPU or other accelerator hardware
+yet.** Please report anything that reads wrong on your machines.
 
 ## Run it
 
@@ -42,15 +75,18 @@ agent/build/chipagent --once                 # print what this machine has, then
 agent/build/chipagent --listen :9400         # serve GET /v1/telemetry and /healthz
 ```
 
+On Windows, build with Visual Studio or MinGW (`cmake -S agent -B build && cmake --build build`)
+and run `chipagent.exe --listen :9400`.
+
 Or in a container (`docker build -t chipagent agent/`): add `--gpus all` on NVIDIA hosts so the
-NVIDIA runtime mounts NVML into the container. On AMD and Intel hosts no flags are needed because
+NVIDIA runtime mounts NVML into the container. On other Linux hosts no flags are needed because
 `/sys` is visible to containers by default.
 
 The agent serves read-only hardware telemetry with no authentication. Bind it to the cluster network,
 for example `--listen 10.0.0.11:9400`, and don't expose it publicly.
 
-`--simulate vendor:name:memory_gib[:utilization_percent]` (repeatable) reports fake devices, which is
-what `make demo-mixed` uses to show an NVIDIA + AMD + Apple fleet on a laptop.
+`--simulate vendor:name:memory_gib[:utilization_percent[:kind]]` (repeatable) reports fake devices,
+which is what `make demo-mixed` uses to show an NVIDIA + AMD + Apple fleet on a laptop.
 
 ## Point the router at it
 
@@ -74,12 +110,12 @@ From the total accelerator memory on the node (summed across GPUs):
 | ≥ `heavy_min_memory_gib` (default 64): H100/H200, MI300X, 4× L4 | heavy |
 | ≥ `standard_min_memory_gib` (default 20): L4, A10, RTX 4090, Radeon 7900 | standard |
 | less than that: T4, small cards | light |
-| accelerators found but the driver doesn't report memory | standard |
-| no accelerators (CPU inference) | light |
-| unified memory (Apple silicon) | at most standard |
+| accelerators found but memory unknown (Gaudi, TPU, Inferentia, ...) | standard |
+| no accelerators, or display adapters only (CPU inference) | light |
+| unified memory (Apple silicon, Jetson) | at most standard |
 
-Apple silicon is capped because a Mac Studio can hold a large model but has a fraction of HBM's
-memory bandwidth, so it generates tokens more slowly than a data-center GPU. Set an explicit
+Unified-memory machines are capped because they can hold a large model but have a fraction of
+HBM's memory bandwidth, so they generate tokens more slowly than a data-center GPU. Set an explicit
 tier on a backend to override any of this.
 
 Until a node's agent first answers, an auto backend is treated as `standard`. If an agent stops
@@ -92,19 +128,25 @@ out of rotation; only the inference health check does that.
 `GET /v1/telemetry`:
 
 ```json
-{"schema":1,"agent":"chipagent","version":"0.1.0","hostname":"gpu-node-1","devices":[
-  {"index":0,"vendor":"amd","name":"AMD Instinct MI300X","id":"0000:03:00.0","source":"sysfs",
+{"schema":1,"agent":"chipagent","version":"0.2.0","hostname":"gpu-node-1",
+ "host":{"os":"linux","arch":"x86_64","cpu":"AMD EPYC 9654 96-Core Processor","logical_cpus":192,
+         "memory_total_bytes":1649267441664,"memory_used_bytes":68719476736,
+         "cpu_features":["avx2","avx512f","avx512_bf16"]},
+ "devices":[
+  {"index":0,"vendor":"amd","kind":"gpu","name":"AMD Instinct MI300X","id":"0000:03:00.0","source":"sysfs",
    "memory_total_bytes":206158430208,"memory_used_bytes":1073741824,"unified_memory":false,
-   "utilization_percent":42,"temperature_c":51,"power_watts":350}]}
+   "utilization_percent":42,"temperature_c":51,"power_watts":350},
+  {"index":1,"vendor":"aspeed","kind":"display","name":"ASPEED BMC graphics [1a03:2000]", ...}]}
 ```
 
-Readings a driver doesn't provide are `null`. `agent/tests/testdata/telemetry.json` is checked
+Readings a driver doesn't provide are `null`. Version 0.2 added `host` and `kind`. The router still
+accepts 0.1 reports and treats their devices as GPUs. `agent/tests/testdata/telemetry.json` is checked
 by both the C++ tests (which must produce it byte for byte) and the Go tests (which must decode
 it). If a change breaks either side, CI fails.
 
 ## Router metrics
 
-- `siliconrouter_backend_accelerators{backend,vendor}`
+- `siliconrouter_backend_accelerators{backend,vendor,kind}`
 - `siliconrouter_backend_accelerator_memory_bytes{backend,state="total|used"}`
 - `siliconrouter_backend_accelerator_utilization_percent{backend}`
 

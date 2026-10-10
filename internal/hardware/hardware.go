@@ -19,11 +19,22 @@ import (
 // TelemetryPath is where chipagent serves its report.
 const TelemetryPath = "/v1/telemetry"
 
-// Device is one accelerator as chipagent reports it. Optional readings are
-// nil when the vendor's driver does not provide them.
+// Device kinds chipagent reports. Display-only adapters (server BMCs, VM
+// graphics, pre-compute legacy GPUs) are listed for inventory but are not AI
+// capacity.
+const (
+	KindGPU         = "gpu"
+	KindNPU         = "npu"
+	KindAccelerator = "accelerator"
+	KindDisplay     = "display"
+)
+
+// Device is one GPU or accelerator as chipagent reports it. Optional
+// readings are nil when the vendor's driver does not provide them.
 type Device struct {
 	Index              int      `json:"index"`
 	Vendor             string   `json:"vendor"`
+	Kind               string   `json:"kind"` // empty from chipagent 0.1, which only reported GPUs
 	Name               string   `json:"name"`
 	ID                 string   `json:"id"`
 	Source             string   `json:"source"`
@@ -35,19 +46,45 @@ type Device struct {
 	PowerWatts         *float64 `json:"power_watts"`
 }
 
+// IsAccelerator reports whether the device can run AI work.
+func (d Device) IsAccelerator() bool { return d.Kind != KindDisplay }
+
+// Host describes the machine itself; CPU inference runs on any of them.
+type Host struct {
+	OS               string   `json:"os"`
+	Arch             string   `json:"arch"`
+	CPU              string   `json:"cpu"`
+	LogicalCPUs      int      `json:"logical_cpus"`
+	MemoryTotalBytes uint64   `json:"memory_total_bytes"`
+	MemoryUsedBytes  uint64   `json:"memory_used_bytes"`
+	CPUFeatures      []string `json:"cpu_features"`
+}
+
 // Report is everything one chipagent knows about its machine.
 type Report struct {
 	Schema   int      `json:"schema"`
 	Agent    string   `json:"agent"`
 	Version  string   `json:"version"`
 	Hostname string   `json:"hostname"`
+	Host     *Host    `json:"host"` // nil from chipagent 0.1
 	Devices  []Device `json:"devices"`
 }
 
-// MemoryTotal is the accelerator memory across all devices (0 if unknown).
+// Accelerators are the devices that count as AI capacity.
+func (r *Report) Accelerators() []Device {
+	var out []Device
+	for _, d := range r.Devices {
+		if d.IsAccelerator() {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// MemoryTotal is the accelerator memory across all accelerators (0 if unknown).
 func (r *Report) MemoryTotal() uint64 {
 	var n uint64
-	for _, d := range r.Devices {
+	for _, d := range r.Accelerators() {
 		n += d.MemoryTotalBytes
 	}
 	return n
@@ -55,17 +92,17 @@ func (r *Report) MemoryTotal() uint64 {
 
 func (r *Report) MemoryUsed() uint64 {
 	var n uint64
-	for _, d := range r.Devices {
+	for _, d := range r.Accelerators() {
 		n += d.MemoryUsedBytes
 	}
 	return n
 }
 
-// Utilization is the mean busy percentage over devices that report one.
+// Utilization is the mean busy percentage over accelerators that report one.
 func (r *Report) Utilization() (float64, bool) {
 	var sum float64
 	n := 0
-	for _, d := range r.Devices {
+	for _, d := range r.Accelerators() {
 		if d.UtilizationPercent != nil {
 			sum += *d.UtilizationPercent
 			n++
@@ -77,10 +114,10 @@ func (r *Report) Utilization() (float64, bool) {
 	return sum / float64(n), true
 }
 
-// Vendors lists the distinct vendors present, sorted.
+// Vendors lists the distinct accelerator vendors present, sorted.
 func (r *Report) Vendors() []string {
 	var out []string
-	for _, d := range r.Devices {
+	for _, d := range r.Accelerators() {
 		if !slices.Contains(out, d.Vendor) {
 			out = append(out, d.Vendor)
 		}
@@ -90,7 +127,7 @@ func (r *Report) Vendors() []string {
 }
 
 func (r *Report) unified() bool {
-	for _, d := range r.Devices {
+	for _, d := range r.Accelerators() {
 		if d.UnifiedMemory {
 			return true
 		}
@@ -112,7 +149,7 @@ var DefaultThresholds = Thresholds{HeavyMinBytes: 64 * gib, StandardMinBytes: 20
 
 // Tier places a node by its total accelerator memory, which bounds the model
 // size and KV cache it can hold:
-//   - no accelerators: light (CPU inference)
+//   - no accelerators (display adapters don't count): light (CPU inference)
 //   - accelerators whose memory the driver does not report: standard
 //   - otherwise by HeavyMinBytes and StandardMinBytes
 //
@@ -120,7 +157,7 @@ var DefaultThresholds = Thresholds{HeavyMinBytes: 64 * gib, StandardMinBytes: 20
 // hold large models, but their memory bandwidth is several times lower than
 // HBM GPUs, so they generate tokens more slowly.
 func (t Thresholds) Tier(r *Report) string {
-	if len(r.Devices) == 0 {
+	if len(r.Accelerators()) == 0 {
 		return config.TierLight
 	}
 	mem := r.MemoryTotal()

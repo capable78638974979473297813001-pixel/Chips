@@ -1,8 +1,6 @@
-// Command chipagent reports the accelerators in this machine (NVIDIA, AMD,
-// Intel, Apple) over HTTP so SiliconRouter can tier and route across a mixed
-// fleet without hand-written hardware labels.
-#include <unistd.h>
-
+// Command chipagent reports the compute hardware in this machine (CPU, GPUs
+// and AI accelerators from any vendor) over HTTP so SiliconRouter can tier
+// and route across a mixed fleet without hand-written hardware labels.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -28,18 +26,13 @@ Serves GET /v1/telemetry (JSON) and GET /healthz.
   --listen ADDR         address to serve on (default ":9400")
   --once                print the telemetry JSON once and exit
   --simulate SPEC       report a fake device instead of real hardware; repeatable.
-                        SPEC is vendor:name:memory_gib[:utilization_percent],
-                        e.g. "nvidia:NVIDIA H100 80GB HBM3:80"
-  --nvml-library PATH   NVML library to load (default libnvidia-ml.so.1)
-  --sysfs-root PATH     root containing sys/class/drm (default "/")
+                        SPEC is vendor:name:memory_gib[:utilization_percent[:kind]],
+                        kind one of gpu, npu, accelerator, display (default gpu),
+                        e.g. "nvidia:NVIDIA H100 80GB HBM3:80" or "google:TPU v5e:16::accelerator"
+  --nvml-library PATH   NVML library to load (default libnvidia-ml.so.1 / nvml.dll)
+  --sysfs-root PATH     Linux: root containing sys/ and proc/ (default "/")
   --version             print the version and exit
 )";
-
-std::string Hostname() {
-  char buf[256] = {};
-  if (gethostname(buf, sizeof buf - 1) != 0) return "";
-  return buf;
-}
 
 }  // namespace
 
@@ -83,33 +76,50 @@ int main(int argc, char** argv) {
     }
     providers.push_back(std::move(sim));
   } else {
+    // NVML gives the richest NVIDIA data; the platform-wide providers below
+    // skip NVIDIA devices when it is present so nothing is counted twice.
     auto nvml = chipagent::OpenNvml(nvml_lib);
     bool have_nvml = nvml != nullptr;
     if (nvml) providers.push_back(std::move(nvml));
-    providers.push_back(chipagent::OpenSysfs(sysfs_root, have_nvml));
+#if defined(_WIN32)
+    if (auto dxgi = chipagent::OpenDxgi(have_nvml)) providers.push_back(std::move(dxgi));
+#elif defined(__APPLE__)
+    (void)have_nvml;  // no NVML on macOS: NVIDIA's driver there never shipped it
     if (auto apple = chipagent::OpenApple()) providers.push_back(std::move(apple));
+#else
+    providers.push_back(chipagent::OpenPci(sysfs_root, have_nvml));
+    if (!have_nvml) providers.push_back(chipagent::OpenDeviceTree(sysfs_root));
+#endif
   }
 
-  const std::string host = Hostname();
   auto telemetry = [&] {
-    return chipagent::RenderTelemetry(chipagent::Collect(providers), host, CHIPAGENT_VERSION);
+    return chipagent::RenderTelemetry(chipagent::Collect(providers), chipagent::ReadHost(sysfs_root),
+                                      CHIPAGENT_VERSION);
   };
   if (once) {
     std::cout << telemetry();
     return 0;
   }
 
+  chipagent::Host host = chipagent::ReadHost(sysfs_root);
+  std::cerr << "chipagent: host " << host.os << "/" << host.arch << " \"" << host.cpu << "\", "
+            << host.logical_cpus << " CPUs, " << (host.memory_total_bytes >> 20) << " MiB RAM\n";
   for (const auto& d : chipagent::Collect(providers)) {
-    std::cerr << "chipagent: found " << d.vendor << " \"" << d.name << "\" via " << d.source;
+    std::cerr << "chipagent: found " << d.kind << " " << d.vendor << " \"" << d.name << "\" via " << d.source;
     if (d.memory_total_bytes) std::cerr << ", " << (d.memory_total_bytes >> 20) << " MiB";
     std::cerr << "\n";
   }
 
+#ifdef _WIN32
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
+#else
   struct sigaction sa{};
   sa.sa_handler = OnSignal;
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
   std::signal(SIGPIPE, SIG_IGN);
+#endif
 
   chipagent::HttpServer server;
   std::string err;

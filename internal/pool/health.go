@@ -59,15 +59,17 @@ func (c *Checker) CheckAll(ctx context.Context) {
 func (c *Checker) check(ctx context.Context, b *Backend) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
+	path := c.Path
+	if b.HealthPath != "" {
+		path = b.HealthPath
+	}
 	u := *b.URL
-	u.Path = strings.TrimSuffix(u.Path, "/") + c.Path
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-	if b.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+b.APIKey)
-	}
+	b.SetAuth(req.Header)
 	resp, err := c.Client.Do(req)
 	if err != nil {
 		return nil, err
@@ -83,9 +85,10 @@ func (c *Checker) check(ctx context.Context, b *Backend) ([]string, error) {
 	return parseModels(body), nil
 }
 
-// parseModels understands the OpenAI /v1/models shape (vLLM, llama.cpp,
-// Ollama's OpenAI layer) and Ollama's native /api/tags shape. It returns nil
-// when the body is neither, which leaves the backend's model list unknown.
+// parseModels understands the OpenAI /v1/models shape (vLLM, SGLang,
+// llama.cpp, LM Studio, Ollama's OpenAI layer), Ollama's native /api/tags
+// shape and TGI's /info. It returns nil for anything else (an empty Triton
+// readiness reply, plain "ok"), which leaves the backend's model list unknown.
 func parseModels(body []byte) []string {
 	var v struct {
 		Data []struct {
@@ -94,11 +97,15 @@ func parseModels(body []byte) []string {
 		Models []struct {
 			Name string `json:"name"`
 		} `json:"models"`
+		ModelID string `json:"model_id"`
 	}
 	if json.Unmarshal(body, &v) != nil {
 		return nil
 	}
 	var out []string
+	if v.ModelID != "" {
+		out = append(out, v.ModelID)
+	}
 	for _, m := range v.Data {
 		out = append(out, m.ID)
 	}

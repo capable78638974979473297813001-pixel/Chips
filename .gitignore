@@ -2,3 +2,4 @@
 *.log
 /siliconrouter.yaml
 /agent/build/
+/agent/build-*/

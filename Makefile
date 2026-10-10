@@ -1,4 +1,4 @@
-.PHONY: build test lint demo demo-mixed bench agent agent-test clean
+.PHONY: build test lint cross demo demo-mixed bench agent agent-test agent-cross clean
 
 build:
 	go build -o bin/ ./cmd/...
@@ -18,6 +18,18 @@ demo: build
 	bin/mockllm -addr :9003 -name mi300 -prefill-tps 2000 -decode-tps 300 -max-concurrency 4 & \
 	sleep 0.5; bin/siliconrouter -config examples/demo.yaml
 
+# Cross-compiles the router for every OS and CPU Go supports that a company
+# might run it on. Pure Go with no cgo, so no extra toolchains are needed.
+CROSS_TARGETS = linux/amd64 linux/386 linux/arm linux/arm64 linux/ppc64le linux/ppc64 linux/s390x \
+	linux/riscv64 linux/mips linux/mipsle linux/mips64 linux/mips64le linux/loong64 \
+	windows/amd64 windows/386 windows/arm64 darwin/amd64 darwin/arm64 \
+	freebsd/amd64 freebsd/arm64 freebsd/386 openbsd/amd64 netbsd/amd64 illumos/amd64 aix/ppc64
+cross:
+	@for t in $(CROSS_TARGETS); do \
+		echo "go build $$t"; \
+		GOOS=$${t%/*} GOARCH=$${t#*/} CGO_ENABLED=0 go build -o bin/$${t%/*}-$${t#*/}/ ./cmd/... || exit 1; \
+	done
+
 # chipagent, the C++ hardware agent that runs on each GPU server.
 agent:
 	cmake -S agent -B agent/build -DCMAKE_BUILD_TYPE=Release
@@ -25,6 +37,10 @@ agent:
 
 agent-test: agent
 	ctest --test-dir agent/build --output-on-failure
+
+# Builds chipagent for 7 more CPU architectures and runs its tests under QEMU.
+agent-cross:
+	scripts/agent-cross-test.sh
 
 # Like demo, but every node runs a simulated chipagent (NVIDIA, AMD, Apple)
 # and the router assigns tiers from the reported hardware.
@@ -43,4 +59,4 @@ bench: build
 	bin/srbench -conversations 30 -turns 10 -concurrency 8 -system-chars 400 -user-chars 2000
 
 clean:
-	rm -rf bin agent/build
+	rm -rf bin agent/build agent/build-*

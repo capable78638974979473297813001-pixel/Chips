@@ -31,15 +31,20 @@ endpoint.
    Big prompts go to heavy GPUs, small ones to cheaper machines, and reserve hardware only gets
    traffic when everything else is full or down. Servers too small for a prompt's context are skipped.
 4. **Knows the hardware, whoever made it.** An optional C++ agent, `chipagent`, runs on each
-   server and reads NVIDIA (NVML), AMD and Intel (Linux sysfs), and Apple silicon (sysctl) through
-   one schema. With `tier: auto` the router tiers each node from what it actually has, sees GPU
-   load from outside work, and lists the whole mixed fleet in one inventory. See
+   server (Linux on any CPU architecture, Windows, macOS). It identifies the CPU and every PCI GPU
+   or AI accelerator: NVIDIA, AMD, Intel, Apple, Gaudi, Inferentia, TPU, Ascend, and unknown
+   vendors. With `tier: auto` the router tiers each node from what it actually has, sees GPU load
+   from outside work, and lists the whole mixed fleet in one inventory. See
    [docs/HARDWARE.md](docs/HARDWARE.md).
 5. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover.
 
 Your apps don't change: point any OpenAI client at SiliconRouter instead of a single server.
+Other AI APIs work too, including Anthropic-style, Ollama, TGI, Triton/KServe, Gemini-style, and any custom
+HTTP service. The router forwards every path and reads the model from the body or URL when it can.
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the full list of chips and AI software, and
+its limits.
 
 ## Quick start
 
@@ -74,8 +79,8 @@ go build -o bin/ ./cmd/...
 bin/siliconrouter -config siliconrouter.yaml
 ```
 
-Works with anything that speaks the OpenAI API: **vLLM, SGLang, llama.cpp server, Ollama, TGI,
-LM Studio**. Enable prefix caching on the engine (vLLM: `--enable-prefix-caching`, on by default in
+Works with **vLLM, SGLang, llama.cpp server, Ollama, TGI, LM Studio, Triton, KServe, TensorFlow
+Serving**, and any other HTTP inference server. Enable prefix caching on the engine (vLLM: `--enable-prefix-caching`, on by default in
 recent versions) to get the cache benefit.
 
 ## Measured results (simulator)
@@ -102,7 +107,7 @@ OpenAI-compatible servers return).
 
 | Endpoint                  | Purpose                                                       |
 |---------------------------|---------------------------------------------------------------|
-| `POST /v1/*`              | Chat completions, completions, embeddings: routed to a backend |
+| any other path            | Forwarded to a backend: OpenAI `/v1/*`, `/v1/messages`, Ollama `/api/*`, TGI, Triton/KServe `/v2/*`, ... |
 | `GET /v1/models`          | Models served by healthy backends                             |
 | `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
 | `GET /metrics`            | Prometheus metrics                                            |
@@ -150,7 +155,8 @@ For each request, the router:
 cmd/siliconrouter   the router
 cmd/mockllm         simulated GPU inference server for demos and tests
 cmd/srbench         multi-turn chat load generator
-agent/              chipagent (C++17): per-node NVIDIA/AMD/Intel/Apple hardware telemetry
+agent/              chipagent (C++17): per-node CPU, GPU and accelerator telemetry, any vendor
+scripts/            cross-architecture test runner for chipagent (QEMU)
 internal/hardware   chipagent client, telemetry schema, automatic tiering
 internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
@@ -159,7 +165,9 @@ internal/prompt     request parsing, prefix hashing, size estimates
 internal/config     YAML config, defaults, validation
 ```
 
-`make test` runs the Go suite with the race detector and `make agent-test` runs the C++ suite. The
+`make test` runs the Go suite with the race detector, and `make agent-test` runs the C++ suite.
+`make cross` builds the router for 25 OS/CPU targets, and `make agent-cross` runs chipagent's tests
+on 7 more CPU architectures under QEMU. The
 router depends only on the Go standard library and `gopkg.in/yaml.v3`. chipagent depends only on
 the C++ standard library and POSIX; it needs no CUDA, ROCm or vendor SDK to build.
 

@@ -1,12 +1,21 @@
-// Package prompt pulls the routing-relevant facts out of an OpenAI-style
-// request body: which model, how big the prompt is, and a chain of prefix
-// hashes that lets the router recognise a conversation it has seen before.
+// Package prompt pulls the routing-relevant facts out of an inference
+// request: which model, how big the prompt is, and a chain of prefix hashes
+// that lets the router recognise a conversation it has seen before.
+//
+// It understands the request shapes of the common AI serving APIs (OpenAI,
+// Anthropic, Ollama, Hugging Face TGI, Google Gemini/Vertex, Triton/KServe,
+// Azure OpenAI) and degrades gracefully: a body it cannot read (audio,
+// images, protobuf) still gets routed, just without model or prefix hints.
 package prompt
 
 import (
 	"bytes"
 	"encoding/json"
 	"hash/fnv"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/url"
 	"strings"
 )
 
@@ -24,46 +33,140 @@ type Info struct {
 type message struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	Parts   json.RawMessage `json:"parts"` // Gemini
 }
 
-type request struct {
-	Model               string          `json:"model"`
-	Stream              bool            `json:"stream"`
-	MaxTokens           *int            `json:"max_tokens"`
-	MaxCompletionTokens *int            `json:"max_completion_tokens"`
-	Messages            []message       `json:"messages"`
-	Prompt              json.RawMessage `json:"prompt"`
-	Input               json.RawMessage `json:"input"`
+// Inspect reads whatever routing hints a request carries. It never fails:
+// requests it does not understand are still forwarded, routed by load alone.
+func Inspect(path, contentType string, body []byte) Info {
+	var info Info
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+	switch {
+	case mediaType == "multipart/form-data":
+		info.Model = multipartField(body, params["boundary"], "model")
+	case mediaType == "application/x-www-form-urlencoded":
+		if q, err := url.ParseQuery(string(body)); err == nil {
+			info.Model = q.Get("model")
+		}
+	default:
+		if parsed, err := Parse(body); err == nil {
+			info = parsed
+		}
+	}
+	if info.Model == "" {
+		info.Model = ModelFromPath(path)
+	}
+	if strings.Contains(path, "stream") { // TGI /generate_stream, Gemini :streamGenerateContent
+		info.Stream = true
+	}
+	return info
 }
 
-// Parse reads a chat-completions, completions or embeddings request body.
+// ModelFromPath finds a model named in the URL, as in Triton/KServe
+// (/v2/models/{name}/infer), Gemini (/v1beta/models/{name}:generateContent)
+// and Azure OpenAI (/openai/deployments/{name}/chat/completions).
+func ModelFromPath(path string) string {
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	for i := 0; i+1 < len(segs); i++ {
+		if segs[i] == "models" || segs[i] == "deployments" {
+			name, _, _ := strings.Cut(segs[i+1], ":")
+			return name
+		}
+	}
+	return ""
+}
+
+func multipartField(body []byte, boundary, field string) string {
+	if boundary == "" {
+		return ""
+	}
+	r := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := r.NextPart()
+		if err != nil {
+			return ""
+		}
+		if part.FormName() == field {
+			v, _ := io.ReadAll(io.LimitReader(part, 512))
+			return strings.TrimSpace(string(v))
+		}
+	}
+}
+
+// Parse reads a JSON request body. Each known field is decoded on its own,
+// so an unexpected type in one field does not hide the others.
 func Parse(body []byte) (Info, error) {
-	var r request
-	if err := json.Unmarshal(body, &r); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
 		return Info{}, err
 	}
-	info := Info{Model: r.Model, Stream: r.Stream}
-	switch {
-	case r.MaxCompletionTokens != nil:
-		info.MaxTokens = *r.MaxCompletionTokens
-	case r.MaxTokens != nil:
-		info.MaxTokens = *r.MaxTokens
+	get := func(key string, v any) bool {
+		raw, ok := fields[key]
+		return ok && json.Unmarshal(raw, v) == nil
 	}
 
+	var info Info
+	get("model", &info.Model)
+	get("stream", &info.Stream)
+
+	// Completion budget, by API: OpenAI, Anthropic and most engines use
+	// max_tokens (newer OpenAI: max_completion_tokens); TGI nests
+	// max_new_tokens in parameters; Ollama uses options.num_predict; Gemini
+	// uses generationConfig.maxOutputTokens.
+	var n int
+	var tgi struct {
+		MaxNewTokens int `json:"max_new_tokens"`
+	}
+	var ollama struct {
+		NumPredict int `json:"num_predict"`
+	}
+	var gemini struct {
+		MaxOutputTokens int `json:"maxOutputTokens"`
+	}
+	switch {
+	case get("max_completion_tokens", &n), get("max_tokens", &n):
+		info.MaxTokens = n
+	case get("parameters", &tgi) && tgi.MaxNewTokens > 0:
+		info.MaxTokens = tgi.MaxNewTokens
+	case get("options", &ollama) && ollama.NumPredict > 0:
+		info.MaxTokens = ollama.NumPredict
+	case get("generationConfig", &gemini) && gemini.MaxOutputTokens > 0:
+		info.MaxTokens = gemini.MaxOutputTokens
+	}
+
+	// The system prompt comes first so it anchors the shared prefix:
+	// Anthropic and Ollama put it in "system", Gemini in "systemInstruction".
 	var sb strings.Builder
-	for _, m := range r.Messages {
+	sb.WriteString(contentText(fields["system"]))
+	var sysInstr message
+	if get("systemInstruction", &sysInstr) {
+		sb.WriteString(contentText(sysInstr.Parts))
+	}
+
+	var msgs []message
+	if !get("messages", &msgs) {
+		get("contents", &msgs) // Gemini
+	}
+	for _, m := range msgs {
 		// Record and unit separators keep "ab"+"c" distinct from "a"+"bc".
 		sb.WriteByte(0x1e)
 		sb.WriteString(m.Role)
 		sb.WriteByte(0x1f)
-		sb.WriteString(contentText(m.Content))
-	}
-	if len(r.Messages) == 0 {
-		raw := r.Prompt
-		if len(raw) == 0 {
-			raw = r.Input
+		if len(m.Content) > 0 {
+			sb.WriteString(contentText(m.Content))
+		} else {
+			sb.WriteString(contentText(m.Parts))
 		}
-		sb.WriteString(contentText(raw))
+	}
+	if len(msgs) == 0 {
+		// Completions (prompt), embeddings (input), TGI (inputs), and
+		// Vertex/TF Serving/KServe v1 (instances).
+		for _, key := range []string{"prompt", "input", "inputs", "instances"} {
+			if raw := fields[key]; len(raw) > 0 {
+				sb.WriteString(contentText(raw))
+				break
+			}
+		}
 	}
 	info.Text = sb.String()
 	return info, nil
@@ -86,11 +189,12 @@ func contentText(raw json.RawMessage) string {
 		var sb strings.Builder
 		for _, p := range parts {
 			var part struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
+				Type string  `json:"type"`
+				Text *string `json:"text"`
 			}
-			if json.Unmarshal(p, &part) == nil && part.Type == "text" {
-				sb.WriteString(part.Text)
+			// OpenAI and Anthropic tag text parts with "type"; Gemini parts are bare {"text": ...}.
+			if json.Unmarshal(p, &part) == nil && part.Text != nil && (part.Type == "" || part.Type == "text") {
+				sb.WriteString(*part.Text)
 				continue
 			}
 			var str string

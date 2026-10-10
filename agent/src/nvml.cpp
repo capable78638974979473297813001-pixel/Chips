@@ -1,9 +1,8 @@
-// NVIDIA support through NVML (libnvidia-ml), which ships with the driver.
-// Only the stable C entry points are used, declared here so the build needs
-// neither the CUDA toolkit nor nvml.h.
-#include <dlfcn.h>
-
+// NVIDIA support through NVML (libnvidia-ml on Linux, nvml.dll on Windows),
+// which ships with the driver. Only the stable C entry points are used,
+// declared here so the build needs neither the CUDA toolkit nor nvml.h.
 #include "chipagent.hpp"
+#include "dynlib.hpp"
 
 namespace chipagent {
 namespace {
@@ -23,7 +22,7 @@ class NvmlProvider : public Provider {
   explicit NvmlProvider(void* lib) : lib_(lib) {}
   ~NvmlProvider() override {
     if (initialized_) shutdown_();
-    dlclose(lib_);
+    CloseLibrary(lib_);
   }
 
   // Resolves the entry points and initializes NVML. Utilization, temperature,
@@ -53,6 +52,7 @@ class NvmlProvider : public Provider {
       if (handle_(i, &h) != 0) continue;
       Device d;
       d.vendor = "nvidia";
+      d.kind = "gpu";
       d.source = "nvml";
       char buf[96] = {};
       d.name = name_(h, buf, sizeof buf) == 0 ? buf : "NVIDIA GPU";
@@ -75,7 +75,7 @@ class NvmlProvider : public Provider {
  private:
   template <typename F>
   bool Sym(F& fn, const char* symbol) {
-    fn = reinterpret_cast<F>(dlsym(lib_, symbol));
+    fn = reinterpret_cast<F>(LibrarySymbol(lib_, symbol));
     return fn != nullptr;
   }
 
@@ -97,9 +97,15 @@ class NvmlProvider : public Provider {
 
 std::unique_ptr<Provider> OpenNvml(const std::string& library) {
   std::vector<std::string> candidates = {library};
+#ifdef _WIN32
+  if (library.empty()) {
+    candidates = {"nvml.dll", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll"};
+  }
+#else
   if (library.empty()) candidates = {"libnvidia-ml.so.1", "libnvidia-ml.so"};
+#endif
   for (const auto& path : candidates) {
-    void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    void* lib = OpenLibrary(path);
     if (!lib) continue;
     auto p = std::make_unique<NvmlProvider>(lib);
     if (p->Init()) return p;
