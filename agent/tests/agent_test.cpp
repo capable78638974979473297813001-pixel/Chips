@@ -61,9 +61,6 @@ static fs::path TempDir(const std::string& tag) {
   return p;
 }
 
-static bool Has(const std::vector<std::string>& v, const std::string& x) {
-  return std::find(v.begin(), v.end(), x) != v.end();
-}
 #endif
 
 static std::string ReadFile(const fs::path& p) {
@@ -223,6 +220,13 @@ static void TestDeviceTree() {
     CHECK_EQ(ds[0].memory_total_bytes, uint64_t(65536000) * 1024);
   }
   fs::remove_all(root);
+}
+
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)  // ReadHost reads /proc only here; macOS uses sysctl
+static bool Has(const std::vector<std::string>& v, const std::string& x) {
+  return std::find(v.begin(), v.end(), x) != v.end();
 }
 
 static void TestReadHostFromProc() {
@@ -392,6 +396,8 @@ int main() {
 #ifndef _WIN32
   TestPci();
   TestDeviceTree();
+#endif
+#if !defined(_WIN32) && !defined(__APPLE__)
   TestReadHostFromProc();
 #endif
   TestParseCpuinfo();
