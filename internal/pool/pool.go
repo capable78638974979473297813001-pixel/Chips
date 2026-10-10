@@ -56,6 +56,9 @@ type Backend struct {
 	lastErr    string
 	hw         *hardware.Report
 	hwErr      string
+	// ttft is a moving average of time to first token on streaming
+	// requests, in seconds (0 = no samples yet).
+	ttft float64
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -67,6 +70,9 @@ type Request struct {
 	Preferred string
 	// Exclude lists backends that already failed this request.
 	Exclude map[string]bool
+	// Priority orders the wait queue: higher ranks are served first
+	// (see config.PriorityRank). Requests of equal priority stay FIFO.
+	Priority int
 }
 
 // Lease is a held concurrency slot. Release must be called exactly once
@@ -196,7 +202,7 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 		return nil, ErrQueueFull
 	}
 	w := &waiter{req: req, start: start, ch: make(chan result, 1)}
-	w.el = p.waiters.PushBack(w)
+	w.el = p.enqueueLocked(w)
 	p.dispatchLocked(false)
 	p.mu.Unlock()
 
@@ -218,6 +224,17 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 		}
 		return nil, ctx.Err()
 	}
+}
+
+// enqueueLocked inserts w behind every waiter of equal or higher priority,
+// so priorities jump the line but each priority stays first come, first served.
+func (p *Pool) enqueueLocked(w *waiter) *list.Element {
+	for el := p.waiters.Back(); el != nil; el = el.Prev() {
+		if el.Value.(*waiter).req.Priority >= w.req.Priority {
+			return p.waiters.InsertAfter(w, el)
+		}
+	}
+	return p.waiters.PushFront(w)
 }
 
 // QueueDepth reports how many requests are waiting for a slot.
@@ -387,9 +404,24 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 // percentages must be before it decides between them; smaller gaps are noise.
 const gpuBusyMargin = 10
 
+// latencyMargin is how much faster (as a fraction) one backend's recent time
+// to first token must be before it wins a tie on load.
+const latencyMargin = 0.3
+
 func better(a, b *Backend) bool {
 	if ua, ub := a.utilization(), b.utilization(); ua != ub {
 		return ua < ub
+	}
+	// Equal load: prefer the backend that has been answering faster. This
+	// steers around a node that is thermally throttled, on a shared GPU, or
+	// otherwise degraded, while small differences are left to the rules below.
+	if a.ttft > 0 && b.ttft > 0 {
+		if a.ttft < b.ttft*(1-latencyMargin) {
+			return true
+		}
+		if b.ttft < a.ttft*(1-latencyMargin) {
+			return false
+		}
 	}
 	// Equal router load: prefer the node whose accelerators are less busy.
 	// This catches load the router cannot see, such as a training job or
@@ -442,6 +474,22 @@ func (p *Pool) Observe(b *Backend, ok, passive bool, errMsg string) {
 			p.log.Warn("backend is unhealthy", "backend", b.Name, "error", b.lastErr)
 		}
 		p.dispatchLocked(true)
+	}
+}
+
+// ttftWeight is the weight of a new sample in the time-to-first-token
+// average; about the last ten streaming requests dominate it.
+const ttftWeight = 0.2
+
+// ObserveTTFT records how long b took to produce the first bytes of a
+// streaming response.
+func (p *Pool) ObserveTTFT(b *Backend, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if b.ttft == 0 {
+		b.ttft = d.Seconds()
+	} else {
+		b.ttft += ttftWeight * (d.Seconds() - b.ttft)
 	}
 }
 
@@ -525,14 +573,17 @@ type Status struct {
 	URL  string `json:"url"`
 	Tier string `json:"tier"`
 	// TierSource is "auto" when chipagent's report chose the tier.
-	TierSource       string          `json:"tier_source"`
-	Healthy          bool            `json:"healthy"`
-	Inflight         int             `json:"inflight"`
-	MaxConcurrency   int             `json:"max_concurrency"`
-	MaxContextTokens int             `json:"max_context_tokens,omitempty"`
-	Models           []string        `json:"models"`
-	LastError        string          `json:"last_error,omitempty"`
-	Hardware         *HardwareStatus `json:"hardware,omitempty"`
+	TierSource       string   `json:"tier_source"`
+	Healthy          bool     `json:"healthy"`
+	Inflight         int      `json:"inflight"`
+	MaxConcurrency   int      `json:"max_concurrency"`
+	MaxContextTokens int      `json:"max_context_tokens,omitempty"`
+	Models           []string `json:"models"`
+	LastError        string   `json:"last_error,omitempty"`
+	// TTFTMillis is the recent average time to first token on streaming
+	// requests (0 until one has been served).
+	TTFTMillis float64         `json:"ttft_ms"`
+	Hardware   *HardwareStatus `json:"hardware,omitempty"`
 }
 
 func (p *Pool) Snapshot() []Status {
@@ -557,7 +608,8 @@ func (p *Pool) Snapshot() []Status {
 			Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, TierSource: source, Healthy: b.healthy,
 			Inflight: b.inflight, MaxConcurrency: b.MaxConcurrency,
 			MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
-			Hardware: b.hardwareStatus(),
+			TTFTMillis: math.Round(b.ttft * 1000),
+			Hardware:   b.hardwareStatus(),
 		})
 	}
 	return out

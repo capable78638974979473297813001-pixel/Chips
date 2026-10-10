@@ -53,13 +53,70 @@ type Config struct {
 	Health       Health    `yaml:"health"`
 	Upstream     Upstream  `yaml:"upstream"`
 	Hardware     Hardware  `yaml:"hardware"`
+	Cache        Cache     `yaml:"cache"`
+	Models       Models    `yaml:"models"`
+}
+
+// Priority classes order the wait queue: high requests are served before
+// normal ones, normal before low.
+const (
+	PriorityLow    = "low"
+	PriorityNormal = "normal"
+	PriorityHigh   = "high"
+)
+
+// PriorityRank maps a priority name to its queue rank; ok is false for unknown names.
+func PriorityRank(name string) (rank int, ok bool) {
+	switch name {
+	case PriorityLow:
+		return 0, true
+	case PriorityNormal, "":
+		return 1, true
+	case PriorityHigh:
+		return 2, true
+	}
+	return 1, false
+}
+
+// APIKey is a named client key with its own queue priority.
+type APIKey struct {
+	Name     string `yaml:"name"`
+	Key      string `yaml:"key"`
+	KeyEnv   string `yaml:"key_env"`
+	Priority string `yaml:"priority"` // high, normal (default) or low
+}
+
+// Cache answers repeated requests from memory instead of a GPU. Only
+// requests whose answer cannot change are cached unless Mode is "all":
+// embeddings, and generations with temperature 0.
+type Cache struct {
+	Enabled       bool     `yaml:"enabled"`
+	Mode          string   `yaml:"mode"` // deterministic (default) or all
+	TTL           Duration `yaml:"ttl"`
+	MaxBytes      int64    `yaml:"max_bytes"`
+	MaxEntryBytes int64    `yaml:"max_entry_bytes"`
+	// ShareAcrossKeys lets clients with different API keys get each other's
+	// cached answers. Off by default so tenants never see each other's data.
+	ShareAcrossKeys bool `yaml:"share_across_keys"`
+}
+
+// Models customizes the model names clients see.
+type Models struct {
+	// Aliases maps the name a client asks for to the model that serves it,
+	// e.g. gpt-4o: llama-3.1-70b, so apps keep working when models change.
+	Aliases map[string]string `yaml:"aliases"`
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
 type Auth struct {
 	APIKeys    []string `yaml:"api_keys"`
 	APIKeysEnv string   `yaml:"api_keys_env"` // comma-separated keys read from this env var
+	// Keys are named keys with a queue priority. api_keys are normal priority.
+	Keys []APIKey `yaml:"keys"`
 }
+
+// Enabled reports whether the router requires a key.
+func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 }
 
 type Backend struct {
 	Name             string   `yaml:"name"`
@@ -107,10 +164,17 @@ func (r Routing) AffinityEnabled() bool { return r.PrefixAffinity == nil || *r.P
 type Queue struct {
 	MaxWaiting int      `yaml:"max_waiting"`
 	MaxWait    Duration `yaml:"max_wait"`
+	// PriorityHeader lets clients set their priority with the
+	// X-SiliconRouter-Priority header. Only enable it for trusted clients.
+	PriorityHeader bool `yaml:"priority_header"`
 }
 
 type Retry struct {
 	MaxAttempts int `yaml:"max_attempts"`
+	// FirstTokenTimeout: if a streaming response has not produced its first
+	// bytes by then, the request moves to another backend before anything
+	// reaches the client. 0 disables it. The last attempt always waits.
+	FirstTokenTimeout Duration `yaml:"first_token_timeout"`
 }
 
 type Health struct {
@@ -213,6 +277,24 @@ func (c *Config) applyDefaults() {
 	if c.Retry.MaxAttempts == 0 {
 		c.Retry.MaxAttempts = 3
 	}
+	if c.Retry.FirstTokenTimeout == 0 {
+		// Generous enough for a very long prompt's prefill; catches a backend
+		// that accepted the request and stalled. Chat deployments can go lower.
+		c.Retry.FirstTokenTimeout = Duration(60 * time.Second)
+	}
+	cc := &c.Cache
+	if cc.Mode == "" {
+		cc.Mode = "deterministic"
+	}
+	if cc.TTL == 0 {
+		cc.TTL = Duration(10 * time.Minute)
+	}
+	if cc.MaxBytes == 0 {
+		cc.MaxBytes = 256 << 20
+	}
+	if cc.MaxEntryBytes == 0 {
+		cc.MaxEntryBytes = 4 << 20
+	}
 	h := &c.Health
 	if h.Path == "" {
 		h.Path = "/v1/models"
@@ -253,6 +335,11 @@ func (c *Config) resolveEnv() {
 			if k = strings.TrimSpace(k); k != "" {
 				c.Auth.APIKeys = append(c.Auth.APIKeys, k)
 			}
+		}
+	}
+	for i := range c.Auth.Keys {
+		if k := &c.Auth.Keys[i]; k.KeyEnv != "" {
+			k.Key = os.Getenv(k.KeyEnv)
 		}
 	}
 	for i := range c.Backends {
@@ -322,6 +409,31 @@ func (c *Config) validate() error {
 	}
 	if c.Retry.MaxAttempts < 1 {
 		errs = append(errs, errors.New("retry.max_attempts must be at least 1"))
+	}
+	if c.Retry.FirstTokenTimeout < 0 {
+		errs = append(errs, errors.New("retry.first_token_timeout must not be negative"))
+	}
+	for i, k := range c.Auth.Keys {
+		where := fmt.Sprintf("auth.keys[%d]", i)
+		if k.Key == "" {
+			errs = append(errs, fmt.Errorf("%s: key is empty (set key or a key_env that exists)", where))
+		}
+		if _, ok := PriorityRank(k.Priority); !ok {
+			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, k.Priority))
+		}
+	}
+	if m := c.Cache.Mode; m != "deterministic" && m != "all" {
+		errs = append(errs, fmt.Errorf("cache.mode must be deterministic or all, got %q", m))
+	}
+	if c.Cache.MaxBytes < 0 || c.Cache.MaxEntryBytes < 0 || c.Cache.MaxEntryBytes > c.Cache.MaxBytes {
+		errs = append(errs, errors.New("cache: need 0 <= max_entry_bytes <= max_bytes"))
+	}
+	for alias, target := range c.Models.Aliases {
+		if alias == "" || target == "" {
+			errs = append(errs, errors.New("models.aliases: names must not be empty"))
+		} else if _, chained := c.Models.Aliases[target]; chained {
+			errs = append(errs, fmt.Errorf("models.aliases: %q points to %q, which is itself an alias", alias, target))
+		}
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {
 		errs = append(errs, errors.New("health.path must start with /"))

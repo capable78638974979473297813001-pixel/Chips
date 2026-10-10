@@ -14,6 +14,9 @@
   silicon, with automatic tiering (`tier: auto`) and a busy-GPU tie-break in the router
 - Any HTTP AI API is forwarded (OpenAI, Anthropic-style, Ollama, TGI, Triton/KServe, Gemini-style,
   multipart, binary), with the model read from the body, URL or form
+- Speed: first-token failover for stalled backends, latency-aware routing, response cache
+  (embeddings and temperature 0), and a single-pass request scanner (2.2x lower router overhead)
+- Customization: model aliases, named API keys with priority classes, cache controls
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
@@ -23,7 +26,6 @@
 |---|---|
 | Real tokenizers (optional, per model) | Exact token counts for context limits and billing |
 | Per-key rate limits and quotas | Multi-team fairness; stops one team starving the others |
-| Priority classes | Interactive chat ahead of batch jobs in the queue |
 | Config hot-reload, plus backend add/remove via API | Scale the fleet without a restart |
 | Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
 | chipagent: live telemetry for Intel, Gaudi (hl-smi), Neuron, TPU; Apple/Windows GPU utilization; real-hardware validation | Fill the remaining gaps in the vendor matrix |

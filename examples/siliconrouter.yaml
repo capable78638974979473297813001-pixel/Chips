@@ -8,6 +8,10 @@ max_body_bytes: 16777216          # reject request bodies larger than this (16 M
 auth:
   api_keys: []
   api_keys_env: SILICONROUTER_API_KEYS   # comma-separated keys from the environment
+  # Named keys with a queue priority: high jumps ahead of normal, normal ahead of low.
+  # keys:
+  #   - {name: chat-app, key_env: CHAT_APP_KEY, priority: high}
+  #   - {name: nightly-batch, key_env: BATCH_KEY, priority: low}
 
 # Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
 # llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.
@@ -59,9 +63,33 @@ routing:
 queue:
   max_waiting: 1024                 # beyond this, answer 429 + Retry-After immediately
   max_wait: 30s                     # how long a request may wait for a free slot
+  priority_header: false            # let clients send X-SiliconRouter-Priority: high|normal|low (trusted clients only)
 
 retry:
   max_attempts: 3                   # tries across different backends before giving up
+  # A streaming response that produces nothing for this long is moved to another
+  # backend before the client sees a byte (the last attempt always waits).
+  # 60s tolerates very long prompts; 10-20s suits chat.
+  first_token_timeout: 60s
+
+# Answer repeated requests from memory. Only answers that cannot change are
+# cached: embeddings, and generations with temperature 0 (mode: all caches
+# everything). Clients can skip it with "Cache-Control: no-cache".
+cache:
+  enabled: false
+  mode: deterministic
+  ttl: 10m
+  max_bytes: 268435456              # 256 MiB in total
+  max_entry_bytes: 4194304          # responses larger than 4 MiB are not stored
+  share_across_keys: false          # true lets different API keys share cached answers
+
+# Names clients use -> the model that serves them. Lets apps written for one
+# model keep working when you swap in another.
+models:
+  aliases: {}
+  # aliases:
+  #   gpt-4o: llama-3.1-70b
+  #   text-embedding-3-small: bge-large-en
 
 health:
   disabled: false

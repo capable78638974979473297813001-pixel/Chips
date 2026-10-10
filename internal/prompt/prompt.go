@@ -10,7 +10,6 @@ package prompt
 
 import (
 	"bytes"
-	"encoding/json"
 	"hash/fnv"
 	"io"
 	"mime"
@@ -25,15 +24,13 @@ type Info struct {
 	Stream bool
 	// MaxTokens is the requested completion budget, 0 if unspecified.
 	MaxTokens int
-	// Text is a canonical rendering of the prompt used for prefix matching.
-	// Two requests whose prompts start the same way have Texts that start the same way.
+	// Text is a canonical rendering of the prompt used for prefix matching:
+	// message contents as they appear in the body (JSON-escaped), so two
+	// requests whose prompts start the same way have Texts that start the same way.
 	Text string
-}
-
-type message struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-	Parts   json.RawMessage `json:"parts"` // Gemini
+	// Deterministic is true when the request asks for greedy decoding
+	// (temperature 0), so an identical request gets an identical answer.
+	Deterministic bool
 }
 
 // Inspect reads whatever routing hints a request carries. It never fails:
@@ -76,6 +73,22 @@ func ModelFromPath(path string) string {
 	return ""
 }
 
+// ReplacePathModel swaps the model named in a URL (see ModelFromPath).
+func ReplacePathModel(path, model string) string {
+	segs := strings.Split(path, "/")
+	for i := 0; i+1 < len(segs); i++ {
+		if segs[i] == "models" || segs[i] == "deployments" {
+			_, action, hasAction := strings.Cut(segs[i+1], ":")
+			segs[i+1] = model
+			if hasAction {
+				segs[i+1] += ":" + action
+			}
+			return strings.Join(segs, "/")
+		}
+	}
+	return path
+}
+
 func multipartField(body []byte, boundary, field string) string {
 	if boundary == "" {
 		return ""
@@ -93,120 +106,119 @@ func multipartField(body []byte, boundary, field string) string {
 	}
 }
 
-// Parse reads a JSON request body. Each known field is decoded on its own,
-// so an unexpected type in one field does not hide the others.
+// Parse reads a JSON request body in one pass without decoding it: it picks
+// out the few fields routing needs and slices the prompt text straight out of
+// the body bytes.
 func Parse(body []byte) (Info, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
+	var info Info
+	var maxCompletion, maxTokens, params, options, genCfg, temperature []byte
+	var system, systemInstruction, messages, contents []byte
+	var inputs [4][]byte // prompt, input, inputs, instances: first present wins, in this order
+	err := eachField(body, func(k, v []byte) bool {
+		switch string(k) {
+		case "model":
+			info.Model, _ = stringValue(v)
+		case "stream":
+			info.Stream = string(v) == "true"
+		case "max_completion_tokens":
+			maxCompletion = v
+		case "max_tokens":
+			maxTokens = v
+		case "parameters": // TGI
+			params = v
+		case "options": // Ollama
+			options = v
+		case "generationConfig": // Gemini
+			genCfg = v
+		case "temperature":
+			temperature = v
+		case "system": // Anthropic, Ollama
+			system = v
+		case "systemInstruction": // Gemini
+			systemInstruction = v
+		case "messages":
+			messages = v
+		case "contents": // Gemini
+			contents = v
+		case "prompt":
+			inputs[0] = v
+		case "input":
+			inputs[1] = v
+		case "inputs": // TGI
+			inputs[2] = v
+		case "instances": // Vertex, TF Serving, KServe v1
+			inputs[3] = v
+		}
+		return true
+	})
+	if err != nil {
 		return Info{}, err
 	}
-	get := func(key string, v any) bool {
-		raw, ok := fields[key]
-		return ok && json.Unmarshal(raw, v) == nil
-	}
-
-	var info Info
-	get("model", &info.Model)
-	get("stream", &info.Stream)
 
 	// Completion budget, by API: OpenAI, Anthropic and most engines use
 	// max_tokens (newer OpenAI: max_completion_tokens); TGI nests
 	// max_new_tokens in parameters; Ollama uses options.num_predict; Gemini
 	// uses generationConfig.maxOutputTokens.
-	var n int
-	var tgi struct {
-		MaxNewTokens int `json:"max_new_tokens"`
-	}
-	var ollama struct {
-		NumPredict int `json:"num_predict"`
-	}
-	var gemini struct {
-		MaxOutputTokens int `json:"maxOutputTokens"`
-	}
-	switch {
-	case get("max_completion_tokens", &n), get("max_tokens", &n):
-		info.MaxTokens = n
-	case get("parameters", &tgi) && tgi.MaxNewTokens > 0:
-		info.MaxTokens = tgi.MaxNewTokens
-	case get("options", &ollama) && ollama.NumPredict > 0:
-		info.MaxTokens = ollama.NumPredict
-	case get("generationConfig", &gemini) && gemini.MaxOutputTokens > 0:
-		info.MaxTokens = gemini.MaxOutputTokens
-	}
-
-	// The system prompt comes first so it anchors the shared prefix:
-	// Anthropic and Ollama put it in "system", Gemini in "systemInstruction".
-	var sb strings.Builder
-	sb.WriteString(contentText(fields["system"]))
-	var sysInstr message
-	if get("systemInstruction", &sysInstr) {
-		sb.WriteString(contentText(sysInstr.Parts))
-	}
-
-	var msgs []message
-	if !get("messages", &msgs) {
-		get("contents", &msgs) // Gemini
-	}
-	for _, m := range msgs {
-		// Record and unit separators keep "ab"+"c" distinct from "a"+"bc".
-		sb.WriteByte(0x1e)
-		sb.WriteString(m.Role)
-		sb.WriteByte(0x1f)
-		if len(m.Content) > 0 {
-			sb.WriteString(contentText(m.Content))
-		} else {
-			sb.WriteString(contentText(m.Parts))
+	for _, v := range [][]byte{maxCompletion, maxTokens, field(params, "max_new_tokens"),
+		field(options, "num_predict"), field(genCfg, "maxOutputTokens")} {
+		if n, ok := numberValue(v); ok && n >= 0 && n == float64(int(n)) {
+			info.MaxTokens = int(n)
+			break
 		}
 	}
-	if len(msgs) == 0 {
-		// Completions (prompt), embeddings (input), TGI (inputs), and
-		// Vertex/TF Serving/KServe v1 (instances).
-		for _, key := range []string{"prompt", "input", "inputs", "instances"} {
-			if raw := fields[key]; len(raw) > 0 {
-				sb.WriteString(contentText(raw))
+	// Sampling temperature, wherever the API puts it. Zero means greedy
+	// decoding: the same request yields the same answer.
+	for _, v := range [][]byte{temperature, field(options, "temperature"), field(params, "temperature"),
+		field(genCfg, "temperature")} {
+		if t, ok := numberValue(v); ok {
+			info.Deterministic = t == 0
+			break
+		}
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(body))
+	// The system prompt comes first so it anchors the shared prefix.
+	sb.Write(textOf(system))
+	sb.Write(textOf(field(systemInstruction, "parts")))
+	if messages == nil {
+		messages = contents
+	}
+	n := 0
+	eachElement(messages, func(m []byte) {
+		n++
+		var role, content, parts []byte
+		eachField(m, func(k, v []byte) bool {
+			switch string(k) {
+			case "role":
+				role = v
+			case "content":
+				content = v
+			case "parts": // Gemini
+				parts = v
+			}
+			return true
+		})
+		// Record and unit separators keep "ab"+"c" distinct from "a"+"bc".
+		sb.WriteByte(0x1e)
+		sb.Write(textOf(role))
+		sb.WriteByte(0x1f)
+		if content != nil {
+			sb.Write(textOf(content))
+		} else {
+			sb.Write(textOf(parts))
+		}
+	})
+	if n == 0 {
+		for _, v := range inputs {
+			if v != nil {
+				sb.Write(textOf(v))
 				break
 			}
 		}
 	}
 	info.Text = sb.String()
 	return info, nil
-}
-
-// contentText flattens a message content field. Strings are used as-is; for
-// multi-part content the text parts are concatenated and any other part
-// (images, audio) contributes its raw JSON so it still affects the prefix.
-func contentText(raw json.RawMessage) string {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || string(raw) == "null" {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
-	}
-	var parts []json.RawMessage
-	if json.Unmarshal(raw, &parts) == nil {
-		var sb strings.Builder
-		for _, p := range parts {
-			var part struct {
-				Type string  `json:"type"`
-				Text *string `json:"text"`
-			}
-			// OpenAI and Anthropic tag text parts with "type"; Gemini parts are bare {"text": ...}.
-			if json.Unmarshal(p, &part) == nil && part.Text != nil && (part.Type == "" || part.Type == "text") {
-				sb.WriteString(*part.Text)
-				continue
-			}
-			var str string
-			if json.Unmarshal(p, &str) == nil {
-				sb.WriteString(str)
-				continue
-			}
-			sb.Write(p)
-		}
-		return sb.String()
-	}
-	return string(raw)
 }
 
 // EstimateTokens approximates a token count from character length. It is

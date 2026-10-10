@@ -1,6 +1,8 @@
 package prompt
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -19,7 +21,7 @@ func TestParseChat(t *testing.T) {
 	if info.Model != "llama" || !info.Stream || info.MaxTokens != 20 {
 		t.Errorf("info = %+v", info)
 	}
-	for _, want := range []string{"be brief", "what is this?", "data:x", "system", "user"} {
+	for _, want := range []string{"be brief", "what is ", "this?", "data:x", "system", "user"} {
 		if !strings.Contains(info.Text, want) {
 			t.Errorf("text %q missing %q", info.Text, want)
 		}
@@ -32,7 +34,7 @@ func TestParseCompletionAndEmbeddings(t *testing.T) {
 		t.Errorf("completion: %+v, %v", info, err)
 	}
 	info, err = Parse([]byte(`{"model": "m", "input": ["a", "b"]}`))
-	if err != nil || info.Text != "ab" {
+	if err != nil || info.Text != `["a", "b"]` {
 		t.Errorf("embeddings: %+v, %v", info, err)
 	}
 }
@@ -147,6 +149,109 @@ func TestModelFromPath(t *testing.T) {
 	} {
 		if got := ModelFromPath(path); got != want {
 			t.Errorf("%s: %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestDeterministic(t *testing.T) {
+	for body, want := range map[string]bool{
+		`{"temperature":0}`:                             true,
+		`{"temperature":0.0}`:                           true,
+		`{"temperature":0.7}`:                           false,
+		`{}`:                                            false, // API defaults sample
+		`{"options":{"temperature":0}}`:                 true,  // Ollama
+		`{"parameters":{"temperature":0}}`:              true,  // TGI
+		`{"generationConfig":{"temperature":0}}`:        true,  // Gemini
+		`{"temperature":1,"options":{"temperature":0}}`: false, // top level wins
+	} {
+		info, err := Parse([]byte(body))
+		if err != nil || info.Deterministic != want {
+			t.Errorf("%s: deterministic=%v err=%v, want %v", body, info.Deterministic, err, want)
+		}
+	}
+}
+
+func TestScannerEdgeCases(t *testing.T) {
+	ok := []string{
+		`{}`, ` { } `, `{"model":"a\"b"}`, `{"messages":[]}`, `{"x":{"y":[1,{"z":"]}"}]},"model":"m"}`,
+		`{"model":"m","messages":[{"role":"user","content":"a, \"b\" ]}"}]}`, `{"model":"\u00e9t\u00e9"}`,
+	}
+	for _, b := range ok {
+		if _, err := Parse([]byte(b)); err != nil {
+			t.Errorf("%s: %v", b, err)
+		}
+	}
+	if info, _ := Parse([]byte(`{"model":"a\"b"}`)); info.Model != `a"b` {
+		t.Errorf("escaped model = %q", info.Model)
+	}
+	if info, _ := Parse([]byte(`{"model":"\u00e9t\u00e9"}`)); info.Model != "été" {
+		t.Errorf("unicode model = %q", info.Model)
+	}
+	bad := []string{``, `[]`, `"x"`, `{`, `{"a"}`, `{"a":}`, `{"a":"b"`, `{"a":"b" "c":1}`, `{"a":[1,2}`, `{"a":"unterminated}`}
+	for _, b := range bad {
+		if _, err := Parse([]byte(b)); err == nil {
+			t.Errorf("%q: expected an error", b)
+		}
+	}
+}
+
+// The scanner must never panic, and on any valid JSON object it must find
+// the same model and stream flag as encoding/json.
+func FuzzParse(f *testing.F) {
+	for _, seed := range []string{
+		`{"model":"llama","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"a\u0062c","x":[{"y":"}"}],"temperature":0}`,
+		`{"inputs":"x","parameters":{"max_new_tokens":5}}`,
+		`{"a":`, `[1,2]`, `{"model":1}`,
+	} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		info, err := Parse(body)
+		// A map, not a struct: struct decoding matches keys case-insensitively,
+		// but API field names are exact.
+		var ref map[string]any
+		if json.Unmarshal(body, &ref) != nil || !json.Valid(body) {
+			return
+		}
+		if body := bytes.TrimSpace(body); len(body) == 0 || body[0] != '{' {
+			return
+		}
+		if err != nil {
+			t.Fatalf("valid object rejected: %v", err)
+		}
+		if m, ok := ref["model"].(string); ok && m != info.Model {
+			t.Fatalf("model %q, encoding/json says %q", info.Model, m)
+		}
+		if st, ok := ref["stream"].(bool); ok && st != info.Stream {
+			t.Fatalf("stream %v, encoding/json says %v", info.Stream, st)
+		}
+	})
+}
+
+func TestReplaceModel(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"\"model\":\"x\""}], "model" : "gpt-4o", "stream":true}`)
+	out, ok := ReplaceModel(body, "llama-3.1-70b")
+	if !ok || string(out) != `{"messages":[{"role":"user","content":"\"model\":\"x\""}], "model" : "llama-3.1-70b", "stream":true}` {
+		t.Errorf("got %s", out)
+	}
+	if _, ok := ReplaceModel([]byte(`{"prompt":"x"}`), "m"); ok {
+		t.Error("replaced a missing field")
+	}
+	if out, _ := ReplaceModel([]byte(`{"model":"a"}`), `we"ird`); string(out) != `{"model":"we\"ird"}` {
+		t.Errorf("not escaped: %s", out)
+	}
+}
+
+func TestReplacePathModel(t *testing.T) {
+	for in, want := range map[string]string{
+		"/v2/models/old/infer":                     "/v2/models/new/infer",
+		"/v1beta/models/old:generateContent":       "/v1beta/models/new:generateContent",
+		"/openai/deployments/old/chat/completions": "/openai/deployments/new/chat/completions",
+		"/v1/chat/completions":                     "/v1/chat/completions",
+	} {
+		if got := ReplacePathModel(in, "new"); got != want {
+			t.Errorf("%s -> %s, want %s", in, got, want)
 		}
 	}
 }

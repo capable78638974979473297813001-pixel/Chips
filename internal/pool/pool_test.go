@@ -280,3 +280,62 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+func TestPriorityJumpsTheQueue(t *testing.T) {
+	p := newPool(t, Options{}, be("only", config.TierStandard, 1))
+	busy := acquire(t, p, Request{})
+	order := make(chan string, 4)
+	for i, w := range []struct {
+		name string
+		prio int
+	}{{"low", 0}, {"normal-1", 1}, {"high", 2}, {"normal-2", 1}} {
+		go func() {
+			l, err := p.Acquire(context.Background(), Request{Priority: w.prio})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			order <- w.name
+			l.Release()
+		}()
+		for p.QueueDepth() != i+1 { // enqueue strictly in this order
+			time.Sleep(time.Millisecond)
+		}
+	}
+	busy.Release()
+	var seen []string
+	for range 4 {
+		seen = append(seen, <-order)
+	}
+	if want := []string{"high", "normal-1", "normal-2", "low"}; !equal(seen, want) {
+		t.Errorf("served %v, want %v", seen, want)
+	}
+}
+
+func TestFasterBackendWinsTies(t *testing.T) {
+	p := newPool(t, Options{}, be("slow", config.TierStandard, 4), be("fast", config.TierStandard, 4))
+	p.ObserveTTFT(p.byName["slow"], 900*time.Millisecond)
+	p.ObserveTTFT(p.byName["fast"], 200*time.Millisecond)
+	if got := acquire(t, p, Request{}).Backend.Name; got != "fast" {
+		t.Errorf("went to %s, want fast", got)
+	}
+	// Load still comes first: fast now has one in flight, slow none.
+	if got := acquire(t, p, Request{}).Backend.Name; got != "slow" {
+		t.Errorf("went to %s, want slow once fast is busier", got)
+	}
+	// Within the margin it is a tie, decided by config order.
+	q := newPool(t, Options{}, be("a", config.TierStandard, 4), be("b", config.TierStandard, 4))
+	q.ObserveTTFT(q.byName["a"], 300*time.Millisecond)
+	q.ObserveTTFT(q.byName["b"], 250*time.Millisecond)
+	if got := acquire(t, q, Request{}).Backend.Name; got != "a" {
+		t.Errorf("went to %s, want a (within margin)", got)
+	}
+	if ms := q.Snapshot()[1].TTFTMillis; ms != 250 {
+		t.Errorf("ttft_ms = %v", ms)
+	}
+	// The average moves toward new samples.
+	q.ObserveTTFT(q.byName["b"], 1250*time.Millisecond)
+	if ms := q.Snapshot()[1].TTFTMillis; ms != 450 {
+		t.Errorf("ttft_ms after a slow sample = %v, want 450", ms)
+	}
+}

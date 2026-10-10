@@ -36,7 +36,12 @@ endpoint.
    vendors. With `tier: auto` the router tiers each node from what it actually has, sees GPU load
    from outside work, and lists the whole mixed fleet in one inventory. See
    [docs/HARDWARE.md](docs/HARDWARE.md).
-5. **Survives failures.** If a server dies mid-request, the request is retried on another server
+5. **Stays fast.** A streaming request whose backend stalls is moved to another backend before the
+   user sees anything. Equally loaded nodes are chosen by how fast they have actually been
+   answering. Repeated embeddings and temperature-0 requests can be answered from a response cache
+   in under a millisecond. Interactive traffic can be given priority over batch jobs. See
+   [docs/TUNING.md](docs/TUNING.md).
+6. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover.
 
@@ -120,8 +125,12 @@ Request headers:
 - `X-Session-ID: <id>` (optional): pins a conversation to one backend even if the client trims
   old messages.
 
-Response headers: `X-SiliconRouter-Backend` (which server answered) and
-`X-SiliconRouter-Prefix-Cache` (`hit` when routed to the server holding the conversation).
+Response headers: `X-SiliconRouter-Backend` (which server answered),
+`X-SiliconRouter-Prefix-Cache` (`hit` when routed to the server holding the conversation), and
+`X-SiliconRouter-Cache` (`hit`/`miss` when the response cache is enabled).
+
+Optional request headers: `X-SiliconRouter-Priority: high|normal|low` (when `queue.priority_header` is
+on) and `Cache-Control: no-cache` (skip the response cache).
 
 Key metrics: `siliconrouter_prefix_cache_routing_total{result="hit|rebalanced|miss"}`,
 `siliconrouter_queue_depth`, `siliconrouter_queue_wait_seconds`, `siliconrouter_backend_inflight`,
@@ -161,7 +170,8 @@ internal/hardware   chipagent client, telemetry schema, automatic tiering
 internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
 internal/affinity   prefix → backend LRU table
-internal/prompt     request parsing, prefix hashing, size estimates
+internal/cache      response cache (LRU, byte budget, TTL)
+internal/prompt     single-pass request scanner, prefix hashing, size estimates
 internal/config     YAML config, defaults, validation
 ```
 

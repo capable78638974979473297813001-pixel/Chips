@@ -70,6 +70,28 @@ backends: [{name: a, url: "http://h:8000", tier: auto, agent_url: "http://h:9400
 	}
 }
 
+func TestSpeedAndCustomizationDefaults(t *testing.T) {
+	t.Setenv("SR_CHAT_KEY", "secret")
+	c, err := Parse([]byte(`
+backends: [{name: a, url: "http://h:1"}]
+auth: {keys: [{name: chat, key_env: SR_CHAT_KEY, priority: high}]}
+cache: {enabled: true}
+models: {aliases: {gpt-4o: llama}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Retry.FirstTokenTimeout.D() != 60*time.Second || c.Cache.Mode != "deterministic" || c.Cache.TTL.D() != 10*time.Minute {
+		t.Errorf("defaults: retry %+v cache %+v", c.Retry, c.Cache)
+	}
+	if k := c.Auth.Keys[0]; k.Key != "secret" || !c.Auth.Enabled() {
+		t.Errorf("named key = %+v", k)
+	}
+	if r, _ := PriorityRank("high"); r != 2 {
+		t.Errorf("rank(high) = %d", r)
+	}
+}
+
 func TestValidation(t *testing.T) {
 	cases := map[string]string{
 		"no backends":     `listen: ":1"`,
@@ -80,6 +102,11 @@ func TestValidation(t *testing.T) {
 		"bad duration":    "backends: [{name: a, url: \"http://h:1\"}]\nqueue: {max_wait: soon}",
 		"missing env key": `backends: [{name: a, url: "http://h:1", api_key_env: SR_DEFINITELY_UNSET}]`,
 		"bad imbalance":   "backends: [{name: a, url: \"http://h:1\"}]\nrouting: {affinity_max_imbalance: 2}",
+		"bad priority":    "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key: k, priority: urgent}]}",
+		"key env unset":   "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key_env: SR_DEFINITELY_UNSET}]}",
+		"bad cache mode":  "backends: [{name: a, url: \"http://h:1\"}]\ncache: {mode: sometimes}",
+		"chained alias":   "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {aliases: {a: b, b: c}}",
+		"negative ttft":   "backends: [{name: a, url: \"http://h:1\"}]\nretry: {first_token_timeout: -1s}",
 		"bad health path": `backends: [{name: a, url: "http://h:1", health_path: "health"}]`,
 		"auto no agent":   `backends: [{name: a, url: "http://h:1", tier: auto}]`,
 		"bad agent url":   `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,

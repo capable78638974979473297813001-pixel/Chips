@@ -26,7 +26,7 @@ type fakeBackend struct {
 	handler  http.HandlerFunc
 }
 
-func newFake(t *testing.T, h http.HandlerFunc) *fakeBackend {
+func newFake(t testing.TB, h http.HandlerFunc) *fakeBackend {
 	f := &fakeBackend{handler: h}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
@@ -47,7 +47,7 @@ func newFake(t *testing.T, h http.HandlerFunc) *fakeBackend {
 	return f
 }
 
-func setup(t *testing.T, mutate func(*config.Config), urls ...string) (*httptest.Server, *pool.Pool) {
+func setup(t testing.TB, mutate func(*config.Config), urls ...string) (*httptest.Server, *pool.Pool) {
 	t.Helper()
 	var sb strings.Builder
 	sb.WriteString("backends:\n")
@@ -71,7 +71,8 @@ func setup(t *testing.T, mutate func(*config.Config), urls ...string) (*httptest
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(New(cfg, p, &http.Client{}, log))
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 256}}
+	ts := httptest.NewServer(New(cfg, p, client, log))
 	t.Cleanup(ts.Close)
 	return ts, p
 }
