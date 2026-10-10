@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
     if (auto dxgi = chipagent::OpenDxgi(have_nvml)) providers.push_back(std::move(dxgi));
 #elif defined(__APPLE__)
+    (void)have_nvml;  // no NVML on macOS: NVIDIA's driver there never shipped it
     if (auto apple = chipagent::OpenApple()) providers.push_back(std::move(apple));
 #else
     providers.push_back(chipagent::OpenPci(sysfs_root, have_nvml));
