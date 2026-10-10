@@ -16,9 +16,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/affinity"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
@@ -29,23 +31,47 @@ import (
 // which helps when they trim old turns and the prompt prefix changes.
 const SessionHeader = "X-Session-ID"
 
+// PriorityHeader sets a request's queue priority (high, normal, low) when
+// queue.priority_header is enabled.
+const PriorityHeader = "X-SiliconRouter-Priority"
+
 type Server struct {
 	cfg      *config.Config
 	pool     *pool.Pool
 	affinity *affinity.Table
+	cache    *cache.Cache // nil when disabled
+	keys     map[string]clientInfo
 	client   *http.Client
 	log      *slog.Logger
 	reg      *metrics.Registry
 	mux      *http.ServeMux
 
-	requests     *metrics.CounterVec
-	upstreamErrs *metrics.CounterVec
-	retries      *metrics.CounterVec
-	rejected     *metrics.CounterVec
-	cacheLookups *metrics.CounterVec
-	duration     *metrics.Histogram
-	queueWait    *metrics.Histogram
-	firstByte    *metrics.Histogram
+	requests      *metrics.CounterVec
+	upstreamErrs  *metrics.CounterVec
+	retries       *metrics.CounterVec
+	rejected      *metrics.CounterVec
+	cacheLookups  *metrics.CounterVec
+	responseCache *metrics.CounterVec
+	ttftTimeouts  *metrics.CounterVec
+	duration      *metrics.Histogram
+	queueWait     *metrics.Histogram
+	firstByte     *metrics.Histogram
+}
+
+// clientInfo is who sent a request, from the API key it used.
+type clientInfo struct {
+	name     string
+	key      string
+	priority int
+}
+
+type clientKeyCtx struct{}
+
+func clientFrom(ctx context.Context) clientInfo {
+	if c, ok := ctx.Value(clientKeyCtx{}).(clientInfo); ok {
+		return c
+	}
+	return clientInfo{priority: 1}
 }
 
 func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger) *Server {
@@ -67,7 +93,32 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		duration:     reg.NewHistogram("siliconrouter_request_duration_seconds", "End-to-end request latency.", metrics.LatencyBuckets),
 		queueWait:    reg.NewHistogram("siliconrouter_queue_wait_seconds", "Time spent waiting for a backend slot.", metrics.LatencyBuckets),
 		firstByte:    reg.NewHistogram("siliconrouter_upstream_ttfb_seconds", "Time from dispatch to first upstream response headers.", metrics.LatencyBuckets),
+
+		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), miss, or skip (request not cacheable).", "result"),
+		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 	}
+	s.keys = map[string]clientInfo{}
+	for _, k := range cfg.Auth.APIKeys {
+		s.keys[k] = clientInfo{key: k, priority: 1}
+	}
+	for _, k := range cfg.Auth.Keys {
+		rank, _ := config.PriorityRank(k.Priority)
+		s.keys[k.Key] = clientInfo{name: k.Name, key: k.Key, priority: rank}
+	}
+	if cfg.Cache.Enabled {
+		s.cache = cache.New(cfg.Cache.MaxBytes, cfg.Cache.TTL.D())
+		reg.NewGaugeFunc("siliconrouter_response_cache_bytes", "Bytes held by the response cache.", nil, func(emit func(float64, ...string)) {
+			_, n := s.cache.Stats()
+			emit(float64(n))
+		})
+	}
+	reg.NewGaugeFunc("siliconrouter_backend_ttft_seconds", "Recent average time to first token on streaming requests, per backend.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.TTFTMillis > 0 {
+				emit(st.TTFTMillis/1000, st.Name)
+			}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_backend_inflight", "Requests in flight per backend.", []string{"backend"}, func(emit func(float64, ...string)) {
 		for _, st := range p.Snapshot() {
 			emit(float64(st.Inflight), st.Name)
@@ -137,16 +188,23 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
-	if len(s.cfg.Auth.APIKeys) == 0 {
+	if !s.cfg.Auth.Enabled() {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := clientKey(r.Header); got != "" {
-			for _, k := range s.cfg.Auth.APIKeys {
+			// Compare against every key in constant time, so timing does not
+			// reveal how much of a guess was right.
+			var match clientInfo
+			found := false
+			for k, c := range s.keys {
 				if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
-					next.ServeHTTP(w, r)
-					return
+					match, found = c, true
 				}
+			}
+			if found {
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientKeyCtx{}, match)))
+				return
 			}
 		}
 		s.rejected.Inc("unauthorized")
@@ -206,14 +264,37 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
+	for alias, target := range s.cfg.Models.Aliases {
+		if seen[target] && !seen[alias] {
+			seen[alias] = true
+			data = append(data, model{ID: alias, Object: "model", OwnedBy: "siliconrouter"})
+		}
+	}
 	slices.SortFunc(data, func(a, b model) int { return strings.Compare(a.ID, b.ID) })
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
+// readBody reads a request body into a buffer of exactly Content-Length
+// bytes when the client sent one, instead of growing a buffer repeatedly.
+func readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	body := http.MaxBytesReader(w, r.Body, limit)
+	if n := r.ContentLength; n > 0 && n <= limit {
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(body, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	return io.ReadAll(body)
+}
+
+// relayBuffers are reused across responses; streams copy through them chunk by chunk.
+var relayBuffers = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
 func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
+	body, err := readBody(w, r, s.cfg.MaxBodyBytes)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -225,7 +306,49 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "could not read request body")
 		return
 	}
-	info := prompt.Inspect(r.URL.Path, r.Header.Get("Content-Type"), body)
+	path := r.URL.Path
+	info := prompt.Inspect(path, r.Header.Get("Content-Type"), body)
+	rl := &requestLog{r: r, info: info, start: start, client: clientFrom(r.Context())}
+
+	// Model aliases: the client's name for a model becomes the real one,
+	// in the body or, for APIs that put it there, in the URL.
+	if target, ok := s.cfg.Models.Aliases[info.Model]; ok {
+		if rewritten, ok := prompt.ReplaceModel(body, target); ok {
+			body = rewritten
+		} else {
+			path = prompt.ReplacePathModel(path, target)
+		}
+		rl.alias = info.Model
+		info.Model, rl.info.Model = target, target
+	}
+
+	priority := rl.client.priority
+	if s.cfg.Queue.PriorityHeader {
+		if rank, ok := config.PriorityRank(r.Header.Get(PriorityHeader)); ok && r.Header.Get(PriorityHeader) != "" {
+			priority = rank
+		}
+	}
+	rl.priority = priority
+
+	var cacheKey cache.Key
+	cacheable := s.cacheable(r, path, info)
+	switch {
+	case cacheable:
+		cacheKey = s.cacheKey(r, path, rl.client, body)
+		if e, ok := s.cache.Get(cacheKey); ok {
+			s.responseCache.Inc("hit")
+			rl.cache = "hit"
+			serveCached(w, e)
+			s.requests.Inc("cache", strconv.Itoa(e.Status))
+			s.duration.Observe(time.Since(start).Seconds())
+			s.logRequest(rl, e.Backend, e.Status, 0, false, nil)
+			return
+		}
+		s.responseCache.Inc("miss")
+		rl.cache = "miss"
+	case s.cache != nil:
+		s.responseCache.Inc("skip")
+	}
 
 	rc := s.cfg.Routing
 	req := pool.Request{
@@ -233,6 +356,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		PromptTokens: prompt.EstimateTokens(info.Text, rc.CharsPerToken),
 		MaxTokens:    info.MaxTokens,
 		Exclude:      map[string]bool{},
+		Priority:     priority,
 	}
 	var keys []uint64
 	if rc.AffinityEnabled() {
@@ -252,49 +376,46 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		lease, err := s.pool.Acquire(acquireCtx, req)
 		if err != nil {
 			status := s.rejectAcquire(w, r, err, attempt, lastErr)
-			s.logRequest(r, info, "", status, attempt, start, false, err)
+			s.logRequest(rl, "", status, attempt, false, err)
 			return
 		}
 		s.queueWait.Observe(lease.Waited.Seconds())
 		b := lease.Backend
 		final := attempt >= s.cfg.Retry.MaxAttempts
 
-		dispatched := time.Now()
-		resp, err := s.forward(r, b, body)
-		if err != nil {
+		res := s.attempt(r, path, body, b, info.Stream, final)
+		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
+			if res.resp != nil {
+				io.Copy(io.Discard, io.LimitReader(res.resp.Body, 64<<10))
+				res.resp.Body.Close()
+			}
+			res.cancel()
 			lease.Release()
 			if r.Context().Err() != nil {
-				s.logRequest(r, info, b.Name, 499, attempt, start, lease.Affinity, r.Context().Err())
+				s.logRequest(rl, b.Name, 499, attempt, lease.Affinity, r.Context().Err())
 				return // client went away; nobody to answer
 			}
 			s.upstreamErrs.Inc(b.Name)
-			s.pool.Observe(b, false, true, err.Error())
-			lastErr = fmt.Sprintf("%s: %v", b.Name, err)
-			if final {
+			if res.err != nil {
+				lastErr = fmt.Sprintf("%s: %v", b.Name, res.err)
+				s.pool.Observe(b, false, true, res.err.Error())
+			} else {
+				lastErr = fmt.Sprintf("%s: %s", b.Name, res.resp.Status)
+				if res.resp.StatusCode != http.StatusTooManyRequests {
+					s.pool.Observe(b, false, true, res.resp.Status)
+				}
+			}
+			if res.err != nil && final {
 				s.requests.Inc(b.Name, "502")
 				writeError(w, http.StatusBadGateway, "upstream_error", "backend request failed: "+lastErr)
-				s.logRequest(r, info, b.Name, http.StatusBadGateway, attempt, start, lease.Affinity, err)
+				s.logRequest(rl, b.Name, http.StatusBadGateway, attempt, lease.Affinity, res.err)
 				return
 			}
 			req.Exclude[b.Name] = true
 			s.retries.Inc()
 			continue
 		}
-		s.firstByte.Observe(time.Since(dispatched).Seconds())
-
-		if retryable(resp.StatusCode) && !final {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-			resp.Body.Close()
-			lease.Release()
-			s.upstreamErrs.Inc(b.Name)
-			if resp.StatusCode != http.StatusTooManyRequests {
-				s.pool.Observe(b, false, true, resp.Status)
-			}
-			lastErr = fmt.Sprintf("%s: %s", b.Name, resp.Status)
-			req.Exclude[b.Name] = true
-			s.retries.Inc()
-			continue
-		}
+		resp := res.resp
 		if resp.StatusCode < 500 {
 			s.pool.Observe(b, true, true, "")
 		}
@@ -312,14 +433,125 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		copyErr := s.relay(w, resp, b.Name, lease.Affinity)
+		var capture *captureBuffer
+		if cacheable && resp.StatusCode == http.StatusOK {
+			capture = &captureBuffer{limit: s.cfg.Cache.MaxEntryBytes}
+			w.Header().Set("X-SiliconRouter-Cache", "miss")
+		}
+		copyErr := s.relay(w, resp, b.Name, lease.Affinity, res.first, capture)
 		resp.Body.Close()
+		res.cancel()
 		lease.Release()
+		if capture != nil && copyErr == nil && !capture.overflow {
+			s.cache.Put(cacheKey, &cache.Entry{Status: resp.StatusCode, Header: cacheableHeader(resp.Header), Body: capture.buf.Bytes(), Backend: b.Name})
+		}
 		s.requests.Inc(b.Name, strconv.Itoa(resp.StatusCode))
 		s.duration.Observe(time.Since(start).Seconds())
-		s.logRequest(r, info, b.Name, resp.StatusCode, attempt, start, lease.Affinity, copyErr)
+		s.logRequest(rl, b.Name, resp.StatusCode, attempt, lease.Affinity, copyErr)
 		return
 	}
+}
+
+// attemptResult is one try at a backend. On success the caller must call
+// cancel after the response has been relayed.
+type attemptResult struct {
+	resp   *http.Response
+	first  []byte // the first bytes of a streamed body, already read
+	err    error
+	cancel context.CancelFunc
+}
+
+var errFirstTokenTimeout = errors.New("no output within retry.first_token_timeout")
+
+// attempt sends the request to b. For a streaming request it also waits for
+// the first bytes of the body before returning, so that a backend that
+// accepts a request and then stalls can be abandoned, and the request tried
+// elsewhere, while nothing has reached the client yet. The final attempt has
+// no timeout: a slow answer is better than none.
+func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Backend, stream, final bool) attemptResult {
+	ctx, cancel := context.WithCancel(r.Context())
+	var timer *time.Timer
+	timeout := s.cfg.Retry.FirstTokenTimeout.D()
+	if stream && timeout > 0 && !final {
+		timer = time.AfterFunc(timeout, cancel)
+	}
+	// stopTimer reports whether the deadline had already passed. Call it once.
+	stopTimer := func() (expired bool) { return timer != nil && !timer.Stop() }
+	fail := func(err error, expired bool) attemptResult {
+		cancel()
+		if expired {
+			s.ttftTimeouts.Inc(b.Name)
+			s.pool.ObserveTTFT(b, timeout)
+			err = errFirstTokenTimeout
+		}
+		return attemptResult{err: err, cancel: cancel}
+	}
+
+	dispatched := time.Now()
+	resp, err := s.forward(ctx, r, path, b, body)
+	if err != nil {
+		return fail(err, stopTimer())
+	}
+	s.firstByte.Observe(time.Since(dispatched).Seconds())
+	if !stream || resp.StatusCode != http.StatusOK {
+		stopTimer()
+		return attemptResult{resp: resp, cancel: cancel}
+	}
+
+	buf := make([]byte, 4<<10)
+	n, rerr := resp.Body.Read(buf)
+	expired := stopTimer()
+	if expired || (n == 0 && rerr != nil && rerr != io.EOF) {
+		resp.Body.Close()
+		return fail(rerr, expired)
+	}
+	s.pool.ObserveTTFT(b, time.Since(dispatched))
+	return attemptResult{resp: resp, first: buf[:n], cancel: cancel}
+}
+
+// cacheable reports whether a request's answer can be served from, and
+// stored in, the response cache.
+func (s *Server) cacheable(r *http.Request, path string, info prompt.Info) bool {
+	if s.cache == nil || r.Method != http.MethodPost {
+		return false
+	}
+	if cc := r.Header.Get("Cache-Control"); strings.Contains(cc, "no-cache") || strings.Contains(cc, "no-store") {
+		return false
+	}
+	// Embeddings never vary; generations only at temperature 0.
+	return s.cfg.Cache.Mode == "all" || info.Deterministic || strings.Contains(path, "embed")
+}
+
+func (s *Server) cacheKey(r *http.Request, path string, c clientInfo, body []byte) cache.Key {
+	who := c.key
+	if s.cfg.Cache.ShareAcrossKeys {
+		who = ""
+	}
+	return cache.NewKey([]byte(r.Method), []byte(path), []byte(r.URL.RawQuery), []byte(who), body)
+}
+
+// cacheableHeader keeps the response headers worth replaying.
+func cacheableHeader(h http.Header) http.Header {
+	out := h.Clone()
+	for _, k := range hopHeaders {
+		out.Del(k)
+	}
+	out.Del("Content-Length")
+	out.Del("Date")
+	out.Del("Set-Cookie")
+	return out
+}
+
+func serveCached(w http.ResponseWriter, e *cache.Entry) {
+	h := w.Header()
+	for k, v := range e.Header {
+		h[k] = v
+	}
+	h.Set("X-SiliconRouter-Backend", e.Backend)
+	h.Set("X-SiliconRouter-Cache", "hit")
+	h.Set("Content-Length", strconv.Itoa(len(e.Body)))
+	w.WriteHeader(e.Status)
+	w.Write(e.Body)
 }
 
 func retryable(code int) bool {
@@ -363,12 +595,12 @@ var hopHeaders = []string{
 	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
-func (s *Server) forward(r *http.Request, b *pool.Backend, body []byte) (*http.Response, error) {
+func (s *Server) forward(ctx context.Context, r *http.Request, path string, b *pool.Backend, body []byte) (*http.Response, error) {
 	u := *b.URL
-	u.Path = strings.TrimSuffix(u.Path, "/") + r.URL.Path
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	u.RawPath = ""
 	u.RawQuery = r.URL.RawQuery
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), bytes.NewReader(body))
+	out, err := http.NewRequestWithContext(ctx, r.Method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +609,8 @@ func (s *Server) forward(r *http.Request, b *pool.Backend, body []byte) (*http.R
 		out.Header.Del(h)
 	}
 	out.Header.Del(SessionHeader)
-	if len(s.cfg.Auth.APIKeys) > 0 {
+	out.Header.Del(PriorityHeader)
+	if s.cfg.Auth.Enabled() {
 		for _, h := range clientKeyHeaders {
 			out.Header.Del(h) // the router's key is not the backend's
 		}
@@ -395,7 +628,29 @@ func (s *Server) forward(r *http.Request, b *pool.Backend, body []byte) (*http.R
 
 // relay copies the upstream response to the client, flushing as bytes
 // arrive so streamed tokens reach the user without buffering.
-func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend string, cacheHit bool) error {
+// captureBuffer copies a response body for the cache, giving up (and
+// releasing the memory) once it passes limit bytes.
+type captureBuffer struct {
+	buf      bytes.Buffer
+	limit    int64
+	overflow bool
+}
+
+func (c *captureBuffer) write(p []byte) {
+	if c.overflow {
+		return
+	}
+	if int64(c.buf.Len()+len(p)) > c.limit {
+		c.overflow = true
+		c.buf = bytes.Buffer{}
+		return
+	}
+	c.buf.Write(p)
+}
+
+// first holds body bytes already read from resp; capture, when non-nil,
+// receives a copy of the body for the cache.
+func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend string, cacheHit bool, first []byte, capture *captureBuffer) error {
 	h := w.Header()
 	for k, v := range resp.Header {
 		h[k] = v
@@ -413,14 +668,30 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend strin
 	w.WriteHeader(resp.StatusCode)
 
 	rc := http.NewResponseController(w)
-	buf := make([]byte, 32<<10)
+	write := func(p []byte) error {
+		if _, err := w.Write(p); err != nil {
+			return err
+		}
+		rc.Flush()
+		if capture != nil {
+			capture.write(p)
+		}
+		return nil
+	}
+	if len(first) > 0 {
+		if err := write(first); err != nil {
+			return err
+		}
+	}
+	bp := relayBuffers.Get().(*[]byte)
+	defer relayBuffers.Put(bp)
+	buf := *bp
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			if werr := write(buf[:n]); werr != nil {
 				return werr
 			}
-			rc.Flush()
 		}
 		if err == io.EOF {
 			return nil
@@ -431,11 +702,34 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend strin
 	}
 }
 
-func (s *Server) logRequest(r *http.Request, info prompt.Info, backend string, status, attempts int, start time.Time, cacheHit bool, err error) {
+// requestLog collects what the request log line reports.
+type requestLog struct {
+	r        *http.Request
+	info     prompt.Info
+	start    time.Time
+	client   clientInfo
+	priority int
+	alias    string
+	cache    string
+}
+
+var priorityNames = [...]string{"low", "normal", "high"}
+
+func (s *Server) logRequest(l *requestLog, backend string, status, attempts int, cacheHit bool, err error) {
 	attrs := []any{
-		"method", r.Method, "path", r.URL.Path, "model", info.Model, "stream", info.Stream,
+		"method", l.r.Method, "path", l.r.URL.Path, "model", l.info.Model, "stream", l.info.Stream,
 		"backend", backend, "status", status, "attempts", attempts,
-		"prefix_cache_hit", cacheHit, "duration_ms", time.Since(start).Milliseconds(),
+		"prefix_cache_hit", cacheHit, "duration_ms", time.Since(l.start).Milliseconds(),
+		"priority", priorityNames[l.priority],
+	}
+	if l.client.name != "" {
+		attrs = append(attrs, "client", l.client.name)
+	}
+	if l.alias != "" {
+		attrs = append(attrs, "alias", l.alias)
+	}
+	if l.cache != "" {
+		attrs = append(attrs, "response_cache", l.cache)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
