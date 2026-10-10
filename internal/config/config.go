@@ -55,7 +55,21 @@ type Config struct {
 	Hardware     Hardware  `yaml:"hardware"`
 	Cache        Cache     `yaml:"cache"`
 	Models       Models    `yaml:"models"`
+	TLS          TLS       `yaml:"tls"`
 }
+
+// TLS serves the router over HTTPS. Certificate files are re-read when they
+// change, so rotation (cert-manager, Let's Encrypt) needs no restart.
+type TLS struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// ClientCAFile, when set, requires every client to present a
+	// certificate signed by one of these CAs (mutual TLS).
+	ClientCAFile string `yaml:"client_ca_file"`
+	MinVersion   string `yaml:"min_version"` // "1.2" (default) or "1.3"
+}
+
+func (t TLS) Enabled() bool { return t.CertFile != "" }
 
 // Priority classes order the wait queue: high requests are served before
 // normal ones, normal before low.
@@ -78,12 +92,17 @@ func PriorityRank(name string) (rank int, ok bool) {
 	return 1, false
 }
 
-// APIKey is a named client key with its own queue priority.
+// APIKey is a named client key with its own queue priority and limits.
+// Usage is counted per name. Zero limits mean unlimited.
 type APIKey struct {
 	Name     string `yaml:"name"`
 	Key      string `yaml:"key"`
 	KeyEnv   string `yaml:"key_env"`
 	Priority string `yaml:"priority"` // high, normal (default) or low
+
+	MaxConcurrent     int   `yaml:"max_concurrent"`      // requests in flight or queued at once
+	RequestsPerMinute int   `yaml:"requests_per_minute"` // sustained rate; bursts up to a minute's worth
+	TokensPerDay      int64 `yaml:"tokens_per_day"`      // prompt + completion tokens per UTC day
 }
 
 // Cache answers repeated requests from memory instead of a GPU. Only
@@ -113,6 +132,9 @@ type Auth struct {
 	APIKeysEnv string   `yaml:"api_keys_env"` // comma-separated keys read from this env var
 	// Keys are named keys with a queue priority. api_keys are normal priority.
 	Keys []APIKey `yaml:"keys"`
+	// AdminKeys alone may use /admin/*. Without any, every client key can.
+	AdminKeys    []string `yaml:"admin_keys"`
+	AdminKeysEnv string   `yaml:"admin_keys_env"` // comma-separated keys read from this env var
 }
 
 // Enabled reports whether the router requires a key.
@@ -329,13 +351,22 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+func splitEnv(name string) []string {
+	var out []string
+	for _, k := range strings.Split(os.Getenv(name), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func (c *Config) resolveEnv() {
 	if c.Auth.APIKeysEnv != "" {
-		for _, k := range strings.Split(os.Getenv(c.Auth.APIKeysEnv), ",") {
-			if k = strings.TrimSpace(k); k != "" {
-				c.Auth.APIKeys = append(c.Auth.APIKeys, k)
-			}
-		}
+		c.Auth.APIKeys = append(c.Auth.APIKeys, splitEnv(c.Auth.APIKeysEnv)...)
+	}
+	if c.Auth.AdminKeysEnv != "" {
+		c.Auth.AdminKeys = append(c.Auth.AdminKeys, splitEnv(c.Auth.AdminKeysEnv)...)
 	}
 	for i := range c.Auth.Keys {
 		if k := &c.Auth.Keys[i]; k.KeyEnv != "" {
@@ -413,14 +444,35 @@ func (c *Config) validate() error {
 	if c.Retry.FirstTokenTimeout < 0 {
 		errs = append(errs, errors.New("retry.first_token_timeout must not be negative"))
 	}
+	names := map[string]bool{}
 	for i, k := range c.Auth.Keys {
 		where := fmt.Sprintf("auth.keys[%d]", i)
+		if k.MaxConcurrent < 0 || k.RequestsPerMinute < 0 || k.TokensPerDay < 0 {
+			errs = append(errs, fmt.Errorf("%s: limits must not be negative", where))
+		}
+		if k.Name == "" && (k.MaxConcurrent > 0 || k.RequestsPerMinute > 0 || k.TokensPerDay > 0) {
+			errs = append(errs, fmt.Errorf("%s: a key with limits needs a name (limits and usage are tracked per name)", where))
+		}
+		if k.Name != "" {
+			if names[k.Name] {
+				errs = append(errs, fmt.Errorf("%s: duplicate name %q", where, k.Name))
+			}
+			names[k.Name] = true
+		}
 		if k.Key == "" {
 			errs = append(errs, fmt.Errorf("%s: key is empty (set key or a key_env that exists)", where))
 		}
 		if _, ok := PriorityRank(k.Priority); !ok {
 			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, k.Priority))
 		}
+	}
+	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
+		errs = append(errs, errors.New("tls: cert_file and key_file must be set together"))
+	} else if t.ClientCAFile != "" && t.CertFile == "" {
+		errs = append(errs, errors.New("tls: client_ca_file needs cert_file and key_file"))
+	}
+	if v := c.TLS.MinVersion; v != "" && v != "1.2" && v != "1.3" {
+		errs = append(errs, fmt.Errorf("tls.min_version must be 1.2 or 1.3, got %q", v))
 	}
 	if m := c.Cache.Mode; m != "deterministic" && m != "all" {
 		errs = append(errs, fmt.Errorf("cache.mode must be deterministic or all, got %q", m))

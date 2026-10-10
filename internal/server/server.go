@@ -11,17 +11,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/affinity"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
@@ -36,11 +39,14 @@ const SessionHeader = "X-Session-ID"
 const PriorityHeader = "X-SiliconRouter-Priority"
 
 type Server struct {
-	cfg      *config.Config
+	// state holds everything a config reload can change; requests load it
+	// once and see one consistent version.
+	state    atomic.Pointer[state]
+	applyMu  sync.Mutex // serializes Apply
+	reloader atomic.Pointer[func() ([]string, error)]
 	pool     *pool.Pool
 	affinity *affinity.Table
-	cache    *cache.Cache // nil when disabled
-	keys     map[string]clientInfo
+	limits   *limits.Tracker
 	client   *http.Client
 	log      *slog.Logger
 	reg      *metrics.Registry
@@ -53,9 +59,68 @@ type Server struct {
 	cacheLookups  *metrics.CounterVec
 	responseCache *metrics.CounterVec
 	ttftTimeouts  *metrics.CounterVec
+	clientReqs    *metrics.CounterVec
+	clientTokens  *metrics.CounterVec
 	duration      *metrics.Histogram
 	queueWait     *metrics.Histogram
 	firstByte     *metrics.Histogram
+}
+
+// state is an immutable snapshot of the reloadable configuration.
+type state struct {
+	cfg       *config.Config
+	keys      map[string]clientInfo
+	adminKeys []string
+	cache     *cache.Cache // nil when disabled
+}
+
+func newState(cfg *config.Config, prev *state) *state {
+	st := &state{cfg: cfg, keys: map[string]clientInfo{}, adminKeys: cfg.Auth.AdminKeys}
+	for _, k := range cfg.Auth.APIKeys {
+		st.keys[k] = clientInfo{key: k, priority: 1}
+	}
+	for _, k := range cfg.Auth.Keys {
+		rank, _ := config.PriorityRank(k.Priority)
+		st.keys[k.Key] = clientInfo{name: k.Name, key: k.Key, priority: rank}
+	}
+	if cfg.Cache.Enabled {
+		// Keep cached answers across a reload unless the cache's shape changed.
+		if prev != nil && prev.cache != nil && prev.cfg.Cache == cfg.Cache {
+			st.cache = prev.cache
+		} else {
+			st.cache = cache.New(cfg.Cache.MaxBytes, cfg.Cache.TTL.D())
+		}
+	}
+	return st
+}
+
+func (s *Server) conf() *config.Config { return s.state.Load().cfg }
+
+func limitsFrom(cfg *config.Config) map[string]limits.Limits {
+	out := map[string]limits.Limits{}
+	for _, k := range cfg.Auth.Keys {
+		if k.Name != "" {
+			out[k.Name] = limits.Limits{MaxConcurrent: k.MaxConcurrent, RequestsPerMinute: k.RequestsPerMinute, TokensPerDay: k.TokensPerDay}
+		}
+	}
+	return out
+}
+
+// usageName is the name a client's usage is counted under.
+func usageName(st *state, c clientInfo) string {
+	switch {
+	case c.name != "":
+		return c.name
+	case st.cfg.Auth.Enabled():
+		return "default" // an unnamed key from api_keys
+	default:
+		return "anonymous"
+	}
+}
+
+func (s *Server) handleUsage(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"clients": s.limits.Snapshot()})
 }
 
 // clientInfo is who sent a request, from the API key it used.
@@ -77,8 +142,8 @@ func clientFrom(ctx context.Context) clientInfo {
 func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger) *Server {
 	reg := &metrics.Registry{}
 	s := &Server{
-		cfg:      cfg,
 		pool:     p,
+		limits:   limits.New(),
 		affinity: affinity.New(cfg.Routing.AffinityCapacity, cfg.Routing.AffinityTTL.D()),
 		client:   client,
 		log:      log,
@@ -96,22 +161,17 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 
 		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), miss, or skip (request not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
+		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
+		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
-	s.keys = map[string]clientInfo{}
-	for _, k := range cfg.Auth.APIKeys {
-		s.keys[k] = clientInfo{key: k, priority: 1}
-	}
-	for _, k := range cfg.Auth.Keys {
-		rank, _ := config.PriorityRank(k.Priority)
-		s.keys[k.Key] = clientInfo{name: k.Name, key: k.Key, priority: rank}
-	}
-	if cfg.Cache.Enabled {
-		s.cache = cache.New(cfg.Cache.MaxBytes, cfg.Cache.TTL.D())
-		reg.NewGaugeFunc("siliconrouter_response_cache_bytes", "Bytes held by the response cache.", nil, func(emit func(float64, ...string)) {
-			_, n := s.cache.Stats()
+	s.limits.SetLimits(limitsFrom(cfg))
+	s.state.Store(newState(cfg, nil))
+	reg.NewGaugeFunc("siliconrouter_response_cache_bytes", "Bytes held by the response cache.", nil, func(emit func(float64, ...string)) {
+		if c := s.state.Load().cache; c != nil {
+			_, n := c.Stats()
 			emit(float64(n))
-		})
-	}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_backend_ttft_seconds", "Recent average time to first token on streaming requests, per backend.", []string{"backend"}, func(emit func(float64, ...string)) {
 		for _, st := range p.Snapshot() {
 			if st.TTFTMillis > 0 {
@@ -177,7 +237,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		reg.Write(w)
 	})
-	s.mux.Handle("GET /admin/backends", s.requireAuth(http.HandlerFunc(s.handleBackends)))
+	s.mux.Handle("GET /admin/backends", s.requireAdmin(http.HandlerFunc(s.handleBackends)))
+	s.mux.Handle("GET /admin/usage", s.requireAdmin(http.HandlerFunc(s.handleUsage)))
+	s.mux.Handle("POST /admin/reload", s.requireAdmin(http.HandlerFunc(s.handleReload)))
 	s.mux.Handle("GET /v1/models", s.requireAuth(http.HandlerFunc(s.handleModels)))
 	// Everything else is forwarded, so any HTTP inference API works: OpenAI,
 	// Anthropic, Ollama, TGI, Triton/KServe, Gemini-style, or a custom one.
@@ -188,16 +250,18 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
-	if !s.cfg.Auth.Enabled() {
-		return next
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := s.state.Load()
+		if !st.cfg.Auth.Enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if got := clientKey(r.Header); got != "" {
 			// Compare against every key in constant time, so timing does not
 			// reveal how much of a guess was right.
 			var match clientInfo
 			found := false
-			for k, c := range s.keys {
+			for k, c := range st.keys {
 				if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
 					match, found = c, true
 				}
@@ -209,6 +273,32 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		s.rejected.Inc("unauthorized")
 		writeError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+	})
+}
+
+// requireAdmin guards /admin/*: only admin keys when any are configured,
+// otherwise any client key (or nothing, when auth is off).
+func (s *Server) requireAdmin(next http.Handler) http.Handler {
+	clientAuth := s.requireAuth(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := s.state.Load()
+		if len(st.adminKeys) == 0 {
+			clientAuth.ServeHTTP(w, r)
+			return
+		}
+		got := clientKey(r.Header)
+		ok := false
+		for _, k := range st.adminKeys {
+			if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
+				ok = true
+			}
+		}
+		if !ok {
+			s.rejected.Inc("unauthorized")
+			writeError(w, http.StatusUnauthorized, "invalid_admin_key", "this endpoint needs an admin key")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -264,7 +354,7 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
-	for alias, target := range s.cfg.Models.Aliases {
+	for alias, target := range s.conf().Models.Aliases {
 		if seen[target] && !seen[alias] {
 			seen[alias] = true
 			data = append(data, model{ID: alias, Object: "model", OwnedBy: "siliconrouter"})
@@ -294,7 +384,20 @@ var relayBuffers = sync.Pool{New: func() any { b := make([]byte, 32<<10); return
 
 func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	body, err := readBody(w, r, s.cfg.MaxBodyBytes)
+	st := s.state.Load()
+	client := clientFrom(r.Context())
+	who := usageName(st, client)
+	release, rejected := s.limits.Admit(who)
+	if rejected != nil {
+		s.rejected.Inc(rejected.Reason)
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(rejected.RetryAfter.Seconds()))))
+		writeError(w, http.StatusTooManyRequests, rejected.Reason, rejected.Message)
+		return
+	}
+	defer release()
+	s.clientReqs.Inc(who)
+
+	body, err := readBody(w, r, st.cfg.MaxBodyBytes)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -308,11 +411,11 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.Path
 	info := prompt.Inspect(path, r.Header.Get("Content-Type"), body)
-	rl := &requestLog{r: r, info: info, start: start, client: clientFrom(r.Context())}
+	rl := &requestLog{r: r, info: info, start: start, client: client}
 
 	// Model aliases: the client's name for a model becomes the real one,
 	// in the body or, for APIs that put it there, in the URL.
-	if target, ok := s.cfg.Models.Aliases[info.Model]; ok {
+	if target, ok := st.cfg.Models.Aliases[info.Model]; ok {
 		if rewritten, ok := prompt.ReplaceModel(body, target); ok {
 			body = rewritten
 		} else {
@@ -323,7 +426,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	}
 
 	priority := rl.client.priority
-	if s.cfg.Queue.PriorityHeader {
+	if st.cfg.Queue.PriorityHeader {
 		if rank, ok := config.PriorityRank(r.Header.Get(PriorityHeader)); ok && r.Header.Get(PriorityHeader) != "" {
 			priority = rank
 		}
@@ -331,11 +434,11 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	rl.priority = priority
 
 	var cacheKey cache.Key
-	cacheable := s.cacheable(r, path, info)
+	cacheable := cacheable(st, r, path, info)
 	switch {
 	case cacheable:
-		cacheKey = s.cacheKey(r, path, rl.client, body)
-		if e, ok := s.cache.Get(cacheKey); ok {
+		cacheKey = cacheKeyFor(st, r, path, rl.client, body)
+		if e, ok := st.cache.Get(cacheKey); ok {
 			s.responseCache.Inc("hit")
 			rl.cache = "hit"
 			serveCached(w, e)
@@ -346,11 +449,11 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		s.responseCache.Inc("miss")
 		rl.cache = "miss"
-	case s.cache != nil:
+	case st.cache != nil:
 		s.responseCache.Inc("skip")
 	}
 
-	rc := s.cfg.Routing
+	rc := st.cfg.Routing
 	req := pool.Request{
 		Model:        info.Model,
 		PromptTokens: prompt.EstimateTokens(info.Text, rc.CharsPerToken),
@@ -368,7 +471,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		req.Preferred, _ = s.affinity.Lookup(keys)
 	}
 
-	acquireCtx, cancel := context.WithTimeout(r.Context(), s.cfg.Queue.MaxWait.D())
+	acquireCtx, cancel := context.WithTimeout(r.Context(), st.cfg.Queue.MaxWait.D())
 	defer cancel()
 
 	var lastErr string
@@ -381,7 +484,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		s.queueWait.Observe(lease.Waited.Seconds())
 		b := lease.Backend
-		final := attempt >= s.cfg.Retry.MaxAttempts
+		final := attempt >= st.cfg.Retry.MaxAttempts
 
 		res := s.attempt(r, path, body, b, info.Stream, final)
 		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
@@ -435,15 +538,19 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 
 		var capture *captureBuffer
 		if cacheable && resp.StatusCode == http.StatusOK {
-			capture = &captureBuffer{limit: s.cfg.Cache.MaxEntryBytes}
+			capture = &captureBuffer{limit: st.cfg.Cache.MaxEntryBytes}
 			w.Header().Set("X-SiliconRouter-Cache", "miss")
 		}
-		copyErr := s.relay(w, resp, b.Name, lease.Affinity, res.first, capture)
+		meter := newUsageMeter(resp.Header.Get("Content-Type"))
+		copyErr := s.relay(w, resp, b.Name, lease.Affinity, res.first, capture, meter)
 		resp.Body.Close()
 		res.cancel()
 		lease.Release()
+		if resp.StatusCode < 400 {
+			s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
+		}
 		if capture != nil && copyErr == nil && !capture.overflow {
-			s.cache.Put(cacheKey, &cache.Entry{Status: resp.StatusCode, Header: cacheableHeader(resp.Header), Body: capture.buf.Bytes(), Backend: b.Name})
+			st.cache.Put(cacheKey, &cache.Entry{Status: resp.StatusCode, Header: cacheableHeader(resp.Header), Body: capture.buf.Bytes(), Backend: b.Name})
 		}
 		s.requests.Inc(b.Name, strconv.Itoa(resp.StatusCode))
 		s.duration.Observe(time.Since(start).Seconds())
@@ -471,7 +578,7 @@ var errFirstTokenTimeout = errors.New("no output within retry.first_token_timeou
 func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Backend, stream, final bool) attemptResult {
 	ctx, cancel := context.WithCancel(r.Context())
 	var timer *time.Timer
-	timeout := s.cfg.Retry.FirstTokenTimeout.D()
+	timeout := s.conf().Retry.FirstTokenTimeout.D()
 	if stream && timeout > 0 && !final {
 		timer = time.AfterFunc(timeout, cancel)
 	}
@@ -511,20 +618,20 @@ func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Back
 
 // cacheable reports whether a request's answer can be served from, and
 // stored in, the response cache.
-func (s *Server) cacheable(r *http.Request, path string, info prompt.Info) bool {
-	if s.cache == nil || r.Method != http.MethodPost {
+func cacheable(st *state, r *http.Request, path string, info prompt.Info) bool {
+	if st.cache == nil || r.Method != http.MethodPost {
 		return false
 	}
 	if cc := r.Header.Get("Cache-Control"); strings.Contains(cc, "no-cache") || strings.Contains(cc, "no-store") {
 		return false
 	}
 	// Embeddings never vary; generations only at temperature 0.
-	return s.cfg.Cache.Mode == "all" || info.Deterministic || strings.Contains(path, "embed")
+	return st.cfg.Cache.Mode == "all" || info.Deterministic || strings.Contains(path, "embed")
 }
 
-func (s *Server) cacheKey(r *http.Request, path string, c clientInfo, body []byte) cache.Key {
+func cacheKeyFor(st *state, r *http.Request, path string, c clientInfo, body []byte) cache.Key {
 	who := c.key
-	if s.cfg.Cache.ShareAcrossKeys {
+	if st.cfg.Cache.ShareAcrossKeys {
 		who = ""
 	}
 	return cache.NewKey([]byte(r.Method), []byte(path), []byte(r.URL.RawQuery), []byte(who), body)
@@ -610,7 +717,7 @@ func (s *Server) forward(ctx context.Context, r *http.Request, path string, b *p
 	}
 	out.Header.Del(SessionHeader)
 	out.Header.Del(PriorityHeader)
-	if s.cfg.Auth.Enabled() {
+	if s.conf().Auth.Enabled() {
 		for _, h := range clientKeyHeaders {
 			out.Header.Del(h) // the router's key is not the backend's
 		}
@@ -648,9 +755,71 @@ func (c *captureBuffer) write(p []byte) {
 	c.buf.Write(p)
 }
 
+// usageTail is how much of a response's end is kept to find its token
+// usage, which every API reports at or near the end.
+const usageTail = 64 << 10
+
+// usageMeter watches a response go by to count the tokens it used.
+type usageMeter struct {
+	tail   []byte
+	bytes  int64
+	events int64 // SSE data events or NDJSON lines, about one token each
+	sse    bool
+	ndjson bool
+}
+
+func newUsageMeter(contentType string) *usageMeter {
+	return &usageMeter{
+		sse:    strings.HasPrefix(contentType, "text/event-stream"),
+		ndjson: strings.Contains(contentType, "ndjson"),
+	}
+}
+
+func (m *usageMeter) write(p []byte) {
+	m.bytes += int64(len(p))
+	switch {
+	case m.sse:
+		m.events += int64(bytes.Count(p, []byte("data:")))
+	case m.ndjson:
+		m.events += int64(bytes.Count(p, []byte("\n")))
+	}
+	m.tail = append(m.tail, p...)
+	if len(m.tail) > 2*usageTail { // trim rarely, keeping the last usageTail bytes
+		m.tail = append(m.tail[:0], m.tail[len(m.tail)-usageTail:]...)
+	}
+}
+
+// recordUsage counts a finished request's tokens: as the backend reported
+// them when it did, otherwise estimated.
+func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, charsPerToken float64) {
+	u := prompt.ParseUsage(m.tail)
+	in, out := u.PromptTokens, u.CompletionTokens
+	inSource, outSource := "reported", "reported"
+	if in < 0 {
+		in, inSource = int64(prompt.EstimateTokens(info.Text, charsPerToken)), "estimated"
+	}
+	if out < 0 {
+		outSource = "estimated"
+		switch {
+		case strings.Contains(path, "embed") || u.PromptTokens >= 0:
+			out = 0 // embeddings generate nothing; a usage block without completions means none
+		case m.sse || m.ndjson:
+			out = m.events - int64(bytes.Count(m.tail, []byte("[DONE]")))
+		default:
+			out = int64(float64(m.bytes) / charsPerToken)
+		}
+		if out < 0 {
+			out = 0
+		}
+	}
+	s.limits.Record(who, in, out, inSource == "estimated" || outSource == "estimated")
+	s.clientTokens.Add(float64(in), who, "prompt", inSource)
+	s.clientTokens.Add(float64(out), who, "completion", outSource)
+}
+
 // first holds body bytes already read from resp; capture, when non-nil,
 // receives a copy of the body for the cache.
-func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend string, cacheHit bool, first []byte, capture *captureBuffer) error {
+func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend string, cacheHit bool, first []byte, capture *captureBuffer, meter *usageMeter) error {
 	h := w.Header()
 	for k, v := range resp.Header {
 		h[k] = v
@@ -676,6 +845,7 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend strin
 		if capture != nil {
 			capture.write(p)
 		}
+		meter.write(p)
 		return nil
 	}
 	if len(first) > 0 {

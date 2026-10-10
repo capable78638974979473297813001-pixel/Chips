@@ -4,14 +4,30 @@
 listen: ":8080"
 max_body_bytes: 16777216          # reject request bodies larger than this (16 MiB)
 
-# Protect the router with bearer keys. Leave both empty for an open router.
+# Serve HTTPS. Certificate files are re-read when they change (no restart).
+# tls:
+#   cert_file: /etc/siliconrouter/tls.crt
+#   key_file: /etc/siliconrouter/tls.key
+#   client_ca_file: ""              # require client certificates signed by this CA (mTLS)
+#   min_version: "1.2"              # or "1.3"
+
+# Protect the router with keys (Authorization: Bearer, x-api-key or api-key).
+# Leave everything empty for an open router. See docs/OPERATIONS.md.
 auth:
   api_keys: []
   api_keys_env: SILICONROUTER_API_KEYS   # comma-separated keys from the environment
-  # Named keys with a queue priority: high jumps ahead of normal, normal ahead of low.
+  # Only these may use /admin/* (backends, usage, reload). Without any, every client key can.
+  admin_keys: []
+  admin_keys_env: SILICONROUTER_ADMIN_KEYS
+  # Named keys with a queue priority and optional limits. Usage is reported per name.
   # keys:
   #   - {name: chat-app, key_env: CHAT_APP_KEY, priority: high}
-  #   - {name: nightly-batch, key_env: BATCH_KEY, priority: low}
+  #   - name: nightly-batch
+  #     key_env: BATCH_KEY
+  #     priority: low                # high jumps ahead of normal, normal ahead of low
+  #     max_concurrent: 8            # requests in flight or queued at once
+  #     requests_per_minute: 120     # sustained rate; bursts up to a minute's worth
+  #     tokens_per_day: 2000000      # prompt + completion tokens per UTC day
 
 # Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
 # llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.

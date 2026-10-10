@@ -7,6 +7,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -131,42 +132,31 @@ type result struct {
 	err   error
 }
 
+// OptionsFromConfig derives pool options from a router configuration.
+func OptionsFromConfig(cfg *config.Config) Options {
+	return Options{
+		MaxWaiting:           cfg.Queue.MaxWaiting,
+		AffinityMaxImbalance: cfg.Routing.AffinityMaxImbalance,
+		LargeRequestTokens:   cfg.Routing.LargeRequestTokens,
+		UnhealthyThreshold:   cfg.Health.UnhealthyThreshold,
+		HealthyThreshold:     cfg.Health.HealthyThreshold,
+		PassiveHealth:        !cfg.Health.Disabled,
+		Tiers: hardware.Thresholds{
+			HeavyMinBytes:    uint64(cfg.Hardware.HeavyMinMemoryGiB * (1 << 30)),
+			StandardMinBytes: uint64(cfg.Hardware.StandardMinMemoryGiB * (1 << 30)),
+		},
+	}
+}
+
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
 	if opts.Tiers == (hardware.Thresholds{}) {
 		opts.Tiers = hardware.DefaultThresholds
 	}
 	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
 	for i, cb := range backends {
-		u, err := url.Parse(cb.URL)
+		b, err := newBackend(cb, i)
 		if err != nil {
 			return nil, err
-		}
-		var agent *url.URL
-		if cb.AgentURL != "" {
-			if agent, err = url.Parse(cb.AgentURL); err != nil {
-				return nil, err
-			}
-		}
-		b := &Backend{
-			Name:             cb.Name,
-			URL:              u,
-			Tier:             cb.Tier,
-			MaxConcurrency:   cb.MaxConcurrency,
-			MaxContextTokens: cb.MaxContextTokens,
-			APIKey:           cb.APIKey,
-			APIKeyHeader:     cb.APIKeyHeader,
-			HealthPath:       cb.HealthPath,
-			AgentURL:         agent,
-			index:            i,
-			models:           map[string]bool{},
-			healthy:          true, // optimistic until the first check says otherwise
-		}
-		if cb.Tier == config.TierAuto {
-			// Until chipagent answers, treat the node as middle of the road.
-			b.AutoTier, b.Tier = true, config.TierStandard
-		}
-		for _, m := range cb.Models {
-			b.models[m] = true
 		}
 		p.backends = append(p.backends, b)
 		p.byName[b.Name] = b
@@ -174,8 +164,137 @@ func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, erro
 	return p, nil
 }
 
-// Backends returns the configured backends in config order.
-func (p *Pool) Backends() []*Backend { return p.backends }
+func newBackend(cb config.Backend, index int) (*Backend, error) {
+	u, err := url.Parse(cb.URL)
+	if err != nil {
+		return nil, err
+	}
+	var agent *url.URL
+	if cb.AgentURL != "" {
+		if agent, err = url.Parse(cb.AgentURL); err != nil {
+			return nil, err
+		}
+	}
+	b := &Backend{
+		Name:         cb.Name,
+		URL:          u,
+		APIKey:       cb.APIKey,
+		APIKeyHeader: cb.APIKeyHeader,
+		HealthPath:   cb.HealthPath,
+		AgentURL:     agent,
+		index:        index,
+		healthy:      true, // optimistic until the first check says otherwise
+	}
+	b.setCapacity(cb)
+	return b, nil
+}
+
+// setCapacity applies the settings that may change in place (under Pool.mu
+// once the backend is in a pool).
+func (b *Backend) setCapacity(cb config.Backend) {
+	b.MaxConcurrency = cb.MaxConcurrency
+	b.MaxContextTokens = cb.MaxContextTokens
+	b.models = map[string]bool{}
+	for _, m := range cb.Models {
+		b.models[m] = true
+	}
+	switch {
+	case cb.Tier != config.TierAuto:
+		b.Tier, b.AutoTier = cb.Tier, false
+	case !b.AutoTier:
+		// Until chipagent answers, treat the node as middle of the road.
+		b.AutoTier, b.Tier = true, config.TierStandard
+	}
+}
+
+// sameConnection reports whether b already talks to cb's endpoint with cb's
+// credentials. These fields are read without the pool lock, so a change to
+// any of them replaces the Backend instead of editing it.
+func (b *Backend) sameConnection(cb config.Backend) bool {
+	agent := ""
+	if b.AgentURL != nil {
+		agent = b.AgentURL.String()
+	}
+	return b.URL.String() == cb.URL && b.APIKey == cb.APIKey && b.APIKeyHeader == cb.APIKeyHeader &&
+		b.HealthPath == cb.HealthPath && agent == cb.AgentURL
+}
+
+// Update applies a new backend list and options without dropping traffic.
+// New backends join, removed ones stop receiving requests (in-flight ones
+// finish), and changed ones are updated, keeping their health, load and
+// hardware state unless their endpoint or credentials changed. It returns a
+// description of each change.
+func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error) {
+	if opts.Tiers == (hardware.Thresholds{}) {
+		opts.Tiers = hardware.DefaultThresholds
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var changes []string
+	next := make([]*Backend, 0, len(backends))
+	byName := make(map[string]*Backend, len(backends))
+	for i, cb := range backends {
+		old := p.byName[cb.Name]
+		switch {
+		case old == nil:
+			b, err := newBackend(cb, i)
+			if err != nil {
+				return nil, err
+			}
+			next = append(next, b)
+			changes = append(changes, "added backend "+cb.Name)
+		case !old.sameConnection(cb):
+			b, err := newBackend(cb, i)
+			if err != nil {
+				return nil, err
+			}
+			next = append(next, b)
+			changes = append(changes, "replaced backend "+cb.Name+" (endpoint or credentials changed)")
+		default:
+			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models))
+			old.setCapacity(cb)
+			old.index = i
+			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models)) != before {
+				changes = append(changes, "updated backend "+cb.Name)
+			}
+			next = append(next, old)
+		}
+		byName[cb.Name] = next[len(next)-1]
+	}
+	for _, b := range p.backends {
+		if byName[b.Name] == nil {
+			changes = append(changes, "removed backend "+b.Name)
+		}
+	}
+	// Re-tier auto backends from their last hardware report, under the
+	// (possibly changed) thresholds.
+	for _, b := range next {
+		if b.AutoTier && b.hw != nil {
+			b.Tier = opts.Tiers.Tier(b.hw)
+		}
+	}
+	p.backends, p.byName, p.opts = next, byName, opts
+	// Capacity or membership changed: hand out new slots, and fail waiters
+	// that no remaining backend can serve.
+	p.dispatchLocked(true)
+	return changes, nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Backends returns the current backends in config order.
+func (p *Pool) Backends() []*Backend {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.backends)
+}
 
 // Acquire returns a slot on the best backend for req, waiting in line if
 // every suitable backend is at capacity. It gives up when ctx is done.

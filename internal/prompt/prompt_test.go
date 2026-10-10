@@ -255,3 +255,35 @@ func TestReplacePathModel(t *testing.T) {
 		}
 	}
 }
+
+func TestParseUsage(t *testing.T) {
+	cases := []struct {
+		name               string
+		tail               string
+		prompt, completion int64
+	}{
+		{"openai json", `{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}`, 12, 34},
+		{"openai stream", "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\ndata: [DONE]\n\n", 5, 7},
+		{"openai stream without usage", "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\ndata: [DONE]\n\n", -1, -1},
+		{"anthropic json", `{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":9,"output_tokens":3}}`, 9, 3},
+		{"anthropic stream end", "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", -1, 15},
+		{"gemini", `{"candidates":[],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":8}}`, 4, 8},
+		{"ollama", `{"model":"llama3","done":true,"prompt_eval_count":26,"eval_count":290}`, 26, 290},
+		{"prompt mentions usage", `{"choices":[{"message":{"content":"the \"usage\" field"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`, 1, 2},
+		{"cut-off tail", `ompletion_tokens":3}}`, -1, -1},
+		{"nothing", `{"choices":[]}`, -1, -1},
+	}
+	for _, c := range cases {
+		if u := ParseUsage([]byte(c.tail)); u.PromptTokens != c.prompt || u.CompletionTokens != c.completion {
+			t.Errorf("%s: got %+v, want %d/%d", c.name, u, c.prompt, c.completion)
+		}
+	}
+}
+
+func FuzzParseUsage(f *testing.F) {
+	f.Add([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+	f.Add([]byte(`"usage":{"prompt_tokens":`))
+	f.Add([]byte(`"eval_count":"x","usage":`))
+	f.Fuzz(func(t *testing.T, b []byte) { ParseUsage(b) })
+}
