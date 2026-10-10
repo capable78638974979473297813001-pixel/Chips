@@ -20,6 +20,8 @@ const (
 	TierStandard = "standard"
 	TierLight    = "light"
 	TierReserve  = "reserve"
+	// TierAuto lets chipagent's hardware report pick heavy, standard or light.
+	TierAuto = "auto"
 )
 
 // Duration is a time.Duration that unmarshals from strings like "5s" or "30m".
@@ -50,6 +52,7 @@ type Config struct {
 	Retry        Retry     `yaml:"retry"`
 	Health       Health    `yaml:"health"`
 	Upstream     Upstream  `yaml:"upstream"`
+	Hardware     Hardware  `yaml:"hardware"`
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
@@ -66,6 +69,9 @@ type Backend struct {
 	MaxContextTokens int      `yaml:"max_context_tokens"` // 0 = no limit
 	Models           []string `yaml:"models"`             // empty = discover from /v1/models
 	APIKeyEnv        string   `yaml:"api_key_env"`        // bearer token sent upstream
+	// AgentURL points at the chipagent on this backend's machine, which
+	// reports its accelerators (NVIDIA, AMD, Intel, Apple) in one schema.
+	AgentURL string `yaml:"agent_url"`
 
 	APIKey string `yaml:"-"`
 }
@@ -115,6 +121,17 @@ type Upstream struct {
 	// ResponseHeaderTimeout bounds time-to-first-byte. Non-streaming requests
 	// only send headers once generation finishes, so keep this generous. 0 = none.
 	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
+}
+
+// Hardware controls polling of chipagent telemetry and how `tier: auto`
+// backends are classified.
+type Hardware struct {
+	PollInterval Duration `yaml:"poll_interval"`
+	Timeout      Duration `yaml:"timeout"`
+	// Total accelerator memory at or above which an auto-tiered node is heavy
+	// or standard; below StandardMinMemoryGiB it is light.
+	HeavyMinMemoryGiB    float64 `yaml:"heavy_min_memory_gib"`
+	StandardMinMemoryGiB float64 `yaml:"standard_min_memory_gib"`
 }
 
 // Load reads, defaults and validates a config file.
@@ -209,6 +226,19 @@ func (c *Config) applyDefaults() {
 	if c.Upstream.DialTimeout == 0 {
 		c.Upstream.DialTimeout = Duration(5 * time.Second)
 	}
+	hw := &c.Hardware
+	if hw.PollInterval == 0 {
+		hw.PollInterval = Duration(10 * time.Second)
+	}
+	if hw.Timeout == 0 {
+		hw.Timeout = Duration(2 * time.Second)
+	}
+	if hw.HeavyMinMemoryGiB == 0 {
+		hw.HeavyMinMemoryGiB = 64
+	}
+	if hw.StandardMinMemoryGiB == 0 {
+		hw.StandardMinMemoryGiB = 20
+	}
 }
 
 func (c *Config) resolveEnv() {
@@ -246,8 +276,17 @@ func (c *Config) validate() error {
 		}
 		switch b.Tier {
 		case TierHeavy, TierStandard, TierLight, TierReserve:
+		case TierAuto:
+			if b.AgentURL == "" {
+				errs = append(errs, fmt.Errorf("%s: tier auto needs agent_url so chipagent can report the hardware", where))
+			}
 		default:
-			errs = append(errs, fmt.Errorf("%s: tier must be heavy, standard, light or reserve, got %q", where, b.Tier))
+			errs = append(errs, fmt.Errorf("%s: tier must be heavy, standard, light, reserve or auto, got %q", where, b.Tier))
+		}
+		if b.AgentURL != "" {
+			if u, err := url.Parse(b.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("%s: agent_url must be an absolute http(s) URL, got %q", where, b.AgentURL))
+			}
 		}
 		if b.MaxConcurrency < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_concurrency must be positive", where))
@@ -277,6 +316,9 @@ func (c *Config) validate() error {
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {
 		errs = append(errs, errors.New("health.path must start with /"))
+	}
+	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
+		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))
 	}
 	if c.MaxBodyBytes < 0 {
 		errs = append(errs, errors.New("max_body_bytes must not be negative"))

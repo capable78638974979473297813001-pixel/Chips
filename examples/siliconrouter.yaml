@@ -19,6 +19,7 @@ backends:
     max_context_tokens: 131072      # skip this node for prompts that would not fit (0 = no limit)
     models: [llama-3.1-70b]         # omit to auto-discover from GET /v1/models
     api_key_env: H100_API_KEY       # optional bearer token sent to this backend
+    agent_url: http://10.0.0.11:9400  # optional chipagent on this machine (see docs/HARDWARE.md)
 
   - name: mac-studio-2
     url: http://10.0.0.12:11434     # Ollama
@@ -29,6 +30,12 @@ backends:
   - name: mi300-reserve-3
     url: http://10.0.0.13:8000      # vLLM on ROCm
     tier: reserve                   # only used when every other node is full or down
+    max_concurrency: 32
+
+  - name: gpu-node-4
+    url: http://10.0.0.14:8000
+    tier: auto                      # chipagent's hardware report picks heavy, standard or light
+    agent_url: http://10.0.0.14:9400
     max_concurrency: 32
 
 routing:
@@ -64,3 +71,10 @@ health:
 upstream:
   dial_timeout: 5s
   response_header_timeout: 0s       # 0 = none; non-streaming replies only send headers when generation ends
+
+# chipagent telemetry (only used by backends with agent_url).
+hardware:
+  poll_interval: 10s
+  timeout: 2s
+  heavy_min_memory_gib: 64          # tier auto: total accelerator memory for heavy...
+  standard_min_memory_gib: 20       # ...and for standard; below this a node is light

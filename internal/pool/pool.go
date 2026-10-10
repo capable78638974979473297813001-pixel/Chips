@@ -8,12 +8,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net/url"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/hardware"
 )
 
 var (
@@ -26,14 +28,20 @@ var (
 
 // Backend is one inference server. Mutable fields are guarded by Pool.mu.
 type Backend struct {
-	Name             string
-	URL              *url.URL
+	Name string
+	URL  *url.URL
+	// Tier is guarded by Pool.mu when AutoTier is set, since chipagent
+	// reports can change it.
 	Tier             string
 	MaxConcurrency   int
 	MaxContextTokens int
 	APIKey           string
-	index            int
-	models           map[string]bool
+	// AgentURL is the chipagent on this backend's machine, or nil.
+	AgentURL *url.URL
+	// AutoTier means Tier comes from the hardware chipagent reports.
+	AutoTier bool
+	index    int
+	models   map[string]bool
 
 	inflight   int
 	checked    bool
@@ -42,6 +50,8 @@ type Backend struct {
 	failStreak int
 	discovered map[string]bool
 	lastErr    string
+	hw         *hardware.Report
+	hwErr      string
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -86,6 +96,8 @@ type Options struct {
 	// PassiveHealth lets request failures mark a backend down. It should only
 	// be on when active checks run, otherwise a backend could never recover.
 	PassiveHealth bool
+	// Tiers classifies `tier: auto` backends; zero means hardware.DefaultThresholds.
+	Tiers hardware.Thresholds
 }
 
 type Pool struct {
@@ -110,11 +122,20 @@ type result struct {
 }
 
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
+	if opts.Tiers == (hardware.Thresholds{}) {
+		opts.Tiers = hardware.DefaultThresholds
+	}
 	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
 	for i, cb := range backends {
 		u, err := url.Parse(cb.URL)
 		if err != nil {
 			return nil, err
+		}
+		var agent *url.URL
+		if cb.AgentURL != "" {
+			if agent, err = url.Parse(cb.AgentURL); err != nil {
+				return nil, err
+			}
 		}
 		b := &Backend{
 			Name:             cb.Name,
@@ -123,9 +144,14 @@ func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, erro
 			MaxConcurrency:   cb.MaxConcurrency,
 			MaxContextTokens: cb.MaxContextTokens,
 			APIKey:           cb.APIKey,
+			AgentURL:         agent,
 			index:            i,
 			models:           map[string]bool{},
 			healthy:          true, // optimistic until the first check says otherwise
+		}
+		if cb.Tier == config.TierAuto {
+			// Until chipagent answers, treat the node as middle of the road.
+			b.AutoTier, b.Tier = true, config.TierStandard
 		}
 		for _, m := range cb.Models {
 			b.models[m] = true
@@ -252,6 +278,14 @@ func (b *Backend) fits(r Request) bool {
 	return b.MaxContextTokens == 0 || r.PromptTokens+r.MaxTokens <= b.MaxContextTokens
 }
 
+// gpuBusy is the latest accelerator busy percentage from chipagent, if fresh.
+func (b *Backend) gpuBusy() (float64, bool) {
+	if b.hw == nil || b.hwErr != "" {
+		return 0, false
+	}
+	return b.hw.Utilization()
+}
+
 func (b *Backend) utilization() float64 {
 	return float64(b.inflight) / float64(b.MaxConcurrency)
 }
@@ -332,9 +366,21 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 	return nil, false, nil // unreachable: every free backend has a known tier
 }
 
+// gpuBusyMargin is how many points apart two nodes' accelerator busy
+// percentages must be before it decides between them; smaller gaps are noise.
+const gpuBusyMargin = 10
+
 func better(a, b *Backend) bool {
 	if ua, ub := a.utilization(), b.utilization(); ua != ub {
 		return ua < ub
+	}
+	// Equal router load: prefer the node whose accelerators are less busy.
+	// This catches load the router cannot see, such as a training job or
+	// another service sharing the GPUs.
+	if ga, okA := a.gpuBusy(); okA {
+		if gb, okB := b.gpuBusy(); okB && math.Abs(ga-gb) >= gpuBusyMargin {
+			return ga < gb
+		}
 	}
 	if fa, fb := a.MaxConcurrency-a.inflight, b.MaxConcurrency-b.inflight; fa != fb {
 		return fa > fb
@@ -393,17 +439,79 @@ func (p *Pool) SetDiscoveredModels(b *Backend, models []string) {
 	p.mu.Unlock()
 }
 
+// SetHardware records a chipagent poll. A successful report re-tiers an
+// auto-tiered backend. A failed poll keeps the last inventory and tier but
+// stops using its stale utilization for routing.
+func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		if b.hwErr == "" {
+			p.log.Warn("chipagent unreachable", "backend", b.Name, "error", err)
+		}
+		b.hwErr = err.Error()
+		return
+	}
+	b.hw, b.hwErr = r, ""
+	if !b.AutoTier {
+		return
+	}
+	if tier := p.opts.Tiers.Tier(r); tier != b.Tier {
+		p.log.Info("backend tier set from hardware", "backend", b.Name, "tier", tier, "was", b.Tier,
+			"vendors", r.Vendors(), "accelerators", len(r.Devices), "memory_gib", r.MemoryTotal()>>30)
+		b.Tier = tier
+	}
+}
+
+// HardwareStatus summarizes what chipagent reported for a backend.
+type HardwareStatus struct {
+	Hostname           string            `json:"hostname,omitempty"`
+	Vendors            []string          `json:"vendors"`
+	Accelerators       int               `json:"accelerators"`
+	MemoryTotalBytes   uint64            `json:"memory_total_bytes"`
+	MemoryUsedBytes    uint64            `json:"memory_used_bytes"`
+	UtilizationPercent *float64          `json:"utilization_percent,omitempty"`
+	Devices            []hardware.Device `json:"devices"`
+	AgentError         string            `json:"agent_error,omitempty"`
+}
+
+func (b *Backend) hardwareStatus() *HardwareStatus {
+	if b.AgentURL == nil {
+		return nil
+	}
+	hs := &HardwareStatus{Vendors: []string{}, Devices: []hardware.Device{}, AgentError: b.hwErr}
+	if b.hw == nil {
+		if hs.AgentError == "" {
+			hs.AgentError = "not polled yet"
+		}
+		return hs
+	}
+	hs.Hostname = b.hw.Hostname
+	hs.Vendors = b.hw.Vendors()
+	hs.Accelerators = len(b.hw.Devices)
+	hs.MemoryTotalBytes = b.hw.MemoryTotal()
+	hs.MemoryUsedBytes = b.hw.MemoryUsed()
+	if u, ok := b.gpuBusy(); ok {
+		hs.UtilizationPercent = &u
+	}
+	hs.Devices = append(hs.Devices, b.hw.Devices...)
+	return hs
+}
+
 // Status is a point-in-time view of one backend.
 type Status struct {
-	Name             string   `json:"name"`
-	URL              string   `json:"url"`
-	Tier             string   `json:"tier"`
-	Healthy          bool     `json:"healthy"`
-	Inflight         int      `json:"inflight"`
-	MaxConcurrency   int      `json:"max_concurrency"`
-	MaxContextTokens int      `json:"max_context_tokens,omitempty"`
-	Models           []string `json:"models"`
-	LastError        string   `json:"last_error,omitempty"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	Tier string `json:"tier"`
+	// TierSource is "auto" when chipagent's report chose the tier.
+	TierSource       string          `json:"tier_source"`
+	Healthy          bool            `json:"healthy"`
+	Inflight         int             `json:"inflight"`
+	MaxConcurrency   int             `json:"max_concurrency"`
+	MaxContextTokens int             `json:"max_context_tokens,omitempty"`
+	Models           []string        `json:"models"`
+	LastError        string          `json:"last_error,omitempty"`
+	Hardware         *HardwareStatus `json:"hardware,omitempty"`
 }
 
 func (p *Pool) Snapshot() []Status {
@@ -420,10 +528,15 @@ func (p *Pool) Snapshot() []Status {
 			models = append(models, m)
 		}
 		slices.Sort(models)
+		source := "config"
+		if b.AutoTier {
+			source = "auto"
+		}
 		out = append(out, Status{
-			Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, Healthy: b.healthy,
+			Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, TierSource: source, Healthy: b.healthy,
 			Inflight: b.inflight, MaxConcurrency: b.MaxConcurrency,
 			MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
+			Hardware: b.hardwareStatus(),
 		})
 	}
 	return out

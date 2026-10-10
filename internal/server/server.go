@@ -78,6 +78,35 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			emit(boolFloat(st.Healthy), st.Name, st.Tier)
 		}
 	})
+	reg.NewGaugeFunc("siliconrouter_backend_accelerators", "Accelerators chipagent reports per backend, by vendor.", []string{"backend", "vendor"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.Hardware == nil {
+				continue
+			}
+			count := map[string]int{}
+			for _, d := range st.Hardware.Devices {
+				count[d.Vendor]++
+			}
+			for _, v := range st.Hardware.Vendors {
+				emit(float64(count[v]), st.Name, v)
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_backend_accelerator_memory_bytes", "Accelerator memory per backend from chipagent.", []string{"backend", "state"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.Hardware != nil && st.Hardware.Accelerators > 0 {
+				emit(float64(st.Hardware.MemoryTotalBytes), st.Name, "total")
+				emit(float64(st.Hardware.MemoryUsedBytes), st.Name, "used")
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_backend_accelerator_utilization_percent", "Mean accelerator busy percentage per backend from chipagent.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.Hardware != nil && st.Hardware.UtilizationPercent != nil {
+				emit(*st.Hardware.UtilizationPercent, st.Name)
+			}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))
 	})

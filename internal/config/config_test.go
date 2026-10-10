@@ -58,6 +58,18 @@ backends: [{name: a, url: "http://h:1", api_key_env: SR_BACKEND_KEY}]
 	}
 }
 
+func TestAutoTier(t *testing.T) {
+	c, err := Parse([]byte(`
+backends: [{name: a, url: "http://h:8000", tier: auto, agent_url: "http://h:9400"}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Backends[0].Tier != TierAuto || c.Hardware.PollInterval.D() != 10*time.Second || c.Hardware.HeavyMinMemoryGiB != 64 {
+		t.Errorf("auto tier config = %+v, hardware = %+v", c.Backends[0], c.Hardware)
+	}
+}
+
 func TestValidation(t *testing.T) {
 	cases := map[string]string{
 		"no backends":     `listen: ":1"`,
@@ -68,6 +80,9 @@ func TestValidation(t *testing.T) {
 		"bad duration":    "backends: [{name: a, url: \"http://h:1\"}]\nqueue: {max_wait: soon}",
 		"missing env key": `backends: [{name: a, url: "http://h:1", api_key_env: SR_DEFINITELY_UNSET}]`,
 		"bad imbalance":   "backends: [{name: a, url: \"http://h:1\"}]\nrouting: {affinity_max_imbalance: 2}",
+		"auto no agent":   `backends: [{name: a, url: "http://h:1", tier: auto}]`,
+		"bad agent url":   `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,
+		"bad thresholds":  "backends: [{name: a, url: \"http://h:1\"}]\nhardware: {heavy_min_memory_gib: 10, standard_min_memory_gib: 40}",
 	}
 	for name, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {

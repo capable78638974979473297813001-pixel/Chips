@@ -1,0 +1,24 @@
+# Local demo of a mixed-vendor fleet (see `make demo-mixed`): three simulated
+# GPU servers, each with a chipagent reporting its hardware. No backend says
+# which tier it belongs in; the router works it out from the hardware.
+listen: ":8080"
+backends:
+  - name: nvidia-h100
+    url: http://127.0.0.1:9001
+    agent_url: http://127.0.0.1:9401
+    tier: auto
+    max_concurrency: 8
+  - name: amd-mi300x
+    url: http://127.0.0.1:9002
+    agent_url: http://127.0.0.1:9402
+    tier: auto
+    max_concurrency: 8
+  - name: apple-m2-ultra
+    url: http://127.0.0.1:9003
+    agent_url: http://127.0.0.1:9403
+    tier: auto
+    max_concurrency: 4
+health:
+  interval: 2s
+hardware:
+  poll_interval: 5s
