@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 
@@ -31,9 +32,13 @@ std::unique_ptr<Provider> OpenSimulated(const std::vector<std::string>& specs, s
     std::stringstream ss(spec);
     for (std::string part; std::getline(ss, part, ':');) parts.push_back(part);
     double gib = 0, util = 0;
-    if (parts.size() < 3 || parts.size() > 4 || parts[0].empty() || parts[1].empty() ||
-        !ParseNumber(parts[2], &gib) || (parts.size() == 4 && !ParseNumber(parts[3], &util))) {
-      *err = "invalid --simulate spec \"" + spec + "\"; want vendor:name:memory_gib[:utilization_percent]";
+    bool has_util = parts.size() >= 4 && !parts[3].empty();
+    static const char* const kKinds[] = {"gpu", "npu", "accelerator", "display"};
+    bool kind_ok = parts.size() < 5 || std::find(std::begin(kKinds), std::end(kKinds), parts[4]) != std::end(kKinds);
+    if (parts.size() < 3 || parts.size() > 5 || parts[0].empty() || parts[1].empty() ||
+        !ParseNumber(parts[2], &gib) || (has_util && !ParseNumber(parts[3], &util)) || !kind_ok) {
+      *err = "invalid --simulate spec \"" + spec +
+             "\"; want vendor:name:memory_gib[:utilization_percent[:gpu|npu|accelerator|display]]";
       return nullptr;
     }
     Device d;
@@ -43,7 +48,8 @@ std::unique_ptr<Provider> OpenSimulated(const std::vector<std::string>& specs, s
     d.source = "simulated";
     d.memory_total_bytes = static_cast<uint64_t>(gib * (1ull << 30));
     d.unified_memory = d.vendor == "apple";
-    if (parts.size() == 4) d.utilization_percent = util;
+    if (has_util) d.utilization_percent = util;
+    if (parts.size() == 5) d.kind = parts[4];
     devices.push_back(std::move(d));
   }
   return std::make_unique<SimulatedProvider>(std::move(devices));

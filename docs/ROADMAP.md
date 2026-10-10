@@ -12,6 +12,10 @@
 - `mockllm` simulator and `srbench` load generator for demos without GPUs
 - `chipagent` (C++): one telemetry schema across NVIDIA (NVML), AMD and Intel (sysfs) and Apple
   silicon, with automatic tiering (`tier: auto`) and a busy-GPU tie-break in the router
+- Any HTTP AI API is forwarded (OpenAI, Anthropic-style, Ollama, TGI, Triton/KServe, Gemini-style,
+  multipart, binary), with the model read from the body, URL or form
+- chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
+  Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
 ## Next
 
@@ -22,7 +26,8 @@
 | Priority classes | Interactive chat ahead of batch jobs in the queue |
 | Config hot-reload, plus backend add/remove via API | Scale the fleet without a restart |
 | Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
-| chipagent: Intel memory/utilization, Apple GPU utilization (IOKit), real-hardware validation | Fill the remaining gaps in the vendor matrix |
+| chipagent: live telemetry for Intel, Gaudi (hl-smi), Neuron, TPU; Apple/Windows GPU utilization; real-hardware validation | Fill the remaining gaps in the vendor matrix |
+| gRPC and WebSocket proxying | Triton/KServe gRPC ports, realtime voice APIs |
 | Shared routing state across router replicas (gossip or Redis) | Run the router itself highly available without losing cache affinity |
 | OpenTelemetry tracing | Per-request timing: queue, TTFT, generation |
 | Grafana dashboard | Shows the ROI story at a glance |

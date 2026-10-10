@@ -13,14 +13,29 @@ jobs:
       - run: make lint
       - run: make test
       - run: make build
+      - run: make cross
   agent:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -S agent -B agent/build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
-      - run: cmake --build agent/build -j
-      - run: ctest --test-dir agent/build --output-on-failure
-      - run: agent/build/chipagent --once
+      - run: cmake --build agent/build -j --config Debug
+      - run: ctest --test-dir agent/build -C Debug --output-on-failure
+      - if: runner.os != 'Windows'
+        run: agent/build/chipagent --once
+      - if: runner.os == 'Windows'
+        run: agent/build/Debug/chipagent.exe --once
+  agent-multiarch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user g++-aarch64-linux-gnu g++-arm-linux-gnueabihf \
+            g++-i686-linux-gnu g++-powerpc64le-linux-gnu g++-s390x-linux-gnu \
+            g++-riscv64-linux-gnu g++-mips-linux-gnu
+      - run: scripts/agent-cross-test.sh

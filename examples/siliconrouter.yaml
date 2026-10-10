@@ -9,8 +9,9 @@ auth:
   api_keys: []
   api_keys_env: SILICONROUTER_API_KEYS   # comma-separated keys from the environment
 
-# Your inference servers. Anything that speaks the OpenAI API works:
-# vLLM, SGLang, llama.cpp server, Ollama, TGI, LM Studio, etc.
+# Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
+# llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.
+# See docs/COMPATIBILITY.md.
 backends:
   - name: h100-node-1
     url: http://10.0.0.11:8000      # vLLM
@@ -20,6 +21,8 @@ backends:
     models: [llama-3.1-70b]         # omit to auto-discover from GET /v1/models
     api_key_env: H100_API_KEY       # optional bearer token sent to this backend
     agent_url: http://10.0.0.11:9400  # optional chipagent on this machine (see docs/HARDWARE.md)
+    # api_key_header: x-api-key     # send the key in this header instead of "Authorization: Bearer"
+    # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)
 
   - name: mac-studio-2
     url: http://10.0.0.12:11434     # Ollama

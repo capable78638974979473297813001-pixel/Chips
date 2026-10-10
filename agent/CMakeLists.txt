@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(chipagent VERSION 0.1.0 LANGUAGES C CXX)
+project(chipagent VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,20 +7,40 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-add_compile_options(-Wall -Wextra -Wpedantic)
+if(MSVC)
+  add_compile_options(/W3 /utf-8)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-Wno-psabi)  # 32-bit Arm ABI notes about GCC 7 changes; informational only
+  endif()
+endif()
+if(WIN32)
+  # Windows 7 is the oldest version with every API chipagent uses.
+  add_compile_definitions(_WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
 
 find_package(Threads REQUIRED)
 
 add_library(chipagent_core STATIC
   src/apple.cpp
+  src/dynlib.cpp
+  src/host.cpp
   src/http.cpp
   src/nvml.cpp
+  src/pci.cpp
   src/simulated.cpp
-  src/sysfs.cpp
   src/telemetry.cpp
+  src/windows.cpp
 )
 target_include_directories(chipagent_core PUBLIC src)
 target_link_libraries(chipagent_core PUBLIC ${CMAKE_DL_LIBS})
+if(WIN32)
+  target_link_libraries(chipagent_core PUBLIC ws2_32 dxgi dxguid advapi32)
+elseif(APPLE)
+  target_link_libraries(chipagent_core PUBLIC "-framework IOKit" "-framework CoreFoundation")
+endif()
 
 add_executable(chipagent src/main.cpp)
 target_compile_definitions(chipagent PRIVATE CHIPAGENT_VERSION="${PROJECT_VERSION}")

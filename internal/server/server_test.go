@@ -269,17 +269,103 @@ func TestBackendKeyIsSent(t *testing.T) {
 	}
 }
 
-func TestRejectsBadInput(t *testing.T) {
+func TestRejectsOversizedBody(t *testing.T) {
 	f := newFake(t, nil)
 	ts, _ := setup(t, func(c *config.Config) { c.MaxBodyBytes = 64 }, f.URL)
-	if resp := chat(t, ts.URL, `nope`); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("bad json: %d", resp.StatusCode)
-	}
 	if resp := chat(t, ts.URL, `{"x":"`+strings.Repeat("a", 100)+`"}`); resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("big body: %d", resp.StatusCode)
 	}
 	if f.hits.Load() != 0 {
-		t.Error("invalid requests reached the backend")
+		t.Error("oversized request reached the backend")
+	}
+}
+
+// Bodies the router cannot read (audio, images, binary tensors) are not its
+// business to reject: they are forwarded byte for byte.
+func TestForwardsNonJSONBodies(t *testing.T) {
+	var got atomic.Value
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got.Store(r.Method + " " + r.URL.Path + " " + r.Header.Get("Content-Type") + " " + string(b))
+	})
+	ts, _ := setup(t, nil, f.URL)
+	resp, err := http.Post(ts.URL+"/v2/models/yolo/infer", "application/octet-stream", strings.NewReader("\x00raw"))
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("status %v err %v", resp.Status, err)
+	}
+	resp.Body.Close()
+	if want := "POST /v2/models/yolo/infer application/octet-stream \x00raw"; got.Load() != want {
+		t.Errorf("backend saw %q, want %q", got.Load(), want)
+	}
+}
+
+// Native, non-OpenAI APIs are proxied too, and a model named in the URL or
+// body steers the request to a backend that serves it.
+func TestRoutesNativeAPIsByModel(t *testing.T) {
+	resnet := newFake(t, nil)
+	llama := newFake(t, nil)
+	ts, _ := setup(t, func(c *config.Config) {
+		c.Backends[0].Models = []string{"resnet50"}
+		c.Backends[1].Models = []string{"llama3"}
+	}, resnet.URL, llama.URL)
+	for i := range 4 {
+		post := func(path, body string) {
+			resp, err := http.Post(ts.URL+path, "application/json", strings.NewReader(body))
+			if err != nil || resp.StatusCode != 200 {
+				t.Fatalf("%s: %v %v", path, resp.Status, err)
+			}
+			resp.Body.Close()
+		}
+		post("/v2/models/resnet50/infer", `{"inputs":[]}`)                                                  // Triton/KServe
+		post("/api/chat", fmt.Sprintf(`{"model":"llama3","messages":[{"role":"user","content":"%d"}]}`, i)) // Ollama
+		post("/v1/messages", `{"model":"llama3","max_tokens":5,"messages":[]}`)                             // Anthropic-style
+	}
+	if resnet.hits.Load() != 4 || llama.hits.Load() != 8 {
+		t.Errorf("resnet got %d, llama got %d; want 4 and 8", resnet.hits.Load(), llama.hits.Load())
+	}
+}
+
+func TestAlternativeKeyHeaders(t *testing.T) {
+	var seen atomic.Value
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get("X-Api-Key") + "|" + r.Header.Get("Api-Key") + "|" + r.Header.Get("Authorization"))
+	})
+	ts, _ := setup(t, func(c *config.Config) {
+		c.Auth.APIKeys = []string{"router-key"}
+		c.Backends[0].APIKey = "upstream-key"
+		c.Backends[0].APIKeyHeader = "x-api-key"
+	}, f.URL)
+	// Anthropic SDKs send x-api-key; Azure OpenAI SDKs send api-key.
+	for _, h := range []string{"X-Api-Key", "Api-Key"} {
+		if resp := chat(t, ts.URL, `{}`, h, "router-key"); resp.StatusCode != 200 {
+			t.Errorf("%s: status %d", h, resp.StatusCode)
+		}
+		if got := seen.Load(); got != "upstream-key||" {
+			t.Errorf("%s: upstream saw %q; want only the backend key in x-api-key", h, got)
+		}
+	}
+	if resp := chat(t, ts.URL, `{}`, "X-Api-Key", "wrong"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong x-api-key: status %d", resp.StatusCode)
+	}
+}
+
+func TestPerBackendHealthPath(t *testing.T) {
+	var paths atomic.Value
+	paths.Store("")
+	tgi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths.Store(paths.Load().(string) + r.URL.Path + " ")
+		if r.URL.Path != "/info" {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, `{"model_id":"mistral-7b"}`)
+	}))
+	defer tgi.Close()
+	_, p := setup(t, func(c *config.Config) { c.Backends[0].HealthPath = "/info" }, tgi.URL)
+	(&pool.Checker{Pool: p, Client: http.DefaultClient, Path: "/v1/models", Timeout: time.Second}).CheckAll(context.Background())
+	st := p.Snapshot()[0]
+	if !st.Healthy || len(st.Models) != 1 || st.Models[0] != "mistral-7b" || paths.Load() != "/info " {
+		t.Errorf("status %+v, paths %q", st, paths.Load())
 	}
 }
 

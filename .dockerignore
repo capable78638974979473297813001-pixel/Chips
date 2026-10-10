@@ -2,3 +2,4 @@
 bin
 *.log
 agent/build
+agent/build-*

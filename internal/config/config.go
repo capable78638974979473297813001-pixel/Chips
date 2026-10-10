@@ -69,6 +69,12 @@ type Backend struct {
 	MaxContextTokens int      `yaml:"max_context_tokens"` // 0 = no limit
 	Models           []string `yaml:"models"`             // empty = discover from /v1/models
 	APIKeyEnv        string   `yaml:"api_key_env"`        // bearer token sent upstream
+	// APIKeyHeader sends the key as a raw header value (e.g. x-api-key,
+	// api-key) instead of "Authorization: Bearer".
+	APIKeyHeader string `yaml:"api_key_header"`
+	// HealthPath overrides health.path for engines with their own health
+	// endpoint, e.g. /health (TGI), /v2/health/ready (Triton, KServe), /api/tags (Ollama).
+	HealthPath string `yaml:"health_path"`
 	// AgentURL points at the chipagent on this backend's machine, which
 	// reports its accelerators (NVIDIA, AMD, Intel, Apple) in one schema.
 	AgentURL string `yaml:"agent_url"`
@@ -293,6 +299,9 @@ func (c *Config) validate() error {
 		}
 		if b.MaxContextTokens < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
+		}
+		if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
+			errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
 		}
 		if b.APIKeyEnv != "" && b.APIKey == "" {
 			errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))

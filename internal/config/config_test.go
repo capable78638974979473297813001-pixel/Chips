@@ -80,6 +80,7 @@ func TestValidation(t *testing.T) {
 		"bad duration":    "backends: [{name: a, url: \"http://h:1\"}]\nqueue: {max_wait: soon}",
 		"missing env key": `backends: [{name: a, url: "http://h:1", api_key_env: SR_DEFINITELY_UNSET}]`,
 		"bad imbalance":   "backends: [{name: a, url: \"http://h:1\"}]\nrouting: {affinity_max_imbalance: 2}",
+		"bad health path": `backends: [{name: a, url: "http://h:1", health_path: "health"}]`,
 		"auto no agent":   `backends: [{name: a, url: "http://h:1", tier: auto}]`,
 		"bad agent url":   `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,
 		"bad thresholds":  "backends: [{name: a, url: \"http://h:1\"}]\nhardware: {heavy_min_memory_gib: 10, standard_min_memory_gib: 40}",
