@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/hardware"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/server"
 )
@@ -66,6 +67,10 @@ func run() error {
 		UnhealthyThreshold:   cfg.Health.UnhealthyThreshold,
 		HealthyThreshold:     cfg.Health.HealthyThreshold,
 		PassiveHealth:        !cfg.Health.Disabled,
+		Tiers: hardware.Thresholds{
+			HeavyMinBytes:    uint64(cfg.Hardware.HeavyMinMemoryGiB * (1 << 30)),
+			StandardMinBytes: uint64(cfg.Hardware.StandardMinMemoryGiB * (1 << 30)),
+		},
 	}, log)
 	if err != nil {
 		return err
@@ -99,9 +104,24 @@ func run() error {
 		checker.CheckAll(ctx) // know who is up before taking traffic
 		go checker.Run(ctx)
 	}
+	agents := &pool.AgentPoller{
+		Pool:     p,
+		Client:   client,
+		Interval: cfg.Hardware.PollInterval.D(),
+		Timeout:  cfg.Hardware.Timeout.D(),
+	}
+	if agents.HasAgents() {
+		agents.PollAll(ctx) // tier auto backends before taking traffic
+		go agents.Run(ctx)
+	}
 	for _, st := range p.Snapshot() {
-		log.Info("backend", "name", st.Name, "url", st.URL, "tier", st.Tier, "healthy", st.Healthy,
-			"max_concurrency", st.MaxConcurrency, "models", st.Models)
+		attrs := []any{"name", st.Name, "url", st.URL, "tier", st.Tier, "tier_source", st.TierSource,
+			"healthy", st.Healthy, "max_concurrency", st.MaxConcurrency, "models", st.Models}
+		if hw := st.Hardware; hw != nil {
+			attrs = append(attrs, "accelerators", hw.Accelerators, "vendors", hw.Vendors,
+				"accelerator_memory_gib", hw.MemoryTotalBytes>>30)
+		}
+		log.Info("backend", attrs...)
 	}
 
 	srv := &http.Server{

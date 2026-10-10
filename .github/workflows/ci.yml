@@ -13,3 +13,14 @@ jobs:
       - run: make lint
       - run: make test
       - run: make build
+  agent:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S agent -B agent/build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - run: cmake --build agent/build -j
+      - run: ctest --test-dir agent/build --output-on-failure
+      - run: agent/build/chipagent --once

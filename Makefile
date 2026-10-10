@@ -1,4 +1,4 @@
-.PHONY: build test lint demo bench clean
+.PHONY: build test lint demo demo-mixed bench agent agent-test clean
 
 build:
 	go build -o bin/ ./cmd/...
@@ -18,9 +18,29 @@ demo: build
 	bin/mockllm -addr :9003 -name mi300 -prefill-tps 2000 -decode-tps 300 -max-concurrency 4 & \
 	sleep 0.5; bin/siliconrouter -config examples/demo.yaml
 
+# chipagent, the C++ hardware agent that runs on each GPU server.
+agent:
+	cmake -S agent -B agent/build -DCMAKE_BUILD_TYPE=Release
+	cmake --build agent/build -j
+
+agent-test: agent
+	ctest --test-dir agent/build --output-on-failure
+
+# Like demo, but every node runs a simulated chipagent (NVIDIA, AMD, Apple)
+# and the router assigns tiers from the reported hardware.
+demo-mixed: build agent
+	@trap 'kill 0' INT TERM EXIT; \
+	bin/mockllm -addr :9001 -name h100 -prefill-tps 3000 -decode-tps 400 -max-concurrency 8 & \
+	bin/mockllm -addr :9002 -name mi300x -prefill-tps 2800 -decode-tps 380 -max-concurrency 8 & \
+	bin/mockllm -addr :9003 -name m2-ultra -prefill-tps 1200 -decode-tps 150 -max-concurrency 4 & \
+	agent/build/chipagent --listen 127.0.0.1:9401 --simulate "nvidia:NVIDIA H100 80GB HBM3:80:20" & \
+	agent/build/chipagent --listen 127.0.0.1:9402 --simulate "amd:AMD Instinct MI300X:192:15" & \
+	agent/build/chipagent --listen 127.0.0.1:9403 --simulate "apple:Apple M2 Ultra GPU:192" & \
+	sleep 0.5; bin/siliconrouter -config examples/mixed-fleet.yaml
+
 # Run against a running `make demo` in another terminal.
 bench: build
 	bin/srbench -conversations 30 -turns 10 -concurrency 8 -system-chars 400 -user-chars 2000
 
 clean:
-	rm -rf bin
+	rm -rf bin agent/build

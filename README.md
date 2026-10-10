@@ -30,7 +30,12 @@ endpoint.
 3. **Mixes and matches hardware.** You tag each server as `heavy`, `standard`, `light` or `reserve`.
    Big prompts go to heavy GPUs, small ones to cheaper machines, and reserve hardware only gets
    traffic when everything else is full or down. Servers too small for a prompt's context are skipped.
-4. **Survives failures.** If a server dies mid-request, the request is retried on another server
+4. **Knows the hardware, whoever made it.** An optional C++ agent, `chipagent`, runs on each
+   server and reads NVIDIA (NVML), AMD and Intel (Linux sysfs), and Apple silicon (sysctl) through
+   one schema. With `tier: auto` the router tiers each node from what it actually has, sees GPU
+   load from outside work, and lists the whole mixed fleet in one inventory. See
+   [docs/HARDWARE.md](docs/HARDWARE.md).
+5. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover.
 
@@ -41,7 +46,10 @@ Your apps don't change: point any OpenAI client at SiliconRouter instead of a si
 ```bash
 make demo        # 3 simulated GPU servers + the router on :8080 (no GPU needed)
 make bench       # in a second terminal: multi-turn chat load test
+make demo-mixed  # same, plus a simulated chipagent per node (NVIDIA, AMD, Apple) and tier: auto
 ```
+
+`demo-mixed` also needs CMake and a C++17 compiler.
 
 Or with Docker:
 
@@ -96,7 +104,7 @@ OpenAI-compatible servers return).
 |---------------------------|---------------------------------------------------------------|
 | `POST /v1/*`              | Chat completions, completions, embeddings: routed to a backend |
 | `GET /v1/models`          | Models served by healthy backends                             |
-| `GET /admin/backends`     | Live state: health, in-flight requests, models, last error    |
+| `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
 | `GET /metrics`            | Prometheus metrics                                            |
 | `GET /healthz`, `/readyz` | Liveness, and readiness (at least one healthy backend)        |
 
@@ -112,7 +120,9 @@ Response headers: `X-SiliconRouter-Backend` (which server answered) and
 
 Key metrics: `siliconrouter_prefix_cache_routing_total{result="hit|rebalanced|miss"}`,
 `siliconrouter_queue_depth`, `siliconrouter_queue_wait_seconds`, `siliconrouter_backend_inflight`,
-`siliconrouter_backend_healthy`, `siliconrouter_retries_total`, `siliconrouter_request_duration_seconds`.
+`siliconrouter_backend_healthy`, `siliconrouter_retries_total`, `siliconrouter_request_duration_seconds`,
+and, with chipagent, `siliconrouter_backend_accelerators{vendor}`,
+`siliconrouter_backend_accelerator_memory_bytes` and `siliconrouter_backend_accelerator_utilization_percent`.
 
 ## How routing decides
 
@@ -126,7 +136,8 @@ For each request, the router:
 3. **Cache first:** if a backend recently served the longest matching prefix and has a free slot,
    it gets the request, unless it is much busier than the alternatives (`affinity_max_imbalance`).
 4. **Then hardware fit:** large prompts try `heavy → standard → light → reserve`; small prompts try
-   `light → standard → heavy → reserve`. Within a tier, the least utilized backend wins.
+   `light → standard → heavy → reserve`. Within a tier, the least utilized backend wins; on a tie,
+   the node whose accelerators chipagent reports as less busy wins.
 5. **Otherwise wait:** if every suitable backend is full, the request joins a FIFO queue. A request
    that can only fit on a big GPU doesn't block smaller requests that fit elsewhere.
 6. **Retry:** on a connection error or a `429/502/503/504` before any bytes reach the client, the
@@ -139,6 +150,8 @@ For each request, the router:
 cmd/siliconrouter   the router
 cmd/mockllm         simulated GPU inference server for demos and tests
 cmd/srbench         multi-turn chat load generator
+agent/              chipagent (C++17): per-node NVIDIA/AMD/Intel/Apple hardware telemetry
+internal/hardware   chipagent client, telemetry schema, automatic tiering
 internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
 internal/affinity   prefix → backend LRU table
@@ -146,8 +159,9 @@ internal/prompt     request parsing, prefix hashing, size estimates
 internal/config     YAML config, defaults, validation
 ```
 
-`make test` runs the suite with the race detector. The router depends only on the Go standard
-library and `gopkg.in/yaml.v3`.
+`make test` runs the Go suite with the race detector and `make agent-test` runs the C++ suite. The
+router depends only on the Go standard library and `gopkg.in/yaml.v3`. chipagent depends only on
+the C++ standard library and POSIX; it needs no CUDA, ROCm or vendor SDK to build.
 
 ## Status and roadmap
 

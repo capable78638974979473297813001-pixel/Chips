@@ -10,6 +10,8 @@
 - Active and passive health checks, plus automatic retry on a different backend
 - Prometheus metrics, an admin status endpoint, API-key auth, and graceful shutdown
 - `mockllm` simulator and `srbench` load generator for demos without GPUs
+- `chipagent` (C++): one telemetry schema across NVIDIA (NVML), AMD and Intel (sysfs) and Apple
+  silicon, with automatic tiering (`tier: auto`) and a busy-GPU tie-break in the router
 
 ## Next
 
@@ -19,7 +21,8 @@
 | Per-key rate limits and quotas | Multi-team fairness; stops one team starving the others |
 | Priority classes | Interactive chat ahead of batch jobs in the queue |
 | Config hot-reload, plus backend add/remove via API | Scale the fleet without a restart |
-| Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real GPU memory pressure, not just request counts |
+| Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
+| chipagent: Intel memory/utilization, Apple GPU utilization (IOKit), real-hardware validation | Fill the remaining gaps in the vendor matrix |
 | Shared routing state across router replicas (gossip or Redis) | Run the router itself highly available without losing cache affinity |
 | OpenTelemetry tracing | Per-request timing: queue, TTFT, generation |
 | Grafana dashboard | Shows the ROI story at a glance |
