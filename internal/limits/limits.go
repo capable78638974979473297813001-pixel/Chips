@@ -218,3 +218,23 @@ func (t *Tracker) Snapshot() []Usage {
 	slices.SortFunc(out, func(a, b Usage) int { return strings.Compare(a.Client, b.Client) })
 	return out
 }
+
+// Restore loads counters saved from Snapshot (for example before a
+// restart). Today's tokens count only if they are from today, so a daily
+// quota survives a restart but still resets at midnight.
+func (t *Tracker) Restore(saved []Usage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	today := midnight(t.now()).Format(dayFormat)
+	for _, u := range saved {
+		c := t.clientLocked(u.Client)
+		c.usage.Requests += u.Requests
+		c.usage.Rejected += u.Rejected
+		c.usage.PromptTokens += u.PromptTokens
+		c.usage.CompletionTokens += u.CompletionTokens
+		c.usage.EstimatedTokens += u.EstimatedTokens
+		if u.Day == today {
+			c.usage.TokensToday += u.TokensToday
+		}
+	}
+}

@@ -161,7 +161,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		queueWait:    reg.NewHistogram("siliconrouter_queue_wait_seconds", "Time spent waiting for a backend slot.", metrics.LatencyBuckets),
 		firstByte:    reg.NewHistogram("siliconrouter_upstream_ttfb_seconds", "Time from dispatch to first upstream response headers.", metrics.LatencyBuckets),
 
-		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), miss, or skip (request not cacheable).", "result"),
+		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), coalesced (shared the answer of an identical request in flight), miss, or skip (not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
@@ -452,13 +452,22 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case cacheable:
 		cacheKey = cacheKeyFor(st, r, path, rl.client, body)
-		if e, ok := st.cache.Get(cacheKey); ok {
-			s.responseCache.Inc("hit")
+		e, coalesced, leader, done := st.cache.Lookup(r.Context(), cacheKey)
+		defer done()
+		if e != nil {
 			rl.cache = "hit"
+			if coalesced {
+				rl.cache = "coalesced" // waited for an identical request already in flight
+			}
+			s.responseCache.Inc(rl.cache)
 			serveCached(w, e)
 			s.requests.Inc("cache", strconv.Itoa(e.Status))
 			s.duration.Observe(time.Since(start).Seconds())
 			s.logRequest(rl, e.Backend, e.Status, 0, false, nil)
+			return
+		}
+		if !leader { // gave up waiting: the client went away
+			s.logRequest(rl, "", 499, 0, false, r.Context().Err())
 			return
 		}
 		s.responseCache.Inc("miss")

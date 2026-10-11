@@ -57,6 +57,10 @@ type Config struct {
 	Models       Models    `yaml:"models"`
 	TLS          TLS       `yaml:"tls"`
 	Cluster      Cluster   `yaml:"cluster"`
+	// StateDir, when set, is where the router saves its response cache and
+	// usage counters (on shutdown and every few minutes) and restores them
+	// at startup, so a restart keeps cached answers and daily quotas.
+	StateDir string `yaml:"state_dir"`
 }
 
 // Cluster lets several routers behind one load balancer act as one: they

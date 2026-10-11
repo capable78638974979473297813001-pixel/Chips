@@ -138,6 +138,28 @@ func run() error {
 	}
 	router := server.New(cfg, p, client, log)
 	go router.RunCluster(ctx)
+	if dir := cfg.StateDir; dir != "" {
+		cached, err := router.LoadState(dir)
+		if err != nil {
+			log.Warn("could not restore saved state; starting fresh", "dir", dir, "error", err)
+		} else {
+			log.Info("restored saved state", "dir", dir, "cached_responses", cached)
+		}
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if err := router.SaveState(dir); err != nil {
+						log.Warn("saving state failed", "dir", dir, "error", err)
+					}
+				}
+			}
+		}()
+	}
 	if cfg.Cluster.Enabled() {
 		log.Info("cluster mode", "node", cfg.Cluster.NodeName, "peers", cfg.Cluster.Peers)
 	}
@@ -207,8 +229,16 @@ func run() error {
 	log.Info("shutting down; draining in-flight requests")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return err
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if dir := cfg.StateDir; dir != "" {
+		if err := router.SaveState(dir); err != nil {
+			log.Error("saving state failed", "dir", dir, "error", err)
+		} else {
+			log.Info("saved state", "dir", dir)
+		}
+	}
+	if shutdownErr != nil && !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		return shutdownErr
 	}
 	return nil
 }
