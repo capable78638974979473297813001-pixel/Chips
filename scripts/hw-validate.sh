@@ -20,6 +20,9 @@ set -uo pipefail
 OUT=${OUT:-/results}
 MODEL=${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
 TTL_MIN=${TTL_MIN:-120}
+# Fraction of GPU memory per engine; lower it to put the KV cache under
+# pressure, where prefix-cache placement matters most.
+MEM_UTIL=${MEM_UTIL:-0.35}
 GO_VERSION=1.24.7
 : "${VLLM_API_KEY:?set VLLM_API_KEY}"
 export VLLM_API_KEY
@@ -94,7 +97,7 @@ agent/build/chipagent --listen :9400 > "$OUT/chipagent-server.log" 2>&1 &
 # flood fills its queue.
 start_vllm() { # $1: port
   log "starting vLLM on :$1"
-  vllm serve "$MODEL" --port "$1" --api-key "$VLLM_API_KEY" --gpu-memory-utilization 0.35 \
+  vllm serve "$MODEL" --port "$1" --api-key "$VLLM_API_KEY" --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len 16384 --max-num-seqs 16 --enable-prefix-caching --enable-prompt-tokens-details \
     > "$OUT/vllm-$1.log" 2>&1 &
   for _ in $(seq 1 240); do
@@ -144,7 +147,9 @@ bench() { # $1: label, $2: url, more srbench flags follow
   echo "engine prefix cache: $((h1 - h0)) of $((q1 - q0)) prompt tokens hit" >> "$OUT/bench-$label.txt"
 }
 # Long shared system prompts make prefix-cache placement matter.
-BENCH=(-conversations 48 -concurrency 16 -turns 6 -system-chars 24000 -user-chars 800)
+# BENCH_ARGS overrides it (word-split), e.g. long unique histories.
+if [ -n "${BENCH_ARGS:-}" ]; then read -r -a BENCH <<< "$BENCH_ARGS"
+else BENCH=(-conversations 48 -concurrency 16 -turns 6 -system-chars 24000 -user-chars 800); fi
 
 # Warm both engines up first (compilation, graph capture, allocator), so
 # the first measured run is not charged for it.
