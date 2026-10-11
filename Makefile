@@ -1,4 +1,4 @@
-.PHONY: build test lint cross dist demo demo-mixed bench agent agent-test agent-cross clean
+.PHONY: build test lint cross dist demo demo-mixed bench soak agent agent-test agent-cross clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS = -s -w -X main.version=$(VERSION)
@@ -73,6 +73,11 @@ demo-mixed: build agent
 	sleep 0.5; bin/siliconrouter -config examples/mixed-fleet.yaml
 
 # Run against a running `make demo` in another terminal.
+# Steady load with failing, killed and restarted backends and config reloads;
+# fails on errors, held slots, panics, or growing goroutines or heap.
+soak: build
+	DURATION=$${DURATION:-120} scripts/soak.sh
+
 bench: build
 	bin/srbench -conversations 30 -turns 10 -concurrency 8 -system-chars 400 -user-chars 2000
 

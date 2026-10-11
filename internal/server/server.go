@@ -15,6 +15,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -304,6 +305,14 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 				emit(float64(len(st.Hardware.Faults)), st.Name)
 			}
 		}
+	})
+	reg.NewGaugeFunc("siliconrouter_goroutines", "Goroutines in the router; steady growth means a leak.", nil, func(emit func(float64, ...string)) {
+		emit(float64(runtime.NumGoroutine()))
+	})
+	reg.NewGaugeFunc("siliconrouter_heap_bytes", "Heap memory in use by the router.", nil, func(emit func(float64, ...string)) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		emit(float64(m.HeapAlloc))
 	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))

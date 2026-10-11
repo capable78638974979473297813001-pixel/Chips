@@ -13,6 +13,8 @@
 | **Load shedding** | Interactive users turned away because batch work filled the queue | automatic with priorities |
 | **Model fallbacks** | Errors or long waits while a model's GPUs are down or saturated | `models.fallbacks` |
 | **Prefix-cache routing** | Re-reading a whole conversation on every turn | `routing.prefix_affinity` (default on) |
+| **Retry budget** | Retries multiplying load when the whole fleet is struggling | `retry.budget_ratio` (default 20%) |
+| **Stall detection** | Requests piling onto a hung engine that still answers health checks | `engine_metrics.stall_after` |
 | **Fair queue + backpressure** | Overloading a GPU until every request on it crawls | `max_concurrency`, `queue.*` |
 | **Hardware tiers** | Small requests waiting behind big ones on the big GPUs | `tier` / `tier: auto` |
 | **Engine-aware routing** | Sending work to an engine whose own queue is backing up or whose KV cache is full, including from load the router can't see | backend `metrics_path` |
