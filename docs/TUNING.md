@@ -7,6 +7,8 @@
 | **First-token failover** | A backend that accepts a request and then stalls (hung GPU, wedged engine) holding a user forever | `retry.first_token_timeout` (default 60s) |
 | **Latency-aware routing** | Traffic going to a degraded node: thermally throttled, on a shared GPU, or simply slower | automatic |
 | **Response cache** | Recomputing an answer that can't change | `cache.enabled` |
+| **Request coalescing** | Many identical requests arriving together each using a GPU | automatic with the cache |
+| **Exact token counts near limits** | A prompt sent to a backend too small for it, or a large backend left unused | backend `tokenize` |
 | **Priority classes** | Batch jobs filling the queue ahead of interactive users | `auth.keys[].priority`, `queue.priority_header` |
 | **Prefix-cache routing** | Re-reading a whole conversation on every turn | `routing.prefix_affinity` (default on) |
 | **Fair queue + backpressure** | Overloading a GPU until every request on it crawls | `max_concurrency`, `queue.*` |
@@ -45,9 +47,36 @@ the same answer to the same question is what you want. Streams are cached whole 
 `200` responses are stored. A cached response carries `X-SiliconRouter-Cache: hit`; a client can skip
 the cache with `Cache-Control: no-cache`.
 
+**Coalescing.** When identical cacheable requests arrive while the first is still being computed,
+they wait for its answer instead of each going to a GPU, so a burst of 50 identical requests costs
+one generation. If that answer turns out not to be cacheable (an error, say), each waiting request
+then computes its own.
+
 By default each API key has its own cache, so one tenant never receives another's answers. Set
 `share_across_keys: true` when every key belongs to the same team. The cache stores hashes of
 requests, never the prompts themselves, but it does hold responses in memory.
+
+### Prompt sizes and context limits
+
+Routing needs each prompt's size to skip backends whose `max_context_tokens` it would exceed. The
+router estimates size without a tokenizer, by script:
+- English and code: about `chars_per_token` (default 4) characters per token;
+- Chinese, Japanese and Korean: about one token per character;
+- other scripts: about 2.5 characters per token.
+
+Far from every limit, a rough estimate is enough. When a request's estimate is within
+`routing.exact_tokens_margin` (default 20%) of some backend's limit, the router asks the engine for
+the exact count first. The backend needs `tokenize` set:
+
+```yaml
+backends:
+  - {name: gpu-small, url: http://10.0.0.21:8000, max_context_tokens: 8192, tokenize: vllm}
+  - {name: gpu-large, url: http://10.0.0.22:8000, max_context_tokens: 131072, tokenize: vllm}
+```
+
+`tokenize` can be `vllm` (counts chat requests with the model's chat template), `llamacpp`, or
+`tgi`. The call is skipped for prompts far from any limit. If it fails, the router keeps its
+estimate.
 
 ### Router overhead
 

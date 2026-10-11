@@ -22,6 +22,8 @@ and keep a conversation on the server that already has it cached.
 | KServe v1 / TF Serving (`/v1/models/{m}:predict`) | TensorFlow Serving, KServe | URL | – |
 | Azure OpenAI (`/openai/deployments/{m}/...`) | Azure-compatible gateways | URL | ✓ |
 | Multipart uploads (speech-to-text, image edits) | Whisper servers, image models | form field `model` | – |
+| gRPC (`application/grpc`) | Triton and KServe gRPC ports, other gRPC model servers | – (routed by load to backends with `grpc_url`) | – |
+| WebSocket (realtime APIs) | OpenAI-style realtime voice/text sessions | `?model=` or URL | – |
 | Anything else (custom JSON, protobuf, binary tensors) | TorchServe, BentoML, Ray Serve, in-house services | – | – (routed by load) |
 
 Requests the router can't parse are never rejected; they are routed by load alone. Bodies are
@@ -43,8 +45,22 @@ backends:
 Clients may authenticate to the router with `Authorization: Bearer`, `x-api-key` (Anthropic SDKs)
 or `api-key` (Azure SDKs).
 
-**Not supported:** gRPC (Triton's and KServe's gRPC ports; use their HTTP ports) and WebSocket
-APIs such as OpenAI's Realtime API.
+**gRPC.** Give each gRPC-capable backend its gRPC address (Triton and KServe use port 8001 next
+to HTTP on 8000):
+
+```yaml
+backends:
+  - {name: triton-1, url: http://10.0.0.20:8000, grpc_url: http://10.0.0.20:8001}
+```
+
+Calls are relayed over HTTP/2: cleartext h2c for `http://`, TLS for `https://`. Trailers such as
+`grpc-status` pass through. Clients may connect to the router with TLS, or with cleartext HTTP/2.
+
+**WebSocket.** Upgrades are relayed to a backend chosen by model and load. The session occupies
+one of the backend's `max_concurrency` slots until it closes.
+
+Neither gRPC nor WebSocket can be retried on another backend once started, and their contents
+aren't inspected, so prefix-cache routing and the response cache don't apply to them.
 
 ## Chips
 

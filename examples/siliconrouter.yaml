@@ -43,6 +43,8 @@ backends:
     agent_url: http://10.0.0.11:9400  # optional chipagent on this machine (see docs/HARDWARE.md)
     # api_key_header: x-api-key     # send the key in this header instead of "Authorization: Bearer"
     # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)
+    # tokenize: vllm                # exact token counts near context limits: vllm, llamacpp or tgi
+    # grpc_url: http://10.0.0.11:8001  # gRPC endpoint, if it has one (Triton/KServe)
 
   - name: mac-studio-2
     url: http://10.0.0.12:11434     # Ollama
@@ -74,7 +76,8 @@ routing:
   # higher = more cache reuse.
   affinity_max_imbalance: 0.5
   large_request_tokens: 2048        # prompts above this prefer heavy nodes; below, light nodes
-  chars_per_token: 4                # for size estimates; no tokenizer needed
+  chars_per_token: 4                # for size estimates of English and code; no tokenizer needed
+  exact_tokens_margin: 0.2          # within 20% of a context limit, count exactly (backends with `tokenize`)
 
 queue:
   max_waiting: 1024                 # beyond this, answer 429 + Retry-After immediately
@@ -125,3 +128,21 @@ hardware:
   timeout: 2s
   heavy_min_memory_gib: 64          # tier auto: total accelerator memory for heavy...
   standard_min_memory_gib: 20       # ...and for standard; below this a node is light
+
+# Save the response cache and usage counters across restarts.
+# state_dir: /var/lib/siliconrouter
+
+# Several routers behind one load balancer (see docs/OPERATIONS.md).
+# cluster:
+#   peers: ["https://router-0:8443", "https://router-1:8443"]
+#   secret_env: SILICONROUTER_CLUSTER_SECRET
+#   sync_interval: 1s
+
+# Export traces to an OpenTelemetry collector (traceparent is always passed on).
+# tracing:
+#   otlp_endpoint: http://otel-collector:4318
+#   sample_rate: 1.0
+
+# logging:
+#   request_sample_rate: 1.0        # share of successful requests logged; errors always are
+#   slow_request: 0s                # always log requests slower than this
