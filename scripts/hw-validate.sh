@@ -116,7 +116,7 @@ backends:
 EOF
   [ "${2:-}" = one ] || cat << EOF
   - {name: gpu-b, url: "http://127.0.0.1:8002", api_key_env: VLLM_API_KEY, metrics_path: /metrics,
-     max_concurrency: 32}
+     agent_url: "http://127.0.0.1:9400", tier: auto, max_concurrency: 32}
 EOF
   cat << EOF
 routing: {prefix_affinity: $1}
@@ -146,6 +146,10 @@ bench() { # $1: label, $2: url, more srbench flags follow
 # Long shared system prompts make prefix-cache placement matter.
 BENCH=(-conversations 48 -concurrency 16 -turns 6 -system-chars 24000 -user-chars 800)
 
+# Warm both engines up first (compilation, graph capture, allocator), so
+# the first measured run is not charged for it.
+bench warmup-a http://127.0.0.1:8001/v1/chat/completions -conversations 16 -concurrency 16 -turns 2
+bench warmup-b http://127.0.0.1:8002/v1/chat/completions -conversations 16 -concurrency 16 -turns 2
 # Router overhead: the same engine directly and through the router.
 bench direct-one-engine http://127.0.0.1:8001/v1/chat/completions "${BENCH[@]}"
 run_router true one-backend one
