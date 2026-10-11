@@ -52,9 +52,18 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	logJSON := flag.Bool("log-json", false, "emit JSON logs")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	checkConfig := flag.Bool("check-config", false, "validate the config file (and its environment variables) and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
+		return nil
+	}
+	if *checkConfig {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: OK (%d backends)\n", *configPath, len(cfg.Backends))
 		return nil
 	}
 

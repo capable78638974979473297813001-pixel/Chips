@@ -39,3 +39,29 @@ jobs:
             g++-i686-linux-gnu g++-powerpc64le-linux-gnu g++-s390x-linux-gnu \
             g++-riscv64-linux-gnu g++-mips-linux-gnu
       - run: scripts/agent-cross-test.sh
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: router image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+      - name: chipagent image
+        uses: docker/build-push-action@v6
+        with:
+          context: agent
+          push: false
+      - uses: azure/setup-helm@v4
+      - name: helm chart
+        run: |
+          helm lint deploy/helm/siliconrouter --set existingSecret=s
+          helm template sr deploy/helm/siliconrouter --set existingSecret=s,agent.enabled=true,tls.secretName=t,persistence.enabled=true > /dev/null
+          helm template sr deploy/helm/siliconrouter --set replicaCount=1 > /dev/null
+      - name: systemd units
+        run: |
+          sudo touch /usr/local/bin/siliconrouter /usr/local/bin/chipagent
+          sudo chmod +x /usr/local/bin/siliconrouter /usr/local/bin/chipagent
+          systemd-analyze verify deploy/systemd/*.service

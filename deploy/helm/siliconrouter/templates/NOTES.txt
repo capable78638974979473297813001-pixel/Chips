@@ -1,0 +1,8 @@
+SiliconRouter is running as {{ .Values.replicaCount }} router(s){{ if gt (int .Values.replicaCount) 1 }} in cluster mode{{ end }}.
+
+In-cluster endpoint:
+  {{ include "siliconrouter.scheme" . }}://{{ include "siliconrouter.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Point OpenAI-compatible clients at <endpoint>/v1.
+Change backends or keys without a restart: edit the ConfigMap, wait for it
+to sync into the pods (about a minute), then POST /admin/reload on each router.

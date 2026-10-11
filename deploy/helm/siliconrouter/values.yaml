@@ -1,0 +1,86 @@
+# Routers. With more than one replica they run in cluster mode: they share
+# which backend holds each conversation and each team's daily token use.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/capable78638974979473297813001-pixel/siliconrouter
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+
+# The router's config file (see examples/siliconrouter.yaml). `listen` and
+# `cluster` are filled in by the chart; everything else is yours.
+config:
+  backends:
+    - name: gpu-node-1
+      url: http://vllm-0.vllm:8000
+      tier: auto
+      agent_url: http://gpu-node-1:9400
+  routing:
+    prefix_affinity: true
+  cache:
+    enabled: true
+  state_dir: /var/lib/siliconrouter
+
+# An existing Secret whose keys become environment variables, for the
+# *_env settings in config (API keys, admin keys, backend keys) and the
+# cluster secret. Create it yourself, e.g.:
+#   kubectl create secret generic siliconrouter \
+#     --from-literal=SILICONROUTER_API_KEYS=... \
+#     --from-literal=SILICONROUTER_ADMIN_KEYS=... \
+#     --from-literal=SILICONROUTER_CLUSTER_SECRET=$(openssl rand -hex 24)
+existingSecret: ""
+
+# Name of the variable in existingSecret that holds the cluster secret
+# (needed when replicaCount > 1).
+clusterSecretKey: SILICONROUTER_CLUSTER_SECRET
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Serve HTTPS from a kubernetes.io/tls Secret (cert-manager can manage it;
+# rotated certificates are picked up without a restart).
+tls:
+  secretName: ""
+
+# Keeps the response cache and usage counters across restarts.
+persistence:
+  enabled: false
+  size: 2Gi
+  storageClass: ""
+
+resources:
+  requests: {cpu: 250m, memory: 256Mi}
+  limits: {memory: 1Gi}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Scrape /metrics with the Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# chipagent on GPU nodes: reports each node's hardware for tier: auto and
+# the busy-GPU tie-break.
+agent:
+  enabled: false
+  image:
+    repository: ghcr.io/capable78638974979473297813001-pixel/chipagent
+    tag: ""
+  port: 9400
+  # Schedule only on accelerator nodes, e.g. {nvidia.com/gpu.present: "true"}.
+  nodeSelector: {}
+  tolerations:
+    - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+    - {key: amd.com/gpu, operator: Exists, effect: NoSchedule}
+  # On NVIDIA nodes, the NVIDIA container runtime mounts NVML into the pod.
+  runtimeClassName: ""
+  resources:
+    requests: {cpu: 10m, memory: 16Mi}
+    limits: {memory: 64Mi}

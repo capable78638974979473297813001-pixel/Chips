@@ -1,0 +1,46 @@
+# SiliconRouter as a systemd service.
+#   sudo install -m 0755 siliconrouter /usr/local/bin/
+#   sudo install -D -m 0640 siliconrouter.yaml /etc/siliconrouter/siliconrouter.yaml
+#   sudo install -D -m 0600 /dev/null /etc/siliconrouter/env   # KEY=value lines for the *_env settings
+#   sudo cp siliconrouter.service /etc/systemd/system/ && sudo systemctl enable --now siliconrouter
+# Apply config changes without a restart:  sudo systemctl reload siliconrouter
+[Unit]
+Description=SiliconRouter AI inference load balancer
+Documentation=https://github.com/capable78638974979473297813001-pixel/Chips
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+StateDirectory=siliconrouter
+ConfigurationDirectory=siliconrouter
+EnvironmentFile=-/etc/siliconrouter/env
+ExecStartPre=/usr/local/bin/siliconrouter -check-config -config /etc/siliconrouter/siliconrouter.yaml
+ExecStart=/usr/local/bin/siliconrouter -config /etc/siliconrouter/siliconrouter.yaml -log-json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+# Allow up to 60s to drain in-flight requests and save state on stop.
+TimeoutStopSec=75s
+LimitNOFILE=1048576
+
+# Hardening: the router only needs the network, its config and its state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+# To listen on a port below 1024, add: AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,114 @@
+# Push a tag like v0.4.0 to publish a release: router and chipagent
+# binaries for Linux, macOS and Windows with checksums, and multi-arch
+# container images on GitHub Container Registry.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: make dist VERSION=${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: router
+          path: dist/*.*
+
+  agent:
+    strategy:
+      matrix:
+        include:
+          - {os: ubuntu-latest, target: linux-amd64}
+          - {os: ubuntu-latest, target: linux-arm64, cross: aarch64-linux-gnu}
+          - {os: macos-latest, target: darwin-arm64}
+          - {os: windows-latest, target: windows-amd64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.cross
+        run: sudo apt-get update -q && sudo apt-get install -y -q g++-${{ matrix.cross }}
+      - name: build
+        shell: bash
+        run: |
+          extra=()
+          if [ -n "${{ matrix.cross }}" ]; then
+            extra=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64
+                   -DCMAKE_C_COMPILER=${{ matrix.cross }}-gcc -DCMAKE_CXX_COMPILER=${{ matrix.cross }}-g++ -DBUILD_TESTING=OFF)
+          fi
+          cmake -S agent -B agent/build -DCMAKE_BUILD_TYPE=Release "${extra[@]}"
+          cmake --build agent/build -j --config Release
+          if [ -z "${{ matrix.cross }}" ]; then ctest --test-dir agent/build -C Release --output-on-failure; fi
+      - name: package
+        shell: bash
+        run: |
+          name=chipagent-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp LICENSE "dist/$name/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp agent/build/Release/chipagent.exe "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+          else
+            cp agent/build/chipagent "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/*.*
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: image names
+        id: names
+        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ github.ref_name }}
+          push: true
+          tags: |
+            ${{ steps.names.outputs.repo }}/siliconrouter:${{ github.ref_name }}
+            ${{ steps.names.outputs.repo }}/siliconrouter:latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: agent
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.names.outputs.repo }}/chipagent:${{ github.ref_name }}
+            ${{ steps.names.outputs.repo }}/chipagent:latest
+
+  publish:
+    needs: [router, agent, images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: rm -f SHA256SUMS && sha256sum -- *.tar.gz *.zip > SHA256SUMS
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --generate-notes
