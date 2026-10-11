@@ -98,6 +98,10 @@ int main(int argc, char** argv) {
 #endif
   }
 
+#ifndef _WIN32
+  // Plugins that read /sys themselves (google-tpu.py) look where the agent does.
+  if (!plugins.empty()) setenv("CHIPAGENT_SYSFS_ROOT", sysfs_root.c_str(), 1);
+#endif
   for (const auto& cmd : plugins) providers.push_back(chipagent::OpenPlugin(cmd, plugin_timeout > 0 ? plugin_timeout : 5000));
 
   auto telemetry = [&] {

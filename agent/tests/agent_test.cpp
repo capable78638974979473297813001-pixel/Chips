@@ -416,6 +416,71 @@ J
       CHECK_EQ(ds[0].name, std::string("AWS Neuron device 0 (2 NeuronCores)"));
       CHECK_EQ(ds[0].memory_total_bytes, uint64_t(34359738368));
     }
+
+    // Intel GPUs: xpu-smi's JSON, one physical GPU and its SR-IOV virtual function.
+    Write(bin / "xpu-smi", R"(#!/bin/sh
+case "$*" in
+  "discovery -j") echo '{"device_list":[{"device_id":0,"device_name":"Intel(R) Data Center GPU Max 1550","device_type":"GPU","device_function_type":"physical","pci_bdf_address":"0000:29:00.0"},{"device_id":1,"device_name":"vf","device_function_type":"virtual","pci_bdf_address":"0000:29:00.1"}]}' ;;
+  "discovery -d 0 -j") echo '{"device_id":0,"memory_physical_size_byte":"137438953472"}' ;;
+  "stats -d 0 -j") echo '{"device_id":0,"device_level":[{"metrics_type":"XPUM_STATS_GPU_UTILIZATION","value":42},{"metrics_type":"XPUM_STATS_MEMORY_USED","value":2048},{"metrics_type":"XPUM_STATS_POWER","value":300.5},{"metrics_type":"XPUM_STATS_GPU_CORE_TEMPERATURE","value":55}]}' ;;
+  *) exit 2 ;;
+esac
+)");
+    fs::permissions(bin / "xpu-smi", fs::perms::owner_all);
+    ds = chipagent::OpenPlugin(path + PLUGINS_DIR "/intel-xpu-smi.py", 5000)->Devices();
+    CHECK_EQ(ds.size(), size_t(1));
+    if (!ds.empty()) {
+      CHECK_EQ(ds[0].vendor, std::string("intel"));
+      CHECK_EQ(ds[0].name, std::string("Intel(R) Data Center GPU Max 1550"));
+      CHECK_EQ(ds[0].id, std::string("0000:29:00.0"));
+      CHECK_EQ(ds[0].memory_total_bytes, uint64_t(128) << 30);
+      CHECK_EQ(ds[0].memory_used_bytes, uint64_t(2048) << 20);
+      CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 42);
+      CHECK(ds[0].power_watts && *ds[0].power_watts == 300.5);
+      CHECK(ds[0].temperature_c && *ds[0].temperature_c == 55);
+    }
+
+    // Google TPUs: chips from a fake PCI tree, usage from a stand-in for
+    // the tpu-info package (two v5e chips).
+    fs::path root = dir / "root";
+    fs::path sys = root / "sys";
+    const std::vector<std::pair<std::string, std::string>> tpus = {
+        {"0000:00:04.0", "0x0063"}, {"0000:00:05.0", "0x0063"}, {"0000:00:06.0", "0x1234"}};
+    for (const auto& [addr, device] : tpus) {
+      fs::path d = sys / "bus/pci/devices" / addr;
+      fs::create_directories(d);
+      Write(d / "vendor", "0x1ae0\n");
+      Write(d / "device", device + "\n");
+      Write(d / "subsystem_device", "0x0000\n");
+    }
+    fs::path py = dir / "py" / "tpu_info";
+    fs::create_directories(py);
+    Write(py / "__init__.py", "");
+    Write(py / "device.py", "def get_local_chips():\n    return ('v5e', 2)\n");
+    Write(py / "metrics.py", R"(import collections
+Usage = collections.namedtuple("Usage", "device_id memory_usage total_memory duty_cycle_pct")
+def get_chip_usage(chip_type):
+    return [Usage(1, 4 << 30, 16 << 30, 10.0), Usage(0, 8 << 30, 16 << 30, 75.5)]
+)");
+    std::string tpu = "CHIPAGENT_SYSFS_ROOT=" + root.string() + " PYTHONPATH=" + (dir / "py").string() + " " PLUGINS_DIR "/google-tpu.py";
+    ds = chipagent::OpenPlugin(tpu, 5000)->Devices();
+    CHECK_EQ(ds.size(), size_t(2));  // the unknown Google device is not a TPU chip
+    if (ds.size() == 2) {
+      CHECK_EQ(ds[0].vendor, std::string("google"));
+      CHECK_EQ(ds[0].name, std::string("Google TPU v5e"));
+      CHECK_EQ(ds[0].id, std::string("0000:00:04.0"));
+      CHECK_EQ(ds[0].memory_total_bytes, uint64_t(16) << 30);
+      CHECK_EQ(ds[0].memory_used_bytes, uint64_t(8) << 30);  // device 0, after sorting by id
+      CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 75.5);
+      CHECK(ds[1].utilization_percent && *ds[1].utilization_percent == 10.0);
+    }
+    // Without tpu-info (or a running workload) the chips are still listed.
+    ds = chipagent::OpenPlugin("CHIPAGENT_SYSFS_ROOT=" + root.string() + " " PLUGINS_DIR "/google-tpu.py", 5000)->Devices();
+    CHECK_EQ(ds.size(), size_t(2));
+    if (!ds.empty()) {
+      CHECK_EQ(ds[0].memory_total_bytes, uint64_t(16) << 30);
+      CHECK(!ds[0].utilization_percent);
+    }
   }
   fs::remove_all(dir);
 }
@@ -480,6 +545,60 @@ static void TestHttp() {
   CHECK(!bad.Listen("no-port", &err));
 }
 
+// FixedProvider returns the devices it was built with.
+class FixedProvider : public chipagent::Provider {
+ public:
+  explicit FixedProvider(std::vector<chipagent::Device> d) : devices_(std::move(d)) {}
+  std::string Name() const override { return "fixed"; }
+  std::vector<chipagent::Device> Devices() override { return devices_; }
+
+ private:
+  std::vector<chipagent::Device> devices_;
+};
+
+static void TestCollectMerges() {
+  CHECK_EQ(chipagent::DeviceKey("0000:3B:00.0"), std::string("0000:3b:00.0"));
+  CHECK_EQ(chipagent::DeviceKey("3b:00.0"), std::string("0000:3b:00.0"));
+  CHECK_EQ(chipagent::DeviceKey("00:1e.0"), std::string("0000:00:1e.0"));
+  CHECK_EQ(chipagent::DeviceKey("00000000:3B:00.0"), std::string("0000:3b:00.0"));  // nvidia-smi style
+  CHECK_EQ(chipagent::DeviceKey("GPU-1234-ABCD"), std::string("gpu-1234-abcd"));
+  CHECK_EQ(chipagent::DeviceKey("tpu0"), std::string("tpu0"));
+
+  chipagent::Device pci;
+  pci.vendor = "habana";
+  pci.kind = "accelerator";
+  pci.name = "Intel Gaudi (Habana) accelerator";
+  pci.id = "0000:19:00.0";
+  pci.source = "sysfs";
+  chipagent::Device other = pci;
+  other.id = "0000:1a:00.0";
+  chipagent::Device noid;
+  noid.vendor = "x";
+  noid.name = "no id";
+  chipagent::Device plugin;
+  plugin.vendor = "habana";
+  plugin.kind = "accelerator";
+  plugin.name = "Intel Gaudi HL-225";
+  plugin.id = "19:00.0";
+  plugin.source = "plugin";
+  plugin.memory_total_bytes = 96ULL << 30;
+  plugin.utilization_percent = 37;
+
+  std::vector<std::unique_ptr<chipagent::Provider>> providers;
+  providers.push_back(std::make_unique<FixedProvider>(std::vector<chipagent::Device>{pci, other, noid}));
+  providers.push_back(std::make_unique<FixedProvider>(std::vector<chipagent::Device>{plugin, noid}));
+  auto ds = chipagent::Collect(providers);
+  CHECK_EQ(ds.size(), size_t(4));  // the plugin's card merged into PCI's; id-less devices never merge
+  if (ds.size() == 4) {
+    CHECK_EQ(ds[0].name, std::string("Intel Gaudi HL-225"));
+    CHECK_EQ(ds[0].id, std::string("0000:19:00.0"));
+    CHECK_EQ(ds[0].source, std::string("sysfs+plugin"));
+    CHECK_EQ(ds[0].memory_total_bytes, uint64_t(96) << 30);
+    CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 37);
+    CHECK_EQ(ds[1].name, std::string("Intel Gaudi (Habana) accelerator"));
+  }
+}
+
 int main() {
 #ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
@@ -499,6 +618,7 @@ int main() {
   TestReadHostLive();
   TestJson();
   TestPlugins();
+  TestCollectMerges();
   TestNvml();
   TestHttp();
   if (failures) {

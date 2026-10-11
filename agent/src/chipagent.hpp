@@ -120,6 +120,10 @@ std::unique_ptr<Provider> OpenSimulated(const std::vector<std::string>& specs, s
 // Devices from every provider, in provider order.
 std::vector<Device> Collect(const std::vector<std::unique_ptr<Provider>>& providers);
 
+// DeviceKey is the identity Collect merges devices by: the id lowercased,
+// and PCI addresses written in full (0000:3b:00.0), however a tool spells them.
+std::string DeviceKey(std::string_view id);
+
 // The JSON document served at /v1/telemetry.
 std::string RenderTelemetry(const std::vector<Device>& devices, const Host& host,
                             const std::string& version);
