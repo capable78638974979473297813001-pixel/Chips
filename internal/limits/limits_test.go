@@ -130,3 +130,69 @@ func TestQuotaCountsPeerUsage(t *testing.T) {
 		t.Errorf("local daily = %+v", d)
 	}
 }
+
+func TestClusterWideConcurrency(t *testing.T) {
+	tr, clk := newTracker(Limits{MaxConcurrent: 3})
+	tr.SetPeerTTL(3 * time.Second)
+	tr.SetRemote("router-b", map[string]Daily{"team": {Day: "2026-10-10", InFlight: 2}})
+	r, rej := tr.Admit("team")
+	if rej != nil {
+		t.Fatalf("2 of 3 in flight across the cluster: %+v", rej)
+	}
+	if _, rej := tr.Admit("team"); rej == nil || rej.Reason != "concurrency_limit" {
+		t.Fatalf("3 of 3 in flight across the cluster, still admitted: %+v", rej)
+	}
+	if u := tr.Snapshot()[0]; u.InFlight != 1 || u.ClusterInFlight != 3 {
+		t.Errorf("usage = %+v", u)
+	}
+	if d := tr.LocalDaily()["team"]; d.InFlight != 1 {
+		t.Errorf("reported in flight = %d", d.InFlight)
+	}
+	// A peer that stops reporting stops holding slots.
+	clk.t = clk.t.Add(4 * time.Second)
+	r2, rej := tr.Admit("team")
+	if rej != nil {
+		t.Fatalf("stale peer still counted: %+v", rej)
+	}
+	r()
+	r2()
+}
+
+func TestClusterSplitsRequestRate(t *testing.T) {
+	tr, clk := newTracker(Limits{RequestsPerMinute: 60})
+	tr.SetPeerTTL(3 * time.Second)
+	tr.SetRemote("router-b", nil)
+	tr.SetRemote("router-c", map[string]Daily{})
+	admitted := 0
+	for range 60 {
+		if r, rej := tr.Admit("team"); rej == nil {
+			admitted++
+			r()
+		}
+	}
+	if admitted != 20 {
+		t.Errorf("burst with 3 live routers: %d admitted, want 20", admitted)
+	}
+	// With the peers gone, this router gets the whole rate back.
+	clk.t = clk.t.Add(time.Minute)
+	admitted = 0
+	for range 60 {
+		if r, rej := tr.Admit("team"); rej == nil {
+			admitted++
+			r()
+		}
+	}
+	if admitted != 60 {
+		t.Errorf("burst alone: %d admitted, want 60", admitted)
+	}
+}
+
+func TestPeersIgnoredWithoutTTL(t *testing.T) {
+	tr, _ := newTracker(Limits{MaxConcurrent: 1, RequestsPerMinute: 60})
+	tr.SetRemote("router-b", map[string]Daily{"team": {Day: "2026-10-10", InFlight: 5}})
+	if r, rej := tr.Admit("team"); rej != nil {
+		t.Fatalf("peer counted without cluster limits: %+v", rej)
+	} else {
+		r()
+	}
+}

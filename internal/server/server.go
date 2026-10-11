@@ -200,6 +200,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	if c := cfg.Cluster; c.Enabled() {
 		s.cluster = cluster.New(c.NodeName, c.Peers, c.Secret, client, s.affinity, s.limits, log)
 		s.mux.Handle("POST "+cluster.SyncPath, s.cluster)
+		// A peer missing three pushes in a row no longer holds a share of
+		// any client's rate or concurrency.
+		s.limits.SetPeerTTL(3 * c.SyncInterval.D())
 	}
 	reg.NewGaugeFunc("siliconrouter_response_cache_bytes", "Bytes held by the response cache.", nil, func(emit func(float64, ...string)) {
 		if c := s.state.Load().cache; c != nil {

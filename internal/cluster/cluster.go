@@ -1,9 +1,9 @@
 // Package cluster keeps several routers behind one load balancer in step.
 // Each router periodically pushes to its peers what it learned since the
-// last push: which backend now holds each conversation prefix, and how many
-// tokens each client used today. A follow-up turn that lands on a different
-// router still goes to the backend with its cache, and daily quotas count
-// the whole fleet's usage.
+// last push: which backend now holds each conversation prefix, and each
+// client's tokens used today and requests in flight. A follow-up turn that
+// lands on a different router still goes to the backend with its cache,
+// and quotas and limits count the whole fleet's usage.
 //
 // The state is a routing hint and an eventually consistent counter, so a
 // lost push costs at most a cache miss or a few seconds of quota slack.

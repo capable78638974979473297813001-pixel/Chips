@@ -39,9 +39,12 @@ type Usage struct {
 	TokensToday     int64 `json:"tokens_today"`
 	// ClusterTokensToday adds what peer routers reported for this client
 	// today; daily quotas are checked against it.
-	ClusterTokensToday int64  `json:"cluster_tokens_today"`
-	TokensPerDay       int64  `json:"tokens_per_day,omitempty"`
-	Day                string `json:"day"` // UTC date TokensToday counts
+	ClusterTokensToday int64 `json:"cluster_tokens_today"`
+	// ClusterInFlight adds the requests peer routers last reported in
+	// flight for this client; max_concurrent is checked against it.
+	ClusterInFlight int    `json:"cluster_in_flight"`
+	TokensPerDay    int64  `json:"tokens_per_day,omitempty"`
+	Day             string `json:"day"` // UTC date TokensToday counts
 }
 
 type client struct {
@@ -58,6 +61,8 @@ type client struct {
 type Daily struct {
 	Day    string `json:"day"` // 2006-01-02
 	Tokens int64  `json:"tokens"`
+	// InFlight is the client's requests in progress on the reporting router.
+	InFlight int `json:"in_flight,omitempty"`
 }
 
 // Tracker holds every client's limits and counters. Safe for concurrent use.
@@ -65,11 +70,53 @@ type Tracker struct {
 	mu      sync.Mutex
 	clients map[string]*client
 	remote  map[string]map[string]Daily // peer -> client -> usage
+	seen    map[string]time.Time        // peer -> when its last report arrived
+	peerTTL time.Duration               // how long a report keeps a peer live
 	now     func() time.Time
 }
 
 func New() *Tracker {
-	return &Tracker{clients: map[string]*client{}, remote: map[string]map[string]Daily{}, now: time.Now}
+	return &Tracker{clients: map[string]*client{}, remote: map[string]map[string]Daily{}, seen: map[string]time.Time{}, now: time.Now}
+}
+
+// SetPeerTTL makes limits cluster-wide: a peer that reported within ttl
+// is live, its in-flight requests count against max_concurrent, and
+// requests_per_minute is split evenly between this router and its live
+// peers (so the fleet admits about the configured rate behind a load
+// balancer that spreads clients evenly). Zero, the default, keeps rate
+// and concurrency limits per router.
+func (t *Tracker) SetPeerTTL(ttl time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.peerTTL = ttl
+}
+
+// livePeersLocked is how many peers reported within the TTL.
+func (t *Tracker) livePeersLocked(now time.Time) int {
+	if t.peerTTL <= 0 {
+		return 0
+	}
+	n := 0
+	for _, at := range t.seen {
+		if now.Sub(at) <= t.peerTTL {
+			n++
+		}
+	}
+	return n
+}
+
+// remoteInFlightLocked sums live peers' in-flight requests for name.
+func (t *Tracker) remoteInFlightLocked(name string, now time.Time) int {
+	if t.peerTTL <= 0 {
+		return 0
+	}
+	n := 0
+	for peer, byClient := range t.remote {
+		if now.Sub(t.seen[peer]) <= t.peerTTL {
+			n += byClient[name].InFlight
+		}
+	}
+	return n
 }
 
 // LocalDaily returns this router's own token use today, per client, for
@@ -80,7 +127,7 @@ func (t *Tracker) LocalDaily() map[string]Daily {
 	out := make(map[string]Daily, len(t.clients))
 	for name, c := range t.clients {
 		t.rollDayLocked(c, t.now())
-		out[name] = Daily{Day: c.day.Format(dayFormat), Tokens: c.usage.TokensToday}
+		out[name] = Daily{Day: c.day.Format(dayFormat), Tokens: c.usage.TokensToday, InFlight: c.inflight}
 	}
 	return out
 }
@@ -91,6 +138,7 @@ func (t *Tracker) SetRemote(peer string, usage map[string]Daily) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.remote[peer] = usage
+	t.seen[peer] = t.now()
 }
 
 // remoteTodayLocked sums what peers reported for name on today's date.
@@ -150,7 +198,7 @@ func (t *Tracker) Admit(name string) (release func(), rejected *Rejection) {
 		c.usage.Rejected++
 		return nil, r
 	}
-	if l.MaxConcurrent > 0 && c.inflight >= l.MaxConcurrent {
+	if l.MaxConcurrent > 0 && c.inflight+t.remoteInFlightLocked(name, now) >= l.MaxConcurrent {
 		return reject(&Rejection{"concurrency_limit", "too many requests in progress for this API key", time.Second})
 	}
 	if l.TokensPerDay > 0 && c.usage.TokensToday+t.remoteTodayLocked(name, now) >= l.TokensPerDay {
@@ -158,8 +206,10 @@ func (t *Tracker) Admit(name string) (release func(), rejected *Rejection) {
 			c.day.Add(24 * time.Hour).Sub(now)})
 	}
 	if l.RequestsPerMinute > 0 {
-		rate := float64(l.RequestsPerMinute) / 60 // per second
-		capacity := float64(l.RequestsPerMinute)
+		// This router's share of the rate, when peers are live.
+		share := float64(l.RequestsPerMinute) / float64(1+t.livePeersLocked(now))
+		rate := share / 60 // per second
+		capacity := math.Max(1, share)
 		c.bucket = math.Min(capacity, c.bucket+now.Sub(c.refilled).Seconds()*rate)
 		c.refilled = now
 		if c.bucket < 1 {
@@ -213,6 +263,7 @@ func (t *Tracker) Snapshot() []Usage {
 		u.TokensPerDay = c.limits.TokensPerDay
 		u.Day = c.day.Format(dayFormat)
 		u.ClusterTokensToday = u.TokensToday + t.remoteTodayLocked(c.usage.Client, t.now())
+		u.ClusterInFlight = c.inflight + t.remoteInFlightLocked(c.usage.Client, t.now())
 		out = append(out, u)
 	}
 	slices.SortFunc(out, func(a, b Usage) int { return strings.Compare(a.Client, b.Client) })
