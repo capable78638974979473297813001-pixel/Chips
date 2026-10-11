@@ -287,3 +287,22 @@ func FuzzParseUsage(f *testing.F) {
 	f.Add([]byte(`"eval_count":"x","usage":`))
 	f.Fuzz(func(t *testing.T, b []byte) { ParseUsage(b) })
 }
+
+func TestEstimateTokensByScript(t *testing.T) {
+	cases := []struct {
+		name     string
+		text     string
+		min, max int // expected range; real tokenizers vary
+	}{
+		{"english", strings.Repeat("the quick brown fox ", 50), 230, 270}, // ~1000 chars
+		{"chinese", strings.Repeat("你好世界", 250), 950, 1050},               // 1000 Han characters
+		{"japanese", strings.Repeat("こんにちは", 200), 950, 1050},             // 1000 kana
+		{"korean", strings.Repeat("안녕하세요", 200), 950, 1050},               // 1000 Hangul syllables
+		{"russian", strings.Repeat("привет ", 140), 300, 450},             // ~980 chars, mostly Cyrillic
+	}
+	for _, c := range cases {
+		if got := EstimateTokens(c.text, 4); got < c.min || got > c.max {
+			t.Errorf("%s: %d tokens, want %d-%d", c.name, got, c.min, c.max)
+		}
+	}
+}

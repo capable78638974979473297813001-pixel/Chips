@@ -127,6 +127,7 @@ func TestValidation(t *testing.T) {
 		"cluster no secret":    "backends: [{name: a, url: \"http://h:1\"}]\ncluster: {peers: [\"http://r2:8080\"]}",
 		"cluster short secret": "backends: [{name: a, url: \"http://h:1\"}]\ncluster: {peers: [\"http://r2:8080\"], secret: short}",
 		"cluster bad peer":     "backends: [{name: a, url: \"http://h:1\"}]\ncluster: {peers: [\"r2:8080\"], secret: a-long-enough-secret}",
+		"bad tokenize":         `backends: [{name: a, url: "http://h:1", tokenize: magic}]`,
 		"bad health path":      `backends: [{name: a, url: "http://h:1", health_path: "health"}]`,
 		"auto no agent":        `backends: [{name: a, url: "http://h:1", tier: auto}]`,
 		"bad agent url":        `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,

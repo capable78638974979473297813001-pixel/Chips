@@ -168,6 +168,10 @@ type Backend struct {
 	// APIKeyHeader sends the key as a raw header value (e.g. x-api-key,
 	// api-key) instead of "Authorization: Bearer".
 	APIKeyHeader string `yaml:"api_key_header"`
+	// Tokenize names the engine's tokenize API (vllm, llamacpp or tgi). The
+	// router uses it for an exact token count when a prompt's estimated size
+	// is close to some backend's max_context_tokens.
+	Tokenize string `yaml:"tokenize"`
 	// HealthPath overrides health.path for engines with their own health
 	// endpoint, e.g. /health (TGI), /v2/health/ready (Triton, KServe), /api/tags (Ollama).
 	HealthPath string `yaml:"health_path"`
@@ -196,6 +200,10 @@ type Routing struct {
 	// prefers heavy hardware.
 	LargeRequestTokens int     `yaml:"large_request_tokens"`
 	CharsPerToken      float64 `yaml:"chars_per_token"`
+	// ExactTokensMargin: when a request's estimated size is within this
+	// fraction of a backend's context limit, count its tokens exactly with
+	// a backend that has `tokenize` set.
+	ExactTokensMargin float64 `yaml:"exact_tokens_margin"`
 }
 
 func (r Routing) AffinityEnabled() bool { return r.PrefixAffinity == nil || *r.PrefixAffinity }
@@ -306,6 +314,9 @@ func (c *Config) applyDefaults() {
 	}
 	if r.CharsPerToken == 0 {
 		r.CharsPerToken = 4
+	}
+	if r.ExactTokensMargin == 0 {
+		r.ExactTokensMargin = 0.2
 	}
 	if c.Queue.MaxWaiting == 0 {
 		c.Queue.MaxWaiting = 1024
@@ -444,6 +455,11 @@ func (c *Config) validate() error {
 		if b.MaxContextTokens < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
 		}
+		switch b.Tokenize {
+		case "", "vllm", "llamacpp", "tgi":
+		default:
+			errs = append(errs, fmt.Errorf("%s: tokenize must be vllm, llamacpp or tgi, got %q", where, b.Tokenize))
+		}
 		if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
 			errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
 		}
@@ -457,6 +473,9 @@ func (c *Config) validate() error {
 	}
 	if r.MaxBlocks < 1 || r.AffinityCapacity < 1 || r.LargeRequestTokens < 1 || r.CharsPerToken <= 0 {
 		errs = append(errs, errors.New("routing: max_blocks, affinity_capacity, large_request_tokens and chars_per_token must be positive"))
+	}
+	if r.ExactTokensMargin < 0 || r.ExactTokensMargin > 1 {
+		errs = append(errs, errors.New("routing.exact_tokens_margin must be between 0 and 1"))
 	}
 	if r.AffinityMaxImbalance < 0 || r.AffinityMaxImbalance > 1 {
 		errs = append(errs, errors.New("routing.affinity_max_imbalance must be between 0 and 1"))

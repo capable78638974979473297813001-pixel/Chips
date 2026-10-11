@@ -475,6 +475,16 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		Exclude:      map[string]bool{},
 		Priority:     priority,
 	}
+	// Near a backend's context limit, an estimate is not good enough: count
+	// exactly, so the prompt neither goes to a backend that must reject it
+	// nor skips one it would fit.
+	if counter, near := s.pool.NearContextLimit(req, rc.ExactTokensMargin); near && counter != nil {
+		if n, ok := s.exactTokens(r.Context(), counter, info.Model, body, info); ok {
+			rl.exactTokens = n
+			req.PromptTokens = n
+		}
+	}
+
 	var keys []uint64
 	if rc.AffinityEnabled() {
 		keys = prompt.BlockHashes(info.Text, rc.BlockChars, rc.MaxBlocks)
@@ -891,13 +901,14 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, backend strin
 
 // requestLog collects what the request log line reports.
 type requestLog struct {
-	r        *http.Request
-	info     prompt.Info
-	start    time.Time
-	client   clientInfo
-	priority int
-	alias    string
-	cache    string
+	r           *http.Request
+	info        prompt.Info
+	start       time.Time
+	client      clientInfo
+	priority    int
+	alias       string
+	cache       string
+	exactTokens int
 }
 
 var priorityNames = [...]string{"low", "normal", "high"}
@@ -917,6 +928,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.cache != "" {
 		attrs = append(attrs, "response_cache", l.cache)
+	}
+	if l.exactTokens > 0 {
+		attrs = append(attrs, "prompt_tokens_exact", l.exactTokens)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())

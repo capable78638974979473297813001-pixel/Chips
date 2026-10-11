@@ -41,6 +41,7 @@ type Backend struct {
 	APIKey           string
 	APIKeyHeader     string
 	HealthPath       string
+	Tokenize         string // engine tokenize API: vllm, llamacpp, tgi or ""
 	// AgentURL is the chipagent on this backend's machine, or nil.
 	AgentURL *url.URL
 	// AutoTier means Tier comes from the hardware chipagent reports.
@@ -181,6 +182,7 @@ func newBackend(cb config.Backend, index int) (*Backend, error) {
 		APIKey:       cb.APIKey,
 		APIKeyHeader: cb.APIKeyHeader,
 		HealthPath:   cb.HealthPath,
+		Tokenize:     cb.Tokenize,
 		AgentURL:     agent,
 		index:        index,
 		healthy:      true, // optimistic until the first check says otherwise
@@ -216,7 +218,7 @@ func (b *Backend) sameConnection(cb config.Backend) bool {
 		agent = b.AgentURL.String()
 	}
 	return b.URL.String() == cb.URL && b.APIKey == cb.APIKey && b.APIKeyHeader == cb.APIKeyHeader &&
-		b.HealthPath == cb.HealthPath && agent == cb.AgentURL
+		b.HealthPath == cb.HealthPath && agent == cb.AgentURL && b.Tokenize == cb.Tokenize
 }
 
 // Update applies a new backend list and options without dropping traffic.
@@ -401,6 +403,29 @@ func (p *Pool) anyFreeLocked() bool {
 		}
 	}
 	return false
+}
+
+// NearContextLimit reports whether r's estimated size is within margin (a
+// fraction) of the context limit of any backend that could serve it, and
+// returns a healthy backend for r's model that can count tokens exactly.
+// Routing on an estimate is fine far from every limit; near one, a wrong
+// guess means the backend rejects the prompt or a bigger one goes unused.
+func (p *Pool) NearContextLimit(r Request, margin float64) (counter *Backend, near bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	need := float64(r.PromptTokens + r.MaxTokens)
+	for _, b := range p.backends {
+		if !b.healthy || r.Exclude[b.Name] || !b.serves(r.Model) {
+			continue
+		}
+		if b.Tokenize != "" && counter == nil {
+			counter = b
+		}
+		if limit := float64(b.MaxContextTokens); limit > 0 && need >= limit*(1-margin) && need <= limit*(1+margin) {
+			near = true
+		}
+	}
+	return counter, near
 }
 
 // SetAuth adds this backend's credentials to an outgoing request.

@@ -16,6 +16,8 @@ import (
 	"mime/multipart"
 	"net/url"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Info describes one inference request.
@@ -72,6 +74,10 @@ func ModelFromPath(path string) string {
 	}
 	return ""
 }
+
+// Field returns the raw JSON value of a top-level field of a JSON object
+// body, or nil.
+func Field(body []byte, key string) []byte { return field(body, key) }
 
 // ReplacePathModel swaps the model named in a URL (see ModelFromPath).
 func ReplacePathModel(path, model string) string {
@@ -221,13 +227,33 @@ func Parse(body []byte) (Info, error) {
 	return info, nil
 }
 
-// EstimateTokens approximates a token count from character length. It is
-// deliberately tokenizer-agnostic: routing only needs the order of magnitude.
+// EstimateTokens approximates a token count without a tokenizer. ASCII
+// text (English, code) runs at about charsPerToken characters per token;
+// Chinese, Japanese and Korean characters are each about one token in
+// current tokenizers; other scripts (Cyrillic, Greek, Arabic, ...) about
+// two and a half characters per token. Routing only needs the right order
+// of magnitude; see Server's exact counting for prompts near a limit.
 func EstimateTokens(text string, charsPerToken float64) int {
 	if text == "" {
 		return 0
 	}
-	return int(float64(len(text))/charsPerToken) + 1
+	var ascii, cjk, other int
+	for i := 0; i < len(text); {
+		c := text[i]
+		if c < utf8.RuneSelf {
+			ascii++
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		i += size
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	return int(float64(ascii)/charsPerToken+float64(cjk)+float64(other)/2.5) + 1
 }
 
 // BlockHashes returns one hash per full block of blockChars bytes, each
