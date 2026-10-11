@@ -26,6 +26,7 @@ import (
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cluster"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/discovery"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
@@ -48,15 +49,19 @@ const FallbackHeader = "X-SiliconRouter-Fallback"
 type Server struct {
 	// state holds everything a config reload can change; requests load it
 	// once and see one consistent version.
-	state    atomic.Pointer[state]
-	applyMu  sync.Mutex // serializes Apply
-	reloader atomic.Pointer[func() ([]string, error)]
-	pool     *pool.Pool
-	affinity *affinity.Table
-	limits   *limits.Tracker
-	cluster  *cluster.Node // nil when this router runs alone
-	tracer   *tracing.Tracer
-	client   *http.Client
+	state   atomic.Pointer[state]
+	applyMu sync.Mutex // serializes Apply
+	// discovered are the backends found in DNS (see discovery), kept apart
+	// from the config's so a reload and a lookup each replace only their own.
+	discovered []config.Backend // guarded by applyMu
+	watcher    *discovery.Watcher
+	reloader   atomic.Pointer[func() ([]string, error)]
+	pool       *pool.Pool
+	affinity   *affinity.Table
+	limits     *limits.Tracker
+	cluster    *cluster.Node // nil when this router runs alone
+	tracer     *tracing.Tracer
+	client     *http.Client
 	// grpcTransport speaks HTTP/2 (h2c for plaintext) to gRPC backends.
 	grpcTransport *http.Transport
 	log           *slog.Logger
@@ -185,6 +190,12 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
 	s.state.Store(newState(cfg, nil))
+	s.watcher = &discovery.Watcher{
+		Resolver: net.DefaultResolver,
+		Log:      log,
+		Sources:  func() []config.Discovery { return s.conf().Discovery },
+		Apply:    s.SetDiscovered,
+	}
 	s.tracer = tracing.New(cfg.Tracing.OTLPEndpoint, cfg.Tracing.ServiceName, cfg.Tracing.SampleRate, client, log)
 	if c := cfg.Cluster; c.Enabled() {
 		s.cluster = cluster.New(c.NodeName, c.Peers, c.Secret, client, s.affinity, s.limits, log)

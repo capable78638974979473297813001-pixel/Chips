@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"slices"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
@@ -18,7 +20,7 @@ func (s *Server) Apply(cfg *config.Config) ([]string, error) {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	old := s.state.Load()
-	changes, err := s.pool.Update(cfg.Backends, pool.OptionsFromConfig(cfg))
+	changes, err := s.pool.Update(withDiscovered(cfg.Backends, s.discovered), pool.OptionsFromConfig(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -26,6 +28,41 @@ func (s *Server) Apply(cfg *config.Config) ([]string, error) {
 	s.limits.SetLimits(limitsFrom(cfg))
 	return append(changes, settingChanges(old.cfg, cfg)...), nil
 }
+
+// SetDiscovered replaces the backends found by DNS discovery.
+func (s *Server) SetDiscovered(backends []config.Backend) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	cfg := s.conf()
+	changes, err := s.pool.Update(withDiscovered(cfg.Backends, backends), pool.OptionsFromConfig(cfg))
+	if err != nil {
+		return err
+	}
+	s.discovered = backends
+	for _, c := range changes {
+		s.log.Info("backend discovery", "change", c)
+	}
+	return nil
+}
+
+// withDiscovered is the configured backends followed by the discovered
+// ones; a configured backend wins a name clash.
+func withDiscovered(static, discovered []config.Backend) []config.Backend {
+	out := slices.Clip(static)
+	for _, b := range discovered {
+		if !slices.ContainsFunc(static, func(c config.Backend) bool { return c.Name == b.Name }) {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// RunDiscovery keeps the discovered backends current until ctx is done.
+// Discovery settings are re-read every second, so reloads apply to it too.
+func (s *Server) RunDiscovery(ctx context.Context) { s.watcher.Run(ctx) }
+
+// DiscoverNow looks up every discovery source and applies the result.
+func (s *Server) DiscoverNow(ctx context.Context) { s.watcher.Refresh(ctx, true) }
 
 // SetReloader installs the function POST /admin/reload calls to re-read
 // the configuration (the caller owns the file and the TLS certificates).
@@ -59,7 +96,8 @@ func settingChanges(old, cfg *config.Config) []string {
 		}
 	}
 	changed(old.Auth, cfg.Auth, "updated API keys, admin keys or limits")
-	changed(old.Models, cfg.Models, "updated model aliases")
+	changed(old.Models, cfg.Models, "updated model aliases or fallbacks")
+	changed(old.Discovery, cfg.Discovery, "updated backend discovery (applied within a second)")
 	changed(old.Cache, cfg.Cache, "updated response cache settings")
 	changed(old.Queue, cfg.Queue, "updated queue settings")
 	changed(old.Retry, cfg.Retry, "updated retry settings")
