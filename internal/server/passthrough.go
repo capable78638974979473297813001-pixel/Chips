@@ -10,6 +10,7 @@ import (
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/tracing"
 )
 
 // isWebSocket reports a WebSocket upgrade request (OpenAI-style realtime APIs).
@@ -62,6 +63,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, st *state, 
 		kind = "grpc"
 	}
 	rl := &requestLog{r: r, info: prompt.Info{Model: model, Stream: true}, start: start, client: client, priority: client.priority}
+	rl.trace, rl.span = s.tracer.Begin(r.Header)
 
 	ctx, cancel := context.WithTimeout(r.Context(), st.cfg.Queue.MaxWait.D())
 	lease, err := s.pool.Acquire(ctx, pool.Request{Model: model, GRPC: grpc, Exclude: map[string]bool{}, Priority: client.priority})
@@ -101,6 +103,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, st *state, 
 				}
 			}
 			b.SetAuth(pr.Out.Header)
+			pr.Out.Header.Set(tracing.Header, tracing.Format(rl.trace.TraceID, rl.span, rl.trace.Sampled))
 			pr.SetXForwarded()
 		},
 		Transport:     transport,

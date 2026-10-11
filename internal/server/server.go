@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"slices"
@@ -29,6 +30,7 @@ import (
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/tracing"
 )
 
 // SessionHeader lets clients pin a conversation to one backend explicitly,
@@ -49,6 +51,7 @@ type Server struct {
 	affinity *affinity.Table
 	limits   *limits.Tracker
 	cluster  *cluster.Node // nil when this router runs alone
+	tracer   *tracing.Tracer
 	client   *http.Client
 	// grpcTransport speaks HTTP/2 (h2c for plaintext) to gRPC backends.
 	grpcTransport *http.Transport
@@ -172,6 +175,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
 	s.state.Store(newState(cfg, nil))
+	s.tracer = tracing.New(cfg.Tracing.OTLPEndpoint, cfg.Tracing.ServiceName, cfg.Tracing.SampleRate, client, log)
 	if c := cfg.Cluster; c.Enabled() {
 		s.cluster = cluster.New(c.NodeName, c.Peers, c.Secret, client, s.affinity, s.limits, log)
 		s.mux.Handle("POST "+cluster.SyncPath, s.cluster)
@@ -258,6 +262,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+
+// RunTracing exports spans until ctx is done (no-op without an endpoint).
+func (s *Server) RunTracing(ctx context.Context) { s.tracer.Run(ctx, 2*time.Second) }
 
 // RunCluster keeps this router in step with its peers until ctx is done.
 // It returns at once when no cluster is configured.
@@ -434,6 +441,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	info := prompt.Inspect(path, r.Header.Get("Content-Type"), body)
 	rl := &requestLog{r: r, info: info, start: start, client: client}
+	rl.trace, rl.span = s.tracer.Begin(r.Header)
 
 	// Model aliases: the client's name for a model becomes the real one,
 	// in the body or, for APIs that put it there, in the URL.
@@ -524,10 +532,15 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.queueWait.Observe(lease.Waited.Seconds())
+		if lease.Waited > time.Millisecond {
+			now := time.Now()
+			s.tracer.Record(rl.trace, tracing.Span{TraceID: rl.trace.TraceID, SpanID: tracing.NewSpanID(), Parent: rl.span,
+				Name: "queue wait", Start: now.Add(-lease.Waited), End: now})
+		}
 		b := lease.Backend
 		final := attempt >= st.cfg.Retry.MaxAttempts
 
-		res := s.attempt(r, path, body, b, info.Stream, final)
+		res := s.attempt(r, path, body, b, info.Stream, final, rl)
 		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
 			if res.resp != nil {
 				io.Copy(io.Discard, io.LimitReader(res.resp.Body, 64<<10))
@@ -619,7 +632,24 @@ var errFirstTokenTimeout = errors.New("no output within retry.first_token_timeou
 // accepts a request and then stalls can be abandoned, and the request tried
 // elsewhere, while nothing has reached the client yet. The final attempt has
 // no timeout: a slow answer is better than none.
-func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Backend, stream, final bool) attemptResult {
+func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Backend, stream, final bool, rl *requestLog) (res attemptResult) {
+	// Each attempt is a child span, and the backend's own spans hang off it.
+	span := tracing.Span{TraceID: rl.trace.TraceID, SpanID: tracing.NewSpanID(), Parent: rl.span,
+		Name: "upstream " + b.Name, Client: true, Start: time.Now(), Attrs: map[string]any{"backend": b.Name}}
+	traceparent := tracing.Format(rl.trace.TraceID, span.SpanID, rl.trace.Sampled)
+	defer func() {
+		span.End = time.Now()
+		switch {
+		case res.err != nil:
+			span.Error = res.err.Error()
+		case res.resp != nil:
+			span.Attrs["http.status_code"] = res.resp.StatusCode
+			if res.resp.StatusCode >= 500 {
+				span.Error = res.resp.Status
+			}
+		}
+		s.tracer.Record(rl.trace, span)
+	}()
 	ctx, cancel := context.WithCancel(r.Context())
 	var timer *time.Timer
 	timeout := s.conf().Retry.FirstTokenTimeout.D()
@@ -639,7 +669,7 @@ func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Back
 	}
 
 	dispatched := time.Now()
-	resp, err := s.forward(ctx, r, path, b, body)
+	resp, err := s.forward(ctx, r, path, b, body, traceparent)
 	if err != nil {
 		return fail(err, stopTimer())
 	}
@@ -656,7 +686,9 @@ func (s *Server) attempt(r *http.Request, path string, body []byte, b *pool.Back
 		resp.Body.Close()
 		return fail(rerr, expired)
 	}
-	s.pool.ObserveTTFT(b, time.Since(dispatched))
+	ttft := time.Since(dispatched)
+	s.pool.ObserveTTFT(b, ttft)
+	span.Attrs["ttft_ms"] = ttft.Milliseconds()
 	return attemptResult{resp: resp, first: buf[:n], cancel: cancel}
 }
 
@@ -746,7 +778,7 @@ var hopHeaders = []string{
 	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
-func (s *Server) forward(ctx context.Context, r *http.Request, path string, b *pool.Backend, body []byte) (*http.Response, error) {
+func (s *Server) forward(ctx context.Context, r *http.Request, path string, b *pool.Backend, body []byte, traceparent string) (*http.Response, error) {
 	u := *b.URL
 	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	u.RawPath = ""
@@ -761,6 +793,7 @@ func (s *Server) forward(ctx context.Context, r *http.Request, path string, b *p
 	}
 	out.Header.Del(SessionHeader)
 	out.Header.Del(PriorityHeader)
+	out.Header.Set(tracing.Header, traceparent)
 	if s.conf().Auth.Enabled() {
 		for _, h := range clientKeyHeaders {
 			out.Header.Del(h) // the router's key is not the backend's
@@ -927,16 +960,26 @@ type requestLog struct {
 	cache       string
 	exactTokens int
 	kind        string // websocket or grpc for passthrough sessions
+	trace       tracing.Context
+	span        tracing.SpanID
 }
 
 var priorityNames = [...]string{"low", "normal", "high"}
 
 func (s *Server) logRequest(l *requestLog, backend string, status, attempts int, cacheHit bool, err error) {
+	elapsed := time.Since(l.start)
+	s.recordRootSpan(l, backend, status, attempts, err, elapsed)
+
+	lc := s.conf().Logging
+	routine := status < 400 && err == nil && (lc.SlowRequest == 0 || elapsed < lc.SlowRequest.D())
+	if routine && lc.RequestSampleRate < 1 && mrand.Float64() >= lc.RequestSampleRate {
+		return
+	}
 	attrs := []any{
 		"method", l.r.Method, "path", l.r.URL.Path, "model", l.info.Model, "stream", l.info.Stream,
 		"backend", backend, "status", status, "attempts", attempts,
-		"prefix_cache_hit", cacheHit, "duration_ms", time.Since(l.start).Milliseconds(),
-		"priority", priorityNames[l.priority],
+		"prefix_cache_hit", cacheHit, "duration_ms", elapsed.Milliseconds(),
+		"priority", priorityNames[l.priority], "trace_id", l.trace.TraceID.String(),
 	}
 	if l.client.name != "" {
 		attrs = append(attrs, "client", l.client.name)
@@ -957,6 +1000,32 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 		attrs = append(attrs, "error", err.Error())
 	}
 	s.log.Info("request", attrs...)
+}
+
+// recordRootSpan exports the span covering the whole request.
+func (s *Server) recordRootSpan(l *requestLog, backend string, status, attempts int, err error, elapsed time.Duration) {
+	if !s.tracer.Exporting() || !l.trace.Sampled {
+		return
+	}
+	attrs := map[string]any{
+		"http.request.method": l.r.Method, "url.path": l.r.URL.Path, "http.response.status_code": status,
+		"llm.model": l.info.Model, "llm.stream": l.info.Stream, "siliconrouter.backend": backend,
+		"siliconrouter.attempts": attempts, "siliconrouter.priority": priorityNames[l.priority],
+	}
+	if l.client.name != "" {
+		attrs["siliconrouter.client"] = l.client.name
+	}
+	if l.cache != "" {
+		attrs["siliconrouter.response_cache"] = l.cache
+	}
+	span := tracing.Span{TraceID: l.trace.TraceID, SpanID: l.span, Parent: l.trace.Parent,
+		Name: l.r.Method + " " + l.r.URL.Path, Start: l.start, End: l.start.Add(elapsed), Attrs: attrs}
+	if err != nil {
+		span.Error = err.Error()
+	} else if status >= 500 {
+		span.Error = http.StatusText(status)
+	}
+	s.tracer.Record(l.trace, span)
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {

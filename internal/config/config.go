@@ -60,7 +60,26 @@ type Config struct {
 	// StateDir, when set, is where the router saves its response cache and
 	// usage counters (on shutdown and every few minutes) and restores them
 	// at startup, so a restart keeps cached answers and daily quotas.
-	StateDir string `yaml:"state_dir"`
+	StateDir string  `yaml:"state_dir"`
+	Tracing  Tracing `yaml:"tracing"`
+	Logging  Logging `yaml:"logging"`
+}
+
+// Tracing exports a span per request (plus queue wait and each backend
+// attempt) to an OpenTelemetry collector. Trace context (W3C traceparent)
+// is passed on to backends whether or not spans are exported.
+type Tracing struct {
+	OTLPEndpoint string  `yaml:"otlp_endpoint"` // OTLP/HTTP base URL, e.g. http://otel-collector:4318
+	ServiceName  string  `yaml:"service_name"`
+	SampleRate   float64 `yaml:"sample_rate"` // share of new traces exported (callers' sampled traces always are)
+}
+
+// Logging controls the per-request log line.
+type Logging struct {
+	// RequestSampleRate logs this share of successful requests (0-1).
+	// Errors and slow requests are always logged.
+	RequestSampleRate float64  `yaml:"request_sample_rate"`
+	SlowRequest       Duration `yaml:"slow_request"` // always log requests slower than this (0 = off)
 }
 
 // Cluster lets several routers behind one load balancer act as one: they
@@ -372,6 +391,15 @@ func (c *Config) applyDefaults() {
 	if c.Upstream.DialTimeout == 0 {
 		c.Upstream.DialTimeout = Duration(5 * time.Second)
 	}
+	if c.Tracing.ServiceName == "" {
+		c.Tracing.ServiceName = "siliconrouter"
+	}
+	if c.Tracing.SampleRate == 0 {
+		c.Tracing.SampleRate = 1
+	}
+	if c.Logging.RequestSampleRate == 0 {
+		c.Logging.RequestSampleRate = 1
+	}
 	if c.Cluster.SyncInterval == 0 {
 		c.Cluster.SyncInterval = Duration(time.Second)
 	}
@@ -531,6 +559,17 @@ func (c *Config) validate() error {
 	}
 	if v := c.TLS.MinVersion; v != "" && v != "1.2" && v != "1.3" {
 		errs = append(errs, fmt.Errorf("tls.min_version must be 1.2 or 1.3, got %q", v))
+	}
+	if r := c.Tracing.SampleRate; r < 0 || r > 1 {
+		errs = append(errs, errors.New("tracing.sample_rate must be between 0 and 1"))
+	}
+	if e := c.Tracing.OTLPEndpoint; e != "" {
+		if u, err := url.Parse(e); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("tracing.otlp_endpoint must be an absolute http(s) URL, got %q", e))
+		}
+	}
+	if r := c.Logging.RequestSampleRate; r < 0 || r > 1 {
+		errs = append(errs, errors.New("logging.request_sample_rate must be between 0 and 1"))
 	}
 	if c.Cluster.Enabled() {
 		if len(c.Cluster.Secret) < 16 {

@@ -80,6 +80,9 @@ func settingChanges(old, cfg *config.Config) []string {
 	restart([]any{old.Hardware.PollInterval, old.Hardware.Timeout}, []any{cfg.Hardware.PollInterval, cfg.Hardware.Timeout}, "hardware polling schedule")
 	restart(old.Upstream, cfg.Upstream, "upstream timeouts")
 	restart(old.Cluster, cfg.Cluster, "cluster settings")
+	restart(old.Tracing, cfg.Tracing, "tracing settings")
+	restart(old.StateDir, cfg.StateDir, "state_dir")
+	changed(old.Logging, cfg.Logging, "updated logging settings")
 	restart([]any{r1.AffinityTTL, r1.AffinityCapacity}, []any{r2.AffinityTTL, r2.AffinityCapacity}, "prefix table size")
 	return out
 }

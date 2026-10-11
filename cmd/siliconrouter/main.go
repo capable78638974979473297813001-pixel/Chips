@@ -138,6 +138,7 @@ func run() error {
 	}
 	router := server.New(cfg, p, client, log)
 	go router.RunCluster(ctx)
+	go router.RunTracing(ctx)
 	if dir := cfg.StateDir; dir != "" {
 		cached, err := router.LoadState(dir)
 		if err != nil {
