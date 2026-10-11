@@ -63,7 +63,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s: OK (%d backends)\n", *configPath, len(cfg.Backends))
+		fmt.Printf("%s: OK (%d backends, %d discovery sources)\n", *configPath, len(cfg.Backends), len(cfg.Discovery))
 		return nil
 	}
 

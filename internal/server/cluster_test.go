@@ -112,6 +112,14 @@ func TestQuotaHoldsAcrossRouters(t *testing.T) {
 	if code := chat(t, b.URL, `{}`, auth...).StatusCode; code != 200 { // 60 on B: each alone is under 100
 		t.Fatal(code)
 	}
+	// Usage is recorded after the response is relayed, so wait for it
+	// before pushing it to the peer.
+	for _, r := range []*httptest.Server{a, b} {
+		waitUntil(t, func() bool {
+			u := r.Config.Handler.(*Server).limits.Snapshot()
+			return len(u) == 1 && u[0].TokensToday == 60
+		})
+	}
 	syncNow(a)
 	syncNow(b)
 	for _, r := range []*httptest.Server{a, b} {

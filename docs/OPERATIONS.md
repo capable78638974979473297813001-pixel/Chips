@@ -33,14 +33,30 @@ auth:
   admin_keys_env: SILICONROUTER_ADMIN_KEYS   # comma-separated; or admin_keys: [...]
 ```
 
-When admin keys are set, only they can use `/admin/*`: `GET /admin/backends`, `GET /admin/usage`
-and `POST /admin/reload`. Client keys get `401` there, and admin keys can't be used for
+When admin keys are set, only they can use `/admin/*`: `GET /admin/backends`, `GET /admin/usage`,
+`POST /admin/reload` and the drain endpoints below. Client keys get `401` there, and admin keys can't be used for
 inference. Without admin keys, any client key can use `/admin/*`, which is the old behavior. The router logs
 a warning about this at startup; set admin keys whenever clients aren't fully trusted.
 
 `/metrics`, `/healthz` and `/readyz` stay unauthenticated so Prometheus and load balancers can
 reach them. They expose backend names and counts, not prompts or keys. Restrict them at the
 network level if that matters.
+
+## Maintenance: draining a backend
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://router:8443/admin/backends/gpu-3/drain
+# ... restart vLLM, swap the model, reboot the box ...
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://router:8443/admin/backends/gpu-3/undrain
+```
+
+A drained backend gets no new requests. Requests already running on it, streams included, finish
+normally. Queued requests that only it could serve fail at once with `503` rather than wait for it.
+Both calls return the backend's status. Watch `inflight` reach `0` before you take the machine
+down. A drain lasts until `undrain` or a router restart, and it survives config reloads. Drained
+backends drop out of `/v1/models` and `/readyz`.
+
+In cluster mode, drain on every router: each one routes on its own view.
 
 ## Per-team limits and usage
 
@@ -64,6 +80,34 @@ auth:
 A request over a limit gets `429` with `Retry-After` and an error code of `concurrency_limit`,
 `rate_limited` or `quota_exceeded`. The request never reaches a GPU. Limits apply per key name,
 so one team can't fill the queue or exhaust the fleet for everyone else.
+
+### What a key may use
+
+```yaml
+auth:
+  keys:
+    - name: interns
+      key_env: INTERN_KEY
+      models: ["llama-3.1-8b", "qwen2.5-*"]   # exact names, or a prefix ending in *
+      max_tokens: 1024                         # completion budget per request
+```
+
+- **`models`** refuses (`403 model_not_allowed`) any request that names a model outside the
+  list. This includes models named in the URL (Gemini, Triton, Azure-style deployments) and in the
+  query string. A request may name an alias whose target is allowed. A request that names no model
+  is refused, and so are WebSocket and gRPC sessions that don't name one in the URL.
+- **`max_tokens`** refuses (`400 max_tokens_exceeded`) a request whose completion budget is larger
+  than the cap. The router checks every field an API might read: `max_tokens`,
+  `max_completion_tokens`, `max_output_tokens`, TGI's `max_new_tokens`, Ollama's `num_predict`
+  (where `-1` means unlimited, so it's refused), and Gemini's `maxOutputTokens`. When an OpenAI- or
+  Anthropic-style request sets no budget, the cap is added to it. WebSocket and gRPC sessions are
+  refused for capped keys, because the router doesn't read the messages inside them.
+
+Keys with a policy get strict parsing. Some backends read JSON keys case-insensitively (Go's
+`encoding/json`) or take the last of two duplicate keys, so a request that writes a policy field
+twice, with escapes (`"m\u006fdel"`), or in another case (`"Model"`) is refused with `400`.
+Otherwise the backend could read a different model or budget than the router checked. Keys
+without a policy are forwarded byte-for-byte, as before.
 
 **Usage** is counted per key name. Keys from `api_keys` count as `default`, and requests with auth
 off count as `anonymous`.
@@ -105,7 +149,7 @@ requests and streams finish undisturbed:
 |---|---|
 | Backends: add, remove, change capacity, tier, models, URL or credentials | `listen` |
 | API keys, admin keys, priorities, limits (usage counters are kept) | turning `tls` on or off (certificate changes are live) |
-| Model aliases, response cache settings | health-check and chipagent polling schedules |
+| Model aliases and fallbacks, response cache settings, `discovery` | health-check and chipagent polling schedules |
 | Queue, retry and routing settings, `max_body_bytes` | `upstream` timeouts, prefix table size |
 
 The response lists each change, and settings that need a restart are named as such:
@@ -134,17 +178,55 @@ Every router can use the same config, listing them all; a router skips itself. E
 its peers two things every `sync_interval`:
 - which backend now holds each conversation prefix, so a follow-up turn that lands on another
   router still reaches the GPU with its cache;
-- how many tokens each client used today, so `tokens_per_day` quotas hold across the fleet.
+- each client's token use today and requests in flight, so `tokens_per_day` and `max_concurrent`
+  hold across the fleet.
+
+`requests_per_minute` is split evenly among the live routers. A router counts as live while its
+pushes keep arriving, and stops counting three missed sync intervals after it goes quiet. With
+three routers and a limit of 600, each admits 200 a minute. Behind a load balancer that spreads a
+client's requests evenly, the fleet admits about 600. When a router dies, the others take over its
+share within seconds.
 
 Nothing else is needed: no Redis, no database.
 
 - **Consistency is eventual.** A turn that arrives within a second of the previous one, on another
-  router, may miss the cache once. Quotas can overshoot by about one sync interval's worth of
-  traffic.
-- **`max_concurrent` and `requests_per_minute` apply per router.** For a fleet-wide rate, divide
-  the limit by the number of routers.
+  router, may miss the cache once. Quotas and concurrency limits can overshoot by about one sync
+  interval's worth of traffic.
+- **Rate shares assume even spreading.** If one router gets most of a client's traffic (sticky
+  load balancing by client IP, say), that client is limited to about its per-router share there.
 - **All routers need the same backend names.** The response cache and the health view stay per
   router.
+
+## Discovering backends from DNS
+
+Instead of listing every GPU server, point the router at DNS:
+
+```yaml
+discovery:
+  - name: vllm                          # backends are named vllm-<ip>:<port>
+    dns: vllm-headless.ai.svc.cluster.local
+    port: 8000
+    agent_port: 9400                    # chipagent on each host (optional)
+    interval: 15s
+    backend: {tier: auto, max_concurrency: 32, health_path: /health}
+  - name: tgi
+    srv: _http._tcp.tgi.service.consul  # SRV records carry host and port
+    backend: {tier: standard, models: [mistral-7b]}
+```
+
+Every A/AAAA record (with `dns`) or SRV target (with `srv`) becomes a backend with the settings
+under `backend`, which takes the same fields as a `backends` entry except the name and URLs.
+Lookups repeat every `interval`:
+- new addresses join after their first health check;
+- vanished addresses are removed, and their in-flight requests finish.
+
+A failed lookup, or one that returns no records, keeps the last known set, so a DNS blip doesn't
+empty the pool. Health checks still take out servers that are really gone.
+
+For Kubernetes, use a headless Service (`clusterIP: None`) so DNS returns one record per ready
+pod. A config can consist of `discovery` alone. Static `backends` and discovered ones mix freely.
+Discovered backends survive config reloads, and changes to `discovery` itself apply within a
+second. SRV priority and weight are ignored: capacity comes from `max_concurrency`.
 
 ## Keeping state across restarts
 
