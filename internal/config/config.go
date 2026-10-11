@@ -143,6 +143,26 @@ type APIKey struct {
 	MaxConcurrent     int   `yaml:"max_concurrent"`      // requests in flight or queued at once
 	RequestsPerMinute int   `yaml:"requests_per_minute"` // sustained rate; bursts up to a minute's worth
 	TokensPerDay      int64 `yaml:"tokens_per_day"`      // prompt + completion tokens per UTC day
+
+	// Models, when set, are the only models this key may use: exact names,
+	// or a prefix ending in * (llama-*). A request may name an alias or the
+	// model behind it. Requests that name no model are refused.
+	Models []string `yaml:"models"`
+	// MaxTokens caps each request's completion budget. Larger budgets are
+	// refused; requests to OpenAI- or Anthropic-style endpoints that set none
+	// get this one.
+	MaxTokens int `yaml:"max_tokens"`
+}
+
+// MatchModel reports whether name matches one of patterns: an exact model
+// name, or a prefix ending in *.
+func MatchModel(patterns []string, name string) bool {
+	for _, p := range patterns {
+		if prefix, ok := strings.CutSuffix(p, "*"); ok && strings.HasPrefix(name, prefix) || p == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Cache answers repeated requests from memory instead of a GPU. Only
@@ -164,6 +184,12 @@ type Models struct {
 	// Aliases maps the name a client asks for to the model that serves it,
 	// e.g. gpt-4o: llama-3.1-70b, so apps keep working when models change.
 	Aliases map[string]string `yaml:"aliases"`
+	// Fallbacks lists models to try, in order, when a model cannot take a
+	// request: no healthy backend serves it, every one failed, or the queue
+	// is full. E.g. llama-3.1-70b: [llama-3.1-8b] keeps answering, from a
+	// smaller model, while the big GPUs are down or saturated. Keys are the
+	// real model names (after aliases).
+	Fallbacks map[string][]string `yaml:"fallbacks"`
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
@@ -551,6 +577,14 @@ func (c *Config) validate() error {
 		if _, ok := PriorityRank(k.Priority); !ok {
 			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, k.Priority))
 		}
+		if k.MaxTokens < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_tokens must not be negative", where))
+		}
+		for _, m := range k.Models {
+			if m == "" || strings.Contains(strings.TrimSuffix(m, "*"), "*") {
+				errs = append(errs, fmt.Errorf("%s: models entry %q must be a model name or a prefix ending in *", where, m))
+			}
+		}
 	}
 	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
 		errs = append(errs, errors.New("tls: cert_file and key_file must be set together"))
@@ -592,6 +626,19 @@ func (c *Config) validate() error {
 			errs = append(errs, errors.New("models.aliases: names must not be empty"))
 		} else if _, chained := c.Models.Aliases[target]; chained {
 			errs = append(errs, fmt.Errorf("models.aliases: %q points to %q, which is itself an alias", alias, target))
+		}
+	}
+	for model, list := range c.Models.Fallbacks {
+		seen := map[string]bool{model: true}
+		for _, f := range list {
+			if f == "" || seen[f] {
+				errs = append(errs, fmt.Errorf("models.fallbacks[%q]: entries must be non-empty, distinct and not the model itself", model))
+				break
+			}
+			seen[f] = true
+		}
+		if _, isAlias := c.Models.Aliases[model]; isAlias {
+			errs = append(errs, fmt.Errorf("models.fallbacks: %q is an alias; key fallbacks by the model it points to", model))
 		}
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {

@@ -134,11 +134,28 @@ func TestValidation(t *testing.T) {
 		"bad health path":      `backends: [{name: a, url: "http://h:1", health_path: "health"}]`,
 		"auto no agent":        `backends: [{name: a, url: "http://h:1", tier: auto}]`,
 		"bad agent url":        `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,
+		"fallback to itself":   "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {fallbacks: {big: [big]}}",
+		"fallback repeated":    "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {fallbacks: {big: [s, s]}}",
+		"fallback on alias":    "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {aliases: {gpt: big}, fallbacks: {gpt: [small]}}",
+		"key model pattern":    "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key: k, models: [\"*llama\"]}]}",
+		"key negative cap":     "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key: k, max_tokens: -5}]}",
 		"bad thresholds":       "backends: [{name: a, url: \"http://h:1\"}]\nhardware: {heavy_min_memory_gib: 10, standard_min_memory_gib: 40}",
 	}
 	for name, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+func TestModelPatterns(t *testing.T) {
+	patterns := []string{"llama-*", "mistral"}
+	for name, want := range map[string]bool{"llama-8b": true, "llama-": true, "mistral": true, "mistral-large": false, "gpt": false} {
+		if got := MatchModel(patterns, name); got != want {
+			t.Errorf("MatchModel(%q) = %v", name, got)
+		}
+	}
+	if !MatchModel([]string{"*"}, "anything") {
+		t.Error("* should match every model")
 	}
 }

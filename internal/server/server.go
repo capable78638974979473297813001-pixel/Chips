@@ -41,6 +41,10 @@ const SessionHeader = "X-Session-ID"
 // queue.priority_header is enabled.
 const PriorityHeader = "X-SiliconRouter-Priority"
 
+// FallbackHeader names the model that answered when it is a fallback for
+// the one the request asked for (see models.fallbacks).
+const FallbackHeader = "X-SiliconRouter-Fallback"
+
 type Server struct {
 	// state holds everything a config reload can change; requests load it
 	// once and see one consistent version.
@@ -68,6 +72,7 @@ type Server struct {
 	ttftTimeouts  *metrics.CounterVec
 	clientReqs    *metrics.CounterVec
 	clientTokens  *metrics.CounterVec
+	fallbacks     *metrics.CounterVec
 	duration      *metrics.Histogram
 	queueWait     *metrics.Histogram
 	firstByte     *metrics.Histogram
@@ -88,7 +93,7 @@ func newState(cfg *config.Config, prev *state) *state {
 	}
 	for _, k := range cfg.Auth.Keys {
 		rank, _ := config.PriorityRank(k.Priority)
-		st.keys[k.Key] = clientInfo{name: k.Name, key: k.Key, priority: rank}
+		st.keys[k.Key] = clientInfo{name: k.Name, key: k.Key, priority: rank, models: k.Models, maxTokens: k.MaxTokens}
 	}
 	if cfg.Cache.Enabled {
 		// Keep cached answers across a reload unless the cache's shape changed.
@@ -135,6 +140,10 @@ type clientInfo struct {
 	name     string
 	key      string
 	priority int
+	// Policy from the key: the models it may use (all when empty) and its
+	// cap on each request's completion budget (none when 0).
+	models    []string
+	maxTokens int
 }
 
 type clientKeyCtx struct{}
@@ -171,6 +180,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), coalesced (shared the answer of an identical request in flight), miss, or skip (not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
+		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
@@ -456,6 +466,12 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	if client.restricted() {
+		var ok bool
+		if body, ok = s.enforcePolicy(w, r, st, client, body); !ok {
+			return
+		}
+	}
 	info := prompt.Inspect(path, r.Header.Get("Content-Type"), body)
 	rl := &requestLog{r: r, info: info, start: start, client: client}
 	rl.trace, rl.span = s.tracer.Begin(r.Header)
@@ -537,14 +553,48 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		req.Preferred, _ = s.affinity.Lookup(keys)
 	}
 
-	acquireCtx, cancel := context.WithTimeout(r.Context(), st.cfg.Queue.MaxWait.D())
-	defer cancel()
+	wait := &queueWait{parent: r.Context(), max: st.cfg.Queue.MaxWait.D()}
+	wait.reset()
+	defer func() { wait.cancel() }() // the one current at return, after any reset
+
+	// Fallback models, for when this one cannot take the request. Each gets
+	// its own retry budget; only the last model's last try is final.
+	var fallbacks []string
+	for _, m := range st.cfg.Models.Fallbacks[info.Model] {
+		if client.allows(st.cfg.Models.Aliases, m) {
+			fallbacks = append(fallbacks, m)
+		}
+	}
+	asked := info.Model
+	fallBack := func() {
+		m := fallbacks[0]
+		fallbacks = fallbacks[1:]
+		if rewritten, ok := prompt.ReplaceModel(body, m); ok {
+			body = rewritten
+		} else {
+			path = prompt.ReplacePathModel(path, m)
+		}
+		info.Model, req.Model, rl.fallback = m, m, m
+		req.Exclude = map[string]bool{}
+		s.fallbacks.Inc(asked, m)
+	}
 
 	var lastErr string
+	tries := 0
 	for attempt := 1; ; attempt++ {
-		lease, err := s.pool.Acquire(acquireCtx, req)
+		tries++
+		lease, err := s.pool.Acquire(wait.ctx, req)
 		if err != nil {
-			status := s.rejectAcquire(w, r, err, attempt, lastErr)
+			if len(fallbacks) > 0 && r.Context().Err() == nil && (errors.Is(err, pool.ErrNoBackend) ||
+				errors.Is(err, pool.ErrQueueFull) || errors.Is(err, pool.ErrShed) || errors.Is(err, context.DeadlineExceeded)) {
+				if wait.ctx.Err() != nil { // the queue wait ran out: the fallback gets a fresh one
+					wait.reset()
+				}
+				fallBack()
+				tries = 0
+				continue
+			}
+			status := s.rejectAcquire(w, r, err, tries, lastErr)
 			s.logRequest(rl, "", status, attempt, false, err)
 			return
 		}
@@ -555,7 +605,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 				Name: "queue wait", Start: now.Add(-lease.Waited), End: now})
 		}
 		b := lease.Backend
-		final := attempt >= st.cfg.Retry.MaxAttempts
+		final := tries >= st.cfg.Retry.MaxAttempts && len(fallbacks) == 0
 
 		res := s.attempt(r, path, body, b, info.Stream, final, rl)
 		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
@@ -587,6 +637,10 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			}
 			req.Exclude[b.Name] = true
 			s.retries.Inc()
+			if tries >= st.cfg.Retry.MaxAttempts { // out of tries on this model; not final, so a fallback remains
+				fallBack()
+				tries = 0
+			}
 			continue
 		}
 		resp := res.resp
@@ -610,8 +664,13 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if rl.fallback != "" {
+			w.Header().Set(FallbackHeader, rl.fallback)
+		}
 		var capture *captureBuffer
-		if cacheable && resp.StatusCode == http.StatusOK {
+		// A fallback's answer is not what the request asked for, so it is
+		// never cached under the request's key.
+		if cacheable && resp.StatusCode == http.StatusOK && rl.fallback == "" {
 			capture = &captureBuffer{limit: st.cfg.Cache.MaxEntryBytes}
 			w.Header().Set("X-SiliconRouter-Cache", "miss")
 		}
@@ -631,6 +690,22 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		s.logRequest(rl, b.Name, resp.StatusCode, attempt, lease.Affinity, copyErr)
 		return
 	}
+}
+
+// queueWait bounds how long a request may wait for a backend slot.
+type queueWait struct {
+	parent context.Context
+	max    time.Duration
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// reset starts a fresh wait.
+func (q *queueWait) reset() {
+	if q.cancel != nil {
+		q.cancel()
+	}
+	q.ctx, q.cancel = context.WithTimeout(q.parent, q.max)
 }
 
 // attemptResult is one try at a backend. On success the caller must call
@@ -979,6 +1054,7 @@ type requestLog struct {
 	client      clientInfo
 	priority    int
 	alias       string
+	fallback    string // the model that served the request instead of the one asked for
 	cache       string
 	exactTokens int
 	kind        string // websocket or grpc for passthrough sessions
@@ -1005,6 +1081,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.client.name != "" {
 		attrs = append(attrs, "client", l.client.name)
+	}
+	if l.fallback != "" {
+		attrs = append(attrs, "fallback", l.fallback)
 	}
 	if l.alias != "" {
 		attrs = append(attrs, "alias", l.alias)

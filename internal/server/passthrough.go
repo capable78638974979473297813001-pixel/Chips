@@ -45,6 +45,24 @@ func newGRPCTransport(client *http.Client) *http.Transport {
 // held for the whole session.
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, st *state, client clientInfo, grpc bool) {
 	start := time.Now()
+	if client.restricted() {
+		// The messages inside a session are not inspected, so a token cap
+		// cannot be enforced; the model must be named in the URL.
+		if client.maxTokens > 0 {
+			s.rejected.Inc("policy")
+			writeError(w, http.StatusForbidden, "max_tokens_unenforceable", "this API key has a max_tokens cap, which WebSocket and gRPC sessions cannot honor")
+			return
+		}
+		claims := prompt.ClaimsOf(r.URL.Path, r.URL.RawQuery, "", nil)
+		if claims.Ambiguous || len(r.URL.Query()["model"]) > 1 {
+			s.rejected.Inc("policy")
+			writeError(w, http.StatusBadRequest, "invalid_request", "name the model once")
+			return
+		}
+		if !s.modelsAllowed(w, st, client, claims.Models) {
+			return
+		}
+	}
 	model := r.URL.Query().Get("model")
 	if model == "" {
 		model = prompt.ModelFromPath(r.URL.Path)
