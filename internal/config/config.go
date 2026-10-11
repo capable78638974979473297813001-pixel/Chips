@@ -354,6 +354,13 @@ type EngineMetrics struct {
 	// with requests queued inside them, get new work only when no other
 	// backend has room.
 	KVSaturated float64 `yaml:"kv_saturated"`
+	// StallAfter is how long an engine may have requests running while
+	// generating fewer than StallMinTokensPerSecond tokens per running
+	// request before it is taken out of rotation as stalled (hung GPU,
+	// deadlocked engine). It returns as soon as tokens flow again. Engines
+	// that report generated tokens (vLLM, SGLang) only; negative disables.
+	StallAfter              Duration `yaml:"stall_after"`
+	StallMinTokensPerSecond float64  `yaml:"stall_min_tokens_per_second"`
 }
 
 // Hardware controls polling of chipagent telemetry and how `tier: auto`
@@ -516,6 +523,12 @@ func (c *Config) applyDefaults() {
 	}
 	if em.KVSaturated == 0 {
 		em.KVSaturated = 0.95
+	}
+	if em.StallAfter == 0 {
+		em.StallAfter = Duration(60 * time.Second)
+	}
+	if em.StallMinTokensPerSecond == 0 {
+		em.StallMinTokensPerSecond = 1
 	}
 	hw := &c.Hardware
 	if hw.PollInterval == 0 {
@@ -792,6 +805,8 @@ func (c *Config) validate() error {
 	}
 	if em := c.EngineMetrics; em.Interval.D() < 100*time.Millisecond || em.Timeout <= 0 || em.KVSaturated <= 0 || em.KVSaturated > 1 {
 		errs = append(errs, errors.New("engine_metrics: need interval >= 100ms, a positive timeout, and 0 < kv_saturated <= 1"))
+	} else if em.StallAfter > 0 && (em.StallAfter.D() < 3*em.Interval.D() || em.StallMinTokensPerSecond < 0) {
+		errs = append(errs, errors.New("engine_metrics: stall_after must span at least three intervals, and stall_min_tokens_per_second must not be negative"))
 	}
 	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
 		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))

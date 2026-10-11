@@ -74,6 +74,9 @@ type Backend struct {
 	eng      *engine.Stats
 	engUntil time.Time // eng is stale after this
 	engErr   string
+	// Recent generated-token counts while requests ran, for stall detection.
+	progress []progressSample
+	stalled  bool
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -129,6 +132,10 @@ type Options struct {
 	// KVSaturated the KV-cache usage at which an engine counts as full.
 	EngineMaxAge time.Duration
 	KVSaturated  float64
+	// StallAfter and StallMinRate configure stall detection (see
+	// config.EngineMetrics); StallAfter <= 0 turns it off.
+	StallAfter   time.Duration
+	StallMinRate float64
 }
 
 type Pool struct {
@@ -181,6 +188,8 @@ func OptionsFromConfig(cfg *config.Config) Options {
 		// Three missed scrapes and the stats no longer steer routing.
 		EngineMaxAge: 3*cfg.EngineMetrics.Interval.D() + cfg.EngineMetrics.Timeout.D(),
 		KVSaturated:  cfg.EngineMetrics.KVSaturated,
+		StallAfter:   cfg.EngineMetrics.StallAfter.D(),
+		StallMinRate: cfg.EngineMetrics.StallMinTokensPerSecond,
 	}
 }
 
@@ -562,7 +571,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !b.drained && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {

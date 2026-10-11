@@ -283,6 +283,13 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewGaugeFunc("siliconrouter_backend_engine_stalled", "1 while a backend's engine has requests running but generates almost no tokens; it gets no new work.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if e := st.Engine; e != nil && e.Engine != "" {
+				emit(map[bool]float64{true: 1}[e.Stalled], st.Name)
+			}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))
 	})

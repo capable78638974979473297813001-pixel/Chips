@@ -28,6 +28,10 @@ type Stats struct {
 	// KVUsage is the fraction of KV cache in use, 0 to 1, or -1 when the
 	// engine does not report it.
 	KVUsage float64
+	// Generated is the engine's running total of generated tokens, or -1
+	// when it does not count them as it goes. Its growth between scrapes
+	// shows whether an engine with running requests is making progress.
+	Generated float64
 }
 
 type role int
@@ -36,6 +40,7 @@ const (
 	running role = iota
 	waiting
 	kvUsage
+	generated
 )
 
 // metric maps a known metric name to what it measures.
@@ -62,6 +67,9 @@ var known = map[string]metric{
 	"llamacpp:requests_deferred":         {"llamacpp", waiting},
 	"llamacpp:kv_cache_usage_ratio":      {"llamacpp", kvUsage},
 	"nv_inference_pending_request_count": {"triton", waiting},
+	// Counted per decoding step, so they grow while requests generate.
+	"vllm:generation_tokens_total":   {"vllm", generated},
+	"sglang:generation_tokens_total": {"sglang", generated},
 }
 
 // ErrNoMetrics means the endpoint answered but exposes none of the known
@@ -70,7 +78,7 @@ var ErrNoMetrics = errors.New("no known inference engine metrics (vLLM, SGLang, 
 
 // Parse reads Prometheus text exposition format.
 func Parse(r io.Reader) (Stats, error) {
-	st := Stats{Running: -1, KVUsage: -1}
+	st := Stats{Running: -1, KVUsage: -1, Generated: -1}
 	found := false
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
@@ -98,6 +106,8 @@ func Parse(r io.Reader) (Stats, error) {
 			st.Waiting += value
 		case kvUsage:
 			st.KVUsage = max(st.KVUsage, min(value, 1))
+		case generated:
+			st.Generated = max(st.Generated, 0) + value
 		}
 	}
 	if err := sc.Err(); err != nil {
