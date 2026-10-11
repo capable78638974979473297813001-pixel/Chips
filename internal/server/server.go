@@ -262,6 +262,27 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewGaugeFunc("siliconrouter_backend_engine_waiting", "Requests queued inside each backend's engine, from its metrics.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if e := st.Engine; e != nil && e.Engine != "" && !e.Stale {
+				emit(e.Waiting, st.Name)
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_backend_engine_kv_cache_usage", "KV-cache usage (0-1) each backend's engine reports.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if e := st.Engine; e != nil && e.KVUsage != nil && !e.Stale {
+				emit(*e.KVUsage, st.Name)
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_backend_engine_saturated", "1 when a backend's engine is queueing or its KV cache is nearly full.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if e := st.Engine; e != nil && e.Engine != "" {
+				emit(map[bool]float64{true: 1}[e.Saturated], st.Name)
+			}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))
 	})

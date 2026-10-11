@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/engine"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/hardware"
 )
 
@@ -48,6 +49,9 @@ type Backend struct {
 	GRPCURL          *url.URL // gRPC endpoint, or nil
 	// AgentURL is the chipagent on this backend's machine, or nil.
 	AgentURL *url.URL
+	// MetricsURL is the engine's Prometheus endpoint, or nil.
+	MetricsURL  *url.URL
+	metricsPath string
 	// AutoTier means Tier comes from the hardware chipagent reports.
 	AutoTier bool
 	index    int
@@ -66,6 +70,10 @@ type Backend struct {
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
+	// The engine's own load, from its metrics (see EngineScraper).
+	eng      *engine.Stats
+	engUntil time.Time // eng is stale after this
+	engErr   string
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -117,6 +125,10 @@ type Options struct {
 	PassiveHealth bool
 	// Tiers classifies `tier: auto` backends; zero means hardware.DefaultThresholds.
 	Tiers hardware.Thresholds
+	// EngineMaxAge is how long an engine metrics scrape stays usable, and
+	// KVSaturated the KV-cache usage at which an engine counts as full.
+	EngineMaxAge time.Duration
+	KVSaturated  float64
 }
 
 type Pool struct {
@@ -141,6 +153,19 @@ type result struct {
 }
 
 // OptionsFromConfig derives pool options from a router configuration.
+func (o Options) withDefaults() Options {
+	if o.Tiers == (hardware.Thresholds{}) {
+		o.Tiers = hardware.DefaultThresholds
+	}
+	if o.EngineMaxAge == 0 {
+		o.EngineMaxAge = 10 * time.Second
+	}
+	if o.KVSaturated == 0 {
+		o.KVSaturated = 0.95
+	}
+	return o
+}
+
 func OptionsFromConfig(cfg *config.Config) Options {
 	return Options{
 		MaxWaiting:           cfg.Queue.MaxWaiting,
@@ -153,13 +178,14 @@ func OptionsFromConfig(cfg *config.Config) Options {
 			HeavyMinBytes:    uint64(cfg.Hardware.HeavyMinMemoryGiB * (1 << 30)),
 			StandardMinBytes: uint64(cfg.Hardware.StandardMinMemoryGiB * (1 << 30)),
 		},
+		// Three missed scrapes and the stats no longer steer routing.
+		EngineMaxAge: 3*cfg.EngineMetrics.Interval.D() + cfg.EngineMetrics.Timeout.D(),
+		KVSaturated:  cfg.EngineMetrics.KVSaturated,
 	}
 }
 
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
-	if opts.Tiers == (hardware.Thresholds{}) {
-		opts.Tiers = hardware.DefaultThresholds
-	}
+	opts = opts.withDefaults()
 	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
 	for i, cb := range backends {
 		b, err := newBackend(cb, i)
@@ -189,6 +215,13 @@ func newBackend(cb config.Backend, index int) (*Backend, error) {
 			return nil, err
 		}
 	}
+	var metricsURL *url.URL
+	if cb.MetricsPath != "" { // like health checks: the path goes under the backend URL's
+		m := *u
+		m.Path = strings.TrimSuffix(m.Path, "/") + cb.MetricsPath
+		m.RawPath, m.RawQuery = "", ""
+		metricsURL = &m
+	}
 	b := &Backend{
 		GRPCURL:      grpcURL,
 		Name:         cb.Name,
@@ -198,6 +231,8 @@ func newBackend(cb config.Backend, index int) (*Backend, error) {
 		HealthPath:   cb.HealthPath,
 		Tokenize:     cb.Tokenize,
 		AgentURL:     agent,
+		MetricsURL:   metricsURL,
+		metricsPath:  cb.MetricsPath,
 		index:        index,
 		healthy:      true, // optimistic until the first check says otherwise
 	}
@@ -236,7 +271,7 @@ func (b *Backend) sameConnection(cb config.Backend) bool {
 		grpcURL = b.GRPCURL.String()
 	}
 	return b.URL.String() == cb.URL && grpcURL == cb.GRPCURL && b.APIKey == cb.APIKey && b.APIKeyHeader == cb.APIKeyHeader &&
-		b.HealthPath == cb.HealthPath && agent == cb.AgentURL && b.Tokenize == cb.Tokenize
+		b.HealthPath == cb.HealthPath && agent == cb.AgentURL && b.Tokenize == cb.Tokenize && b.metricsPath == cb.MetricsPath
 }
 
 // Update applies a new backend list and options without dropping traffic.
@@ -245,9 +280,7 @@ func (b *Backend) sameConnection(cb config.Backend) bool {
 // hardware state unless their endpoint or credentials changed. It returns a
 // description of each change.
 func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error) {
-	if opts.Tiers == (hardware.Thresholds{}) {
-		opts.Tiers = hardware.DefaultThresholds
-	}
+	opts = opts.withDefaults()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var changes []string
@@ -574,13 +607,31 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 		return nil, false, nil
 	}
 
-	minUtil := 1.0
+	// Engines that report queueing or a nearly full KV cache come last:
+	// they get new work only when nothing else has room.
+	now := time.Now()
+	var ready, saturated []*Backend
 	for _, b := range free {
-		minUtil = min(minUtil, b.utilization())
+		if p.saturated(b, now) {
+			saturated = append(saturated, b)
+		} else {
+			ready = append(ready, b)
+		}
+	}
+	if len(ready) > 0 {
+		free = ready
+	} else {
+		free = saturated
+	}
+	loads := make(map[*Backend]float64, len(free))
+	minLoad := math.Inf(1)
+	for _, b := range free {
+		loads[b] = b.load(now)
+		minLoad = min(minLoad, loads[b])
 	}
 	if r.Preferred != "" {
 		for _, b := range free {
-			if b.Name == r.Preferred && b.utilization() <= minUtil+p.opts.AffinityMaxImbalance {
+			if b.Name == r.Preferred && loads[b] <= minLoad+p.opts.AffinityMaxImbalance {
 				return b, true, nil
 			}
 		}
@@ -593,7 +644,7 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 	for _, tier := range order {
 		var best *Backend
 		for _, b := range free {
-			if b.Tier == tier && (best == nil || better(b, best)) {
+			if b.Tier == tier && (best == nil || better(b, best, loads)) {
 				best = b
 			}
 		}
@@ -612,9 +663,9 @@ const gpuBusyMargin = 10
 // to first token must be before it wins a tie on load.
 const latencyMargin = 0.3
 
-func better(a, b *Backend) bool {
-	if ua, ub := a.utilization(), b.utilization(); ua != ub {
-		return ua < ub
+func better(a, b *Backend, loads map[*Backend]float64) bool {
+	if la, lb := loads[a], loads[b]; la != lb {
+		return la < lb
 	}
 	// Equal load: prefer the backend that has been answering faster. This
 	// steers around a node that is thermally throttled, on a shared GPU, or
@@ -789,6 +840,7 @@ type Status struct {
 	// requests (0 until one has been served).
 	TTFTMillis float64         `json:"ttft_ms"`
 	Hardware   *HardwareStatus `json:"hardware,omitempty"`
+	Engine     *EngineStatus   `json:"engine,omitempty"`
 }
 
 func (p *Pool) Snapshot() []Status {
@@ -822,5 +874,6 @@ func (p *Pool) statusLocked(b *Backend) Status {
 		MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
 		TTFTMillis: math.Round(b.ttft * 1000),
 		Hardware:   b.hardwareStatus(),
+		Engine:     p.engineStatusLocked(b, time.Now()),
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
@@ -29,6 +30,8 @@ type server struct {
 	decodeTPS  float64
 	failRate   float64
 	slots      chan struct{}
+	// Load, exposed vLLM-style on /metrics.
+	running, waiting atomic.Int64
 
 	mu       sync.Mutex
 	cache    map[uint64]*list.Element
@@ -57,8 +60,20 @@ func main() {
 	})
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/completions", s.handleChat)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	log.Printf("mockllm %q serving %s on %s", s.name, s.model, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+// handleMetrics reports load in vLLM's metric names. The KV cache is taken
+// to be full when every slot is busy.
+func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	running, waiting := s.running.Load(), s.waiting.Load()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{model_name=%q} %d\n", s.model, running)
+	fmt.Fprintf(w, "# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{model_name=%q} %d\n", s.model, waiting)
+	fmt.Fprintf(w, "# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{model_name=%q} %g\n", s.model,
+		float64(running)/float64(cap(s.slots)))
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -81,12 +96,16 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.waiting.Add(1)
 	select {
 	case s.slots <- struct{}{}:
+		s.waiting.Add(-1)
 	case <-r.Context().Done():
+		s.waiting.Add(-1)
 		return
 	}
-	defer func() { <-s.slots }()
+	s.running.Add(1)
+	defer func() { s.running.Add(-1); <-s.slots }()
 
 	hashes := prompt.BlockHashes(info.Text, blockChars, 1<<20)
 	cachedBlocks := s.lookup(hashes)

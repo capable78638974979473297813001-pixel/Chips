@@ -58,10 +58,13 @@ type Config struct {
 	Health    Health      `yaml:"health"`
 	Upstream  Upstream    `yaml:"upstream"`
 	Hardware  Hardware    `yaml:"hardware"`
-	Cache     Cache       `yaml:"cache"`
-	Models    Models      `yaml:"models"`
-	TLS       TLS         `yaml:"tls"`
-	Cluster   Cluster     `yaml:"cluster"`
+	// EngineMetrics controls scraping of backends' own load metrics (see
+	// Backend.MetricsPath).
+	EngineMetrics EngineMetrics `yaml:"engine_metrics"`
+	Cache         Cache         `yaml:"cache"`
+	Models        Models        `yaml:"models"`
+	TLS           TLS           `yaml:"tls"`
+	Cluster       Cluster       `yaml:"cluster"`
 	// StateDir, when set, is where the router saves its response cache and
 	// usage counters (on shutdown and every few minutes) and restores them
 	// at startup, so a restart keeps cached answers and daily quotas.
@@ -274,6 +277,11 @@ type Backend struct {
 	// AgentURL points at the chipagent on this backend's machine, which
 	// reports its accelerators (NVIDIA, AMD, Intel, Apple) in one schema.
 	AgentURL string `yaml:"agent_url"`
+	// MetricsPath turns on scraping of the engine's Prometheus metrics
+	// (vLLM, SGLang, TGI, llama.cpp with --metrics, Triton) at this path,
+	// usually /metrics, to route on the engine's real queue and KV-cache
+	// pressure, including load from clients that bypass this router.
+	MetricsPath string `yaml:"metrics_path"`
 
 	APIKey string `yaml:"-"`
 }
@@ -334,6 +342,18 @@ type Upstream struct {
 	// ResponseHeaderTimeout bounds time-to-first-byte. Non-streaming requests
 	// only send headers once generation finishes, so keep this generous. 0 = none.
 	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
+}
+
+// EngineMetrics controls how often backends' /metrics are scraped and when
+// an engine counts as saturated.
+type EngineMetrics struct {
+	Interval Duration `yaml:"interval"`
+	Timeout  Duration `yaml:"timeout"`
+	// KVSaturated is the KV-cache usage (0 to 1) at which an engine is
+	// about to queue or preempt requests. Saturated engines, and engines
+	// with requests queued inside them, get new work only when no other
+	// backend has room.
+	KVSaturated float64 `yaml:"kv_saturated"`
 }
 
 // Hardware controls polling of chipagent telemetry and how `tier: auto`
@@ -487,6 +507,16 @@ func (c *Config) applyDefaults() {
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
 	}
+	em := &c.EngineMetrics
+	if em.Interval == 0 {
+		em.Interval = Duration(2 * time.Second)
+	}
+	if em.Timeout == 0 {
+		em.Timeout = Duration(time.Second)
+	}
+	if em.KVSaturated == 0 {
+		em.KVSaturated = 0.95
+	}
 	hw := &c.Hardware
 	if hw.PollInterval == 0 {
 		hw.PollInterval = Duration(10 * time.Second)
@@ -624,6 +654,9 @@ func validateBackend(where string, b Backend) []error {
 	if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
 		errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
 	}
+	if b.MetricsPath != "" && !strings.HasPrefix(b.MetricsPath, "/") {
+		errs = append(errs, fmt.Errorf("%s: metrics_path must start with /", where))
+	}
 	if b.APIKeyEnv != "" && b.APIKey == "" {
 		errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))
 	}
@@ -756,6 +789,9 @@ func (c *Config) validate() error {
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {
 		errs = append(errs, errors.New("health.path must start with /"))
+	}
+	if em := c.EngineMetrics; em.Interval.D() < 100*time.Millisecond || em.Timeout <= 0 || em.KVSaturated <= 0 || em.KVSaturated > 1 {
+		errs = append(errs, errors.New("engine_metrics: need interval >= 100ms, a positive timeout, and 0 < kv_saturated <= 1"))
 	}
 	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
 		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))
