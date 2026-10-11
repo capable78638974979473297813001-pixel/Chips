@@ -206,6 +206,13 @@ func run() error {
 		IdleTimeout:       120 * time.Second,
 		// No write timeout: streamed generations can legitimately run for minutes.
 	}
+	// HTTP/1.1 and HTTP/2 everywhere, including HTTP/2 without TLS (h2c),
+	// which plaintext gRPC clients use.
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
+	srv.Protocols = &protocols
 	errc := make(chan error, 1)
 	if certs != nil {
 		srv.TLSConfig = certs.ServerConfig()

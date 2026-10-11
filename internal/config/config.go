@@ -172,6 +172,10 @@ type Backend struct {
 	// APIKeyHeader sends the key as a raw header value (e.g. x-api-key,
 	// api-key) instead of "Authorization: Bearer".
 	APIKeyHeader string `yaml:"api_key_header"`
+	// GRPCURL is the backend's gRPC endpoint, when it has one on a separate
+	// port (Triton and KServe serve gRPC on 8001 next to HTTP on 8000). gRPC
+	// requests only go to backends that have it.
+	GRPCURL string `yaml:"grpc_url"`
 	// Tokenize names the engine's tokenize API (vllm, llamacpp or tgi). The
 	// router uses it for an exact token count when a prompt's estimated size
 	// is close to some backend's max_context_tokens.
@@ -458,6 +462,11 @@ func (c *Config) validate() error {
 		}
 		if b.MaxContextTokens < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
+		}
+		if b.GRPCURL != "" {
+			if u, err := url.Parse(b.GRPCURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("%s: grpc_url must be an absolute http(s) URL (http for plaintext h2c), got %q", where, b.GRPCURL))
+			}
 		}
 		switch b.Tokenize {
 		case "", "vllm", "llamacpp", "tgi":

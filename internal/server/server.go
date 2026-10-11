@@ -50,9 +50,11 @@ type Server struct {
 	limits   *limits.Tracker
 	cluster  *cluster.Node // nil when this router runs alone
 	client   *http.Client
-	log      *slog.Logger
-	reg      *metrics.Registry
-	mux      *http.ServeMux
+	// grpcTransport speaks HTTP/2 (h2c for plaintext) to gRPC backends.
+	grpcTransport *http.Transport
+	log           *slog.Logger
+	reg           *metrics.Registry
+	mux           *http.ServeMux
 
 	requests      *metrics.CounterVec
 	upstreamErrs  *metrics.CounterVec
@@ -144,13 +146,15 @@ func clientFrom(ctx context.Context) clientInfo {
 func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger) *Server {
 	reg := &metrics.Registry{}
 	s := &Server{
-		pool:     p,
-		limits:   limits.New(),
-		affinity: affinity.New(cfg.Routing.AffinityCapacity, cfg.Routing.AffinityTTL.D()),
-		client:   client,
-		log:      log,
-		reg:      reg,
-		mux:      http.NewServeMux(),
+		pool:   p,
+		limits: limits.New(),
+
+		grpcTransport: newGRPCTransport(client),
+		affinity:      affinity.New(cfg.Routing.AffinityCapacity, cfg.Routing.AffinityTTL.D()),
+		client:        client,
+		log:           log,
+		reg:           reg,
+		mux:           http.NewServeMux(),
 
 		requests:     reg.NewCounterVec("siliconrouter_requests_total", "Proxied requests by backend and HTTP status.", "backend", "code"),
 		upstreamErrs: reg.NewCounterVec("siliconrouter_upstream_errors_total", "Failed upstream attempts (connection errors and retryable statuses).", "backend"),
@@ -410,6 +414,10 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	s.clientReqs.Inc(who)
+	if ws, grpc := isWebSocket(r), isGRPC(r); ws || grpc {
+		s.passthrough(w, r, st, client, grpc)
+		return
+	}
 
 	body, err := readBody(w, r, st.cfg.MaxBodyBytes)
 	if err != nil {
@@ -918,6 +926,7 @@ type requestLog struct {
 	alias       string
 	cache       string
 	exactTokens int
+	kind        string // websocket or grpc for passthrough sessions
 }
 
 var priorityNames = [...]string{"low", "normal", "high"}
@@ -937,6 +946,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.cache != "" {
 		attrs = append(attrs, "response_cache", l.cache)
+	}
+	if l.kind != "" {
+		attrs = append(attrs, "kind", l.kind)
 	}
 	if l.exactTokens > 0 {
 		attrs = append(attrs, "prompt_tokens_exact", l.exactTokens)
