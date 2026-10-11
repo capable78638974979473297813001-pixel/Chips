@@ -56,7 +56,47 @@ type Config struct {
 	Cache        Cache     `yaml:"cache"`
 	Models       Models    `yaml:"models"`
 	TLS          TLS       `yaml:"tls"`
+	Cluster      Cluster   `yaml:"cluster"`
+	// StateDir, when set, is where the router saves its response cache and
+	// usage counters (on shutdown and every few minutes) and restores them
+	// at startup, so a restart keeps cached answers and daily quotas.
+	StateDir string  `yaml:"state_dir"`
+	Tracing  Tracing `yaml:"tracing"`
+	Logging  Logging `yaml:"logging"`
 }
+
+// Tracing exports a span per request (plus queue wait and each backend
+// attempt) to an OpenTelemetry collector. Trace context (W3C traceparent)
+// is passed on to backends whether or not spans are exported.
+type Tracing struct {
+	OTLPEndpoint string  `yaml:"otlp_endpoint"` // OTLP/HTTP base URL, e.g. http://otel-collector:4318
+	ServiceName  string  `yaml:"service_name"`
+	SampleRate   float64 `yaml:"sample_rate"` // share of new traces exported (callers' sampled traces always are)
+}
+
+// Logging controls the per-request log line.
+type Logging struct {
+	// RequestSampleRate logs this share of successful requests (0-1).
+	// Errors and slow requests are always logged.
+	RequestSampleRate float64  `yaml:"request_sample_rate"`
+	SlowRequest       Duration `yaml:"slow_request"` // always log requests slower than this (0 = off)
+}
+
+// Cluster lets several routers behind one load balancer act as one: they
+// share which backend holds each conversation's cache and how many tokens
+// each client used today, so either router routes a follow-up turn to the
+// right backend and daily quotas hold across the fleet.
+type Cluster struct {
+	// Peers are the other routers' base URLs (this router may be listed too;
+	// it skips itself by node name).
+	Peers        []string `yaml:"peers"`
+	NodeName     string   `yaml:"node_name"` // default: hostname
+	Secret       string   `yaml:"secret"`
+	SecretEnv    string   `yaml:"secret_env"`
+	SyncInterval Duration `yaml:"sync_interval"`
+}
+
+func (c Cluster) Enabled() bool { return len(c.Peers) > 0 }
 
 // TLS serves the router over HTTPS. Certificate files are re-read when they
 // change, so rotation (cert-manager, Let's Encrypt) needs no restart.
@@ -151,6 +191,14 @@ type Backend struct {
 	// APIKeyHeader sends the key as a raw header value (e.g. x-api-key,
 	// api-key) instead of "Authorization: Bearer".
 	APIKeyHeader string `yaml:"api_key_header"`
+	// GRPCURL is the backend's gRPC endpoint, when it has one on a separate
+	// port (Triton and KServe serve gRPC on 8001 next to HTTP on 8000). gRPC
+	// requests only go to backends that have it.
+	GRPCURL string `yaml:"grpc_url"`
+	// Tokenize names the engine's tokenize API (vllm, llamacpp or tgi). The
+	// router uses it for an exact token count when a prompt's estimated size
+	// is close to some backend's max_context_tokens.
+	Tokenize string `yaml:"tokenize"`
 	// HealthPath overrides health.path for engines with their own health
 	// endpoint, e.g. /health (TGI), /v2/health/ready (Triton, KServe), /api/tags (Ollama).
 	HealthPath string `yaml:"health_path"`
@@ -179,6 +227,10 @@ type Routing struct {
 	// prefers heavy hardware.
 	LargeRequestTokens int     `yaml:"large_request_tokens"`
 	CharsPerToken      float64 `yaml:"chars_per_token"`
+	// ExactTokensMargin: when a request's estimated size is within this
+	// fraction of a backend's context limit, count its tokens exactly with
+	// a backend that has `tokenize` set.
+	ExactTokensMargin float64 `yaml:"exact_tokens_margin"`
 }
 
 func (r Routing) AffinityEnabled() bool { return r.PrefixAffinity == nil || *r.PrefixAffinity }
@@ -290,6 +342,9 @@ func (c *Config) applyDefaults() {
 	if r.CharsPerToken == 0 {
 		r.CharsPerToken = 4
 	}
+	if r.ExactTokensMargin == 0 {
+		r.ExactTokensMargin = 0.2
+	}
 	if c.Queue.MaxWaiting == 0 {
 		c.Queue.MaxWaiting = 1024
 	}
@@ -336,6 +391,21 @@ func (c *Config) applyDefaults() {
 	if c.Upstream.DialTimeout == 0 {
 		c.Upstream.DialTimeout = Duration(5 * time.Second)
 	}
+	if c.Tracing.ServiceName == "" {
+		c.Tracing.ServiceName = "siliconrouter"
+	}
+	if c.Tracing.SampleRate == 0 {
+		c.Tracing.SampleRate = 1
+	}
+	if c.Logging.RequestSampleRate == 0 {
+		c.Logging.RequestSampleRate = 1
+	}
+	if c.Cluster.SyncInterval == 0 {
+		c.Cluster.SyncInterval = Duration(time.Second)
+	}
+	if c.Cluster.NodeName == "" {
+		c.Cluster.NodeName, _ = os.Hostname()
+	}
 	hw := &c.Hardware
 	if hw.PollInterval == 0 {
 		hw.PollInterval = Duration(10 * time.Second)
@@ -367,6 +437,9 @@ func (c *Config) resolveEnv() {
 	}
 	if c.Auth.AdminKeysEnv != "" {
 		c.Auth.AdminKeys = append(c.Auth.AdminKeys, splitEnv(c.Auth.AdminKeysEnv)...)
+	}
+	if c.Cluster.SecretEnv != "" {
+		c.Cluster.Secret = os.Getenv(c.Cluster.SecretEnv)
 	}
 	for i := range c.Auth.Keys {
 		if k := &c.Auth.Keys[i]; k.KeyEnv != "" {
@@ -418,6 +491,16 @@ func (c *Config) validate() error {
 		if b.MaxContextTokens < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
 		}
+		if b.GRPCURL != "" {
+			if u, err := url.Parse(b.GRPCURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("%s: grpc_url must be an absolute http(s) URL (http for plaintext h2c), got %q", where, b.GRPCURL))
+			}
+		}
+		switch b.Tokenize {
+		case "", "vllm", "llamacpp", "tgi":
+		default:
+			errs = append(errs, fmt.Errorf("%s: tokenize must be vllm, llamacpp or tgi, got %q", where, b.Tokenize))
+		}
 		if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
 			errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
 		}
@@ -431,6 +514,9 @@ func (c *Config) validate() error {
 	}
 	if r.MaxBlocks < 1 || r.AffinityCapacity < 1 || r.LargeRequestTokens < 1 || r.CharsPerToken <= 0 {
 		errs = append(errs, errors.New("routing: max_blocks, affinity_capacity, large_request_tokens and chars_per_token must be positive"))
+	}
+	if r.ExactTokensMargin < 0 || r.ExactTokensMargin > 1 {
+		errs = append(errs, errors.New("routing.exact_tokens_margin must be between 0 and 1"))
 	}
 	if r.AffinityMaxImbalance < 0 || r.AffinityMaxImbalance > 1 {
 		errs = append(errs, errors.New("routing.affinity_max_imbalance must be between 0 and 1"))
@@ -473,6 +559,27 @@ func (c *Config) validate() error {
 	}
 	if v := c.TLS.MinVersion; v != "" && v != "1.2" && v != "1.3" {
 		errs = append(errs, fmt.Errorf("tls.min_version must be 1.2 or 1.3, got %q", v))
+	}
+	if r := c.Tracing.SampleRate; r < 0 || r > 1 {
+		errs = append(errs, errors.New("tracing.sample_rate must be between 0 and 1"))
+	}
+	if e := c.Tracing.OTLPEndpoint; e != "" {
+		if u, err := url.Parse(e); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("tracing.otlp_endpoint must be an absolute http(s) URL, got %q", e))
+		}
+	}
+	if r := c.Logging.RequestSampleRate; r < 0 || r > 1 {
+		errs = append(errs, errors.New("logging.request_sample_rate must be between 0 and 1"))
+	}
+	if c.Cluster.Enabled() {
+		if len(c.Cluster.Secret) < 16 {
+			errs = append(errs, errors.New("cluster: a secret of at least 16 characters is required (secret or secret_env)"))
+		}
+		for i, p := range c.Cluster.Peers {
+			if u, err := url.Parse(p); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("cluster.peers[%d]: must be an absolute http(s) URL, got %q", i, p))
+			}
+		}
 	}
 	if m := c.Cache.Mode; m != "deterministic" && m != "all" {
 		errs = append(errs, fmt.Errorf("cache.mode must be deterministic or all, got %q", m))

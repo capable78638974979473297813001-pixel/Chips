@@ -1,7 +1,10 @@
-.PHONY: build test lint cross demo demo-mixed bench agent agent-test agent-cross clean
+.PHONY: build test lint cross dist demo demo-mixed bench agent agent-test agent-cross clean
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS = -s -w -X main.version=$(VERSION)
 
 build:
-	go build -o bin/ ./cmd/...
+	go build -ldflags "-X main.version=$(VERSION)" -o bin/ ./cmd/...
 
 test:
 	go test -race ./...
@@ -29,6 +32,21 @@ cross:
 		echo "go build $$t"; \
 		GOOS=$${t%/*} GOARCH=$${t#*/} CGO_ENABLED=0 go build -o bin/$${t%/*}-$${t#*/}/ ./cmd/... || exit 1; \
 	done
+
+# Release archives of the router for the common platforms, with checksums.
+DIST_TARGETS = linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+dist:
+	rm -rf dist && mkdir -p dist
+	@for t in $(DIST_TARGETS); do \
+		os=$${t%/*}; arch=$${t#*/}; name=siliconrouter-$(VERSION)-$$os-$$arch; \
+		echo "dist $$name"; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$name/ ./cmd/... || exit 1; \
+		cp LICENSE README.md examples/siliconrouter.yaml dist/$$name/; \
+		if [ $$os = windows ]; then (cd dist && zip -qr $$name.zip $$name); \
+		else tar -C dist -czf dist/$$name.tar.gz $$name; fi; \
+		rm -rf dist/$$name; \
+	done
+	cd dist && sha256sum * > SHA256SUMS
 
 # chipagent, the C++ hardware agent that runs on each GPU server.
 agent:
@@ -59,4 +77,4 @@ bench: build
 	bin/srbench -conversations 30 -turns 10 -concurrency 8 -system-chars 400 -user-chars 2000
 
 clean:
-	rm -rf bin agent/build agent/build-*
+	rm -rf bin dist agent/build agent/build-*

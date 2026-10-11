@@ -29,6 +29,9 @@ Serves GET /v1/telemetry (JSON) and GET /healthz.
                         SPEC is vendor:name:memory_gib[:utilization_percent[:kind]],
                         kind one of gpu, npu, accelerator, display (default gpu),
                         e.g. "nvidia:NVIDIA H100 80GB HBM3:80" or "google:TPU v5e:16::accelerator"
+  --plugin COMMAND      also report the devices COMMAND prints as JSON; repeatable.
+                        Use it for chips without built-in support (see agent/plugins/)
+  --plugin-timeout MS   how long a plugin may run per collection (default 5000)
   --nvml-library PATH   NVML library to load (default libnvidia-ml.so.1 / nvml.dll)
   --sysfs-root PATH     Linux: root containing sys/ and proc/ (default "/")
   --version             print the version and exit
@@ -38,7 +41,8 @@ Serves GET /v1/telemetry (JSON) and GET /healthz.
 
 int main(int argc, char** argv) {
   std::string listen = ":9400", nvml_lib, sysfs_root = "/";
-  std::vector<std::string> simulate;
+  std::vector<std::string> simulate, plugins;
+  int plugin_timeout = 5000;
   bool once = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -52,6 +56,8 @@ int main(int argc, char** argv) {
     if (arg == "--listen") listen = value("--listen");
     else if (arg == "--once") once = true;
     else if (arg == "--simulate") simulate.push_back(value("--simulate"));
+    else if (arg == "--plugin") plugins.push_back(value("--plugin"));
+    else if (arg == "--plugin-timeout") plugin_timeout = std::atoi(value("--plugin-timeout").c_str());
     else if (arg == "--nvml-library") nvml_lib = value("--nvml-library");
     else if (arg == "--sysfs-root") sysfs_root = value("--sysfs-root");
     else if (arg == "--version") {
@@ -91,6 +97,8 @@ int main(int argc, char** argv) {
     if (!have_nvml) providers.push_back(chipagent::OpenDeviceTree(sysfs_root));
 #endif
   }
+
+  for (const auto& cmd : plugins) providers.push_back(chipagent::OpenPlugin(cmd, plugin_timeout > 0 ? plugin_timeout : 5000));
 
   auto telemetry = [&] {
     return chipagent::RenderTelemetry(chipagent::Collect(providers), chipagent::ReadHost(sysfs_root),

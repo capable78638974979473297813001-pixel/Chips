@@ -52,9 +52,18 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	logJSON := flag.Bool("log-json", false, "emit JSON logs")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	checkConfig := flag.Bool("check-config", false, "validate the config file (and its environment variables) and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
+		return nil
+	}
+	if *checkConfig {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: OK (%d backends)\n", *configPath, len(cfg.Backends))
 		return nil
 	}
 
@@ -137,6 +146,33 @@ func run() error {
 		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
 	}
 	router := server.New(cfg, p, client, log)
+	go router.RunCluster(ctx)
+	go router.RunTracing(ctx)
+	if dir := cfg.StateDir; dir != "" {
+		cached, err := router.LoadState(dir)
+		if err != nil {
+			log.Warn("could not restore saved state; starting fresh", "dir", dir, "error", err)
+		} else {
+			log.Info("restored saved state", "dir", dir, "cached_responses", cached)
+		}
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if err := router.SaveState(dir); err != nil {
+						log.Warn("saving state failed", "dir", dir, "error", err)
+					}
+				}
+			}
+		}()
+	}
+	if cfg.Cluster.Enabled() {
+		log.Info("cluster mode", "node", cfg.Cluster.NodeName, "peers", cfg.Cluster.Peers)
+	}
 	// reload re-reads the config file and applies it; on any error the
 	// running config stays in place.
 	var reloadMu sync.Mutex
@@ -180,6 +216,13 @@ func run() error {
 		IdleTimeout:       120 * time.Second,
 		// No write timeout: streamed generations can legitimately run for minutes.
 	}
+	// HTTP/1.1 and HTTP/2 everywhere, including HTTP/2 without TLS (h2c),
+	// which plaintext gRPC clients use.
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
+	srv.Protocols = &protocols
 	errc := make(chan error, 1)
 	if certs != nil {
 		srv.TLSConfig = certs.ServerConfig()
@@ -203,8 +246,16 @@ func run() error {
 	log.Info("shutting down; draining in-flight requests")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return err
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if dir := cfg.StateDir; dir != "" {
+		if err := router.SaveState(dir); err != nil {
+			log.Error("saving state failed", "dir", dir, "error", err)
+		} else {
+			log.Info("saved state", "dir", dir)
+		}
+	}
+	if shutdownErr != nil && !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		return shutdownErr
 	}
 	return nil
 }

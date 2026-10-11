@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siliconrouter.fullname" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "siliconrouter.selector" . | nindent 4 }}
+  ports:
+    - {name: http, port: {{ .Values.service.port }}, targetPort: http}
+---
+# Gives each router a stable DNS name for cluster mode.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siliconrouter.fullname" . }}-headless
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "siliconrouter.selector" . | nindent 4 }}
+  ports:
+    - {name: http, port: {{ .Values.service.port }}, targetPort: http}

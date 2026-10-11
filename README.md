@@ -44,6 +44,8 @@ endpoint.
 6. **Ready for a platform team.** Built-in HTTPS with certificate hot-swap and optional mutual TLS,
    separate admin keys, per-team limits (concurrency, requests per minute, tokens per day), and
    per-team usage for chargeback. Config changes apply live via `SIGHUP` or `POST /admin/reload`.
+   Several routers can run as one cluster, sharing conversation placement and quotas. Traces go
+   to any OpenTelemetry collector. A Helm chart, systemd units and release builds are included.
    See [docs/OPERATIONS.md](docs/OPERATIONS.md).
 7. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
@@ -172,11 +174,14 @@ cmd/mockllm         simulated GPU inference server for demos and tests
 cmd/srbench         multi-turn chat load generator
 agent/              chipagent (C++17): per-node CPU, GPU and accelerator telemetry, any vendor
 scripts/            cross-architecture test runner for chipagent (QEMU)
+deploy/             Helm chart, systemd units, Grafana dashboard, Docker Compose demo
 internal/hardware   chipagent client, telemetry schema, automatic tiering
 internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
 internal/affinity   prefix → backend LRU table
-internal/cache      response cache (LRU, byte budget, TTL)
+internal/cache      response cache (LRU, byte budget, TTL, request coalescing, persistence)
+internal/cluster    multi-router sync of prefix affinity and daily usage
+internal/tracing    W3C trace context and OTLP/HTTP span export
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload
 internal/prompt     single-pass request scanner, prefix hashing, size estimates

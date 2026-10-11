@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "chipagent.hpp"
+#include "json.hpp"
 
 namespace fs = std::filesystem;
 using chipagent::Device;
@@ -334,6 +335,100 @@ static void TestNvml() {
   CHECK(!ds[1].power_watts);  // the fake reports NOT_SUPPORTED
 }
 
+static void TestJson() {
+  std::string err;
+  auto j = chipagent::ParseJson(R"( {"a": [1, 2.5e1, -3], "s": "x\"y\u00e9\n", "t": true, "n": null, "o": {}} )", &err);
+  CHECK(j.has_value());
+  if (j) {
+    CHECK_EQ(j->Get("a")->array.size(), size_t(3));
+    CHECK(j->Get("a")->array[1].number == 25);
+    CHECK_EQ(j->Str("s"), std::string("x\"y\xc3\xa9\n"));
+    CHECK(j->Get("t")->boolean);
+    CHECK(j->Get("n")->type == chipagent::Json::Null);
+    CHECK(!j->Num("s").has_value());
+  }
+  for (const char* bad : {"", "{", "[1,]", "{\"a\" 1}", "\"unterminated", "{} x", "tru", "[1 2]"}) {
+    CHECK(!chipagent::ParseJson(bad, &err).has_value());
+  }
+  CHECK(!chipagent::ParseJson(std::string(100, '[') + std::string(100, ']'), &err).has_value());  // too deep
+}
+
+#ifndef _WIN32
+static void TestPlugins() {
+  fs::path dir = TempDir("plugin");
+  auto script = [&](const std::string& name, const std::string& body) {
+    fs::path p = dir / name;
+    Write(p, "#!/bin/sh\n" + body);
+    fs::permissions(p, fs::perms::owner_all);
+    return p.string();
+  };
+
+  auto ds = chipagent::OpenPlugin(script("ok.sh", R"(cat <<'J'
+{"devices": [
+  {"vendor": "google", "kind": "accelerator", "name": "TPU v5e", "id": "tpu0",
+   "memory_total_bytes": 17179869184, "utilization_percent": 12.5, "temperature_c": null},
+  {"vendor": "acme", "name": "Mystery NPU", "kind": "quantum"},
+  {"name": "no vendor"}
+]}
+J
+)"), 2000)->Devices();
+  CHECK_EQ(ds.size(), size_t(2));
+  if (ds.size() == 2) {
+    CHECK_EQ(ds[0].name, std::string("TPU v5e"));
+    CHECK_EQ(ds[0].source, std::string("plugin"));
+    CHECK_EQ(ds[0].memory_total_bytes, uint64_t(17179869184));
+    CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 12.5);
+    CHECK(!ds[0].temperature_c);
+    CHECK_EQ(ds[1].kind, std::string("accelerator"));  // unknown kinds fall back
+  }
+  CHECK_EQ(chipagent::OpenPlugin(script("array.sh", "echo '[{\"vendor\":\"x\",\"name\":\"y\"}]'\n"), 2000)->Devices().size(), size_t(1));
+  CHECK(chipagent::OpenPlugin(script("bad.sh", "echo 'not json'\n"), 2000)->Devices().empty());
+  CHECK(chipagent::OpenPlugin(script("fail.sh", "echo '{\"devices\":[]}'; exit 3\n"), 2000)->Devices().empty());
+
+  // A hung tool is killed at the timeout, its children too.
+  auto start = std::chrono::steady_clock::now();
+  CHECK(chipagent::OpenPlugin(script("hang.sh", "sleep 30 & sleep 30\n"), 300)->Devices().empty());
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(5));
+
+  // The bundled plugins, run against sample output of the vendor tools.
+  fs::path bin = dir / "bin";
+  fs::create_directories(bin);
+  Write(bin / "hl-smi", "#!/bin/sh\nprintf '0, HL-225, 0000:19:00.0, 98304, 512, 37, 41, 180\\n1, HL-225, 0000:1a:00.0, 98304, 0, N/A, 39, 95\\n'\n");
+  Write(bin / "neuron-ls", "#!/bin/sh\necho '[{\"neuron_device\":0,\"bdf\":\"00:1e.0\",\"nc_count\":2,\"memory_size\":34359738368}]'\n");
+  fs::permissions(bin / "hl-smi", fs::perms::owner_all);
+  fs::permissions(bin / "neuron-ls", fs::perms::owner_all);
+  std::string path = "PATH=" + bin.string() + ":$PATH ";
+  ds = chipagent::OpenPlugin(path + PLUGINS_DIR "/gaudi-hl-smi.sh", 5000)->Devices();
+  CHECK_EQ(ds.size(), size_t(2));
+  if (ds.size() == 2) {
+    CHECK_EQ(ds[0].vendor, std::string("habana"));
+    CHECK_EQ(ds[0].name, std::string("Intel Gaudi HL-225"));
+    CHECK_EQ(ds[0].id, std::string("0000:19:00.0"));
+    CHECK_EQ(ds[0].memory_total_bytes, uint64_t(98304) << 20);
+    CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 37);
+    CHECK(ds[0].power_watts && *ds[0].power_watts == 180);
+    CHECK(!ds[1].utilization_percent);  // "N/A"
+  }
+  if (std::system("command -v python3 > /dev/null") == 0) {
+    ds = chipagent::OpenPlugin(path + PLUGINS_DIR "/aws-neuron.py", 5000)->Devices();
+    CHECK_EQ(ds.size(), size_t(1));
+    if (!ds.empty()) {
+      CHECK_EQ(ds[0].name, std::string("AWS Neuron device 0 (2 NeuronCores)"));
+      CHECK_EQ(ds[0].memory_total_bytes, uint64_t(34359738368));
+    }
+  }
+  fs::remove_all(dir);
+}
+#else
+static void TestPlugins() {
+  fs::path f = fs::temp_directory_path() / "chipagent-plugin.json";
+  std::ofstream(f) << R"({"devices":[{"vendor":"x","name":"Windows plugin device"}]})";
+  auto ds = chipagent::OpenPlugin("type \"" + f.string() + "\"", 5000)->Devices();
+  CHECK_EQ(ds.size(), size_t(1));
+  fs::remove(f);
+}
+#endif
+
 static std::string HttpGet(int port, const std::string& request) {
   auto fd = socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in addr{};
@@ -402,6 +497,8 @@ int main() {
 #endif
   TestParseCpuinfo();
   TestReadHostLive();
+  TestJson();
+  TestPlugins();
   TestNvml();
   TestHttp();
   if (failures) {

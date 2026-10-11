@@ -46,6 +46,8 @@ How much detail each vendor gets:
 | Intel Macs' GPUs | IOKit | ✓ | where macOS reports it | – | – |
 | Every other PCI device (Linux) | PCI sysfs | ✓ | – | – | – |
 
+| Anything with a vendor tool | a plugin (see below) | ✓ | what the tool reports | ✓ | ✓ |
+
 "–" means chipagent reports `null`, and the router treats the reading as unknown. A device whose
 memory is unknown is still counted, and tiers as `standard`.
 
@@ -66,6 +68,24 @@ Vendor code paths are tested against fakes: a stand-in NVML library that exports
 functions, and fake `/sys` and `/proc` trees, including `/proc/cpuinfo` samples from 12 CPU
 families. **None of it has run on real NVIDIA, AMD, Gaudi, TPU or other accelerator hardware
 yet.** Please report anything that reads wrong on your machines.
+
+### Plugins: any other chip
+
+For hardware without built-in readings, chipagent runs a plugin: any command that prints the
+machine's devices as JSON in chipagent's schema.
+
+```bash
+chipagent --plugin /opt/chipagent/plugins/gaudi-hl-smi.sh --plugin "/opt/chipagent/plugins/aws-neuron.py"
+```
+
+Two plugins are included:
+- Intel Gaudi, via `hl-smi`;
+- AWS Inferentia and Trainium, via `neuron-ls`.
+
+Writing one for another accelerator is a short script around its vendor tool. A plugin that hangs
+is killed after `--plugin-timeout` (default 5 s), and bad output is logged and skipped. See
+[`agent/plugins/README.md`](../agent/plugins/README.md). The included plugins have been tested
+against sample output of the vendor tools, not yet on real hardware.
 
 ## Run it
 

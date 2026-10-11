@@ -1,0 +1,30 @@
+# chipagent on each GPU server.
+#   sudo install -m 0755 chipagent /usr/local/bin/
+#   sudo cp chipagent.service /etc/systemd/system/ && sudo systemctl enable --now chipagent
+# Change the listen address with: sudo systemctl edit chipagent  (override ExecStart)
+[Unit]
+Description=chipagent hardware telemetry for SiliconRouter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+ExecStart=/usr/local/bin/chipagent --listen :9400
+Restart=on-failure
+RestartSec=2s
+
+# Reads /sys, /proc and the NVIDIA driver's NVML; needs GPU device nodes for NVML.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SupplementaryGroups=video render
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

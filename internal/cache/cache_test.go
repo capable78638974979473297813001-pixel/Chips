@@ -1,6 +1,9 @@
 package cache
 
 import (
+	"bytes"
+	"context"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -61,5 +64,81 @@ func TestExpires(t *testing.T) {
 	}
 	if n, _ := c.Stats(); n != 0 {
 		t.Error("expired entry not removed")
+	}
+}
+
+func TestLookupCoalesces(t *testing.T) {
+	c := New(1<<20, time.Minute)
+	k := NewKey([]byte("same request"))
+	_, _, leader, done := c.Lookup(context.Background(), k)
+	if !leader {
+		t.Fatal("first request is not the leader")
+	}
+	results := make(chan bool, 5)
+	for range 5 {
+		go func() {
+			e, coalesced, leader, d := c.Lookup(context.Background(), k)
+			d()
+			results <- e != nil && coalesced && !leader
+		}()
+	}
+	time.Sleep(20 * time.Millisecond) // let the followers start waiting
+	c.Put(k, entry(3))
+	done()
+	for range 5 {
+		if !<-results {
+			t.Error("a follower did not get the leader's answer")
+		}
+	}
+}
+
+func TestLookupAfterUncacheableAnswer(t *testing.T) {
+	c := New(1<<20, time.Minute)
+	k := NewKey([]byte("k"))
+	_, _, _, done := c.Lookup(context.Background(), k)
+	got := make(chan bool)
+	go func() {
+		e, _, leader, d := c.Lookup(context.Background(), k)
+		d()
+		got <- e == nil && leader
+	}()
+	time.Sleep(10 * time.Millisecond)
+	done() // the leader's answer was an error: nothing stored
+	if !<-got {
+		t.Error("waiter did not fall back to computing its own answer")
+	}
+	// A waiter gives up with its context.
+	_, _, _, done2 := c.Lookup(context.Background(), k)
+	defer done2()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if e, _, leader, _ := c.Lookup(ctx, k); e != nil || leader {
+		t.Error("cancelled waiter should get nothing")
+	}
+}
+
+func TestSaveLoad(t *testing.T) {
+	c := New(1<<20, time.Minute)
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+	fresh, stale := NewKey([]byte("fresh")), NewKey([]byte("stale"))
+	c.Put(stale, &Entry{Status: 200, Body: []byte("old")})
+	now = now.Add(50 * time.Second)
+	c.Put(fresh, &Entry{Status: 200, Body: []byte("new"), Header: http.Header{"Content-Type": {"application/json"}}, Backend: "gpu1"})
+	var buf bytes.Buffer
+	if err := c.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	d := New(1<<20, time.Minute)
+	d.now = func() time.Time { return now.Add(20 * time.Second) } // "stale" is now 70s old
+	if n, err := d.Load(&buf); err != nil || n != 1 {
+		t.Fatalf("restored %d, %v; want 1", n, err)
+	}
+	e, ok := d.Get(fresh)
+	if !ok || string(e.Body) != "new" || e.Backend != "gpu1" || e.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("restored entry = %+v", e)
+	}
+	if _, ok := d.Get(stale); ok {
+		t.Error("expired entry restored")
 	}
 }

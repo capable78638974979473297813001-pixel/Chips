@@ -19,6 +19,10 @@
 - Customization: model aliases, named API keys with priority classes, cache controls
 - Operations: built-in HTTPS (hot-swapped certificates, optional mTLS), admin keys, per-key
   concurrency/rate/daily-token limits, per-client usage for chargeback, live config reload
+- Cluster mode (shared prefix affinity and quotas across routers), state persistence, request
+  coalescing, exact token counts near context limits, gRPC and WebSocket passthrough, OTLP
+  tracing, log sampling, Grafana dashboard, Helm chart, systemd units, release builds, chipagent
+  plugins
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
@@ -26,14 +30,9 @@
 
 | Feature | Why it matters |
 |---|---|
-| Real tokenizers (optional, per model) | Exact token counts for context limits and billing |
-| Durable usage storage and quota state across restarts | Quotas survive a router restart; long-term chargeback without Prometheus |
 | Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
-| chipagent: live telemetry for Intel, Gaudi (hl-smi), Neuron, TPU; Apple/Windows GPU utilization; real-hardware validation | Fill the remaining gaps in the vendor matrix |
-| gRPC and WebSocket proxying | Triton/KServe gRPC ports, realtime voice APIs |
-| Shared routing state across router replicas (gossip or Redis) | Run the router itself highly available without losing cache affinity |
-| OpenTelemetry tracing | Per-request timing: queue, TTFT, generation |
-| Grafana dashboard | Shows the ROI story at a glance |
+| Real-hardware validation of chipagent and its plugins; TPU and Intel GPU plugins | Confirm readings on every vendor |
+| Fleet-wide rate limits in cluster mode | Today only daily quotas are shared; per-minute and concurrency limits apply per router |
 
 ## Research track (hard, and not promised)
 

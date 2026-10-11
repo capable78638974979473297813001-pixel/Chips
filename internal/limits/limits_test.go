@@ -102,3 +102,31 @@ func TestUnlimitedAndReload(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotaCountsPeerUsage(t *testing.T) {
+	tr, clk := newTracker(Limits{TokensPerDay: 1000})
+	tr.Record("team", 300, 0, false)
+	tr.SetRemote("router-b", map[string]Daily{"team": {Day: "2026-10-10", Tokens: 650}})
+	if r, rej := tr.Admit("team"); rej != nil {
+		t.Fatalf("950 of 1000 used: %+v", rej)
+	} else {
+		r()
+	}
+	tr.SetRemote("router-b", map[string]Daily{"team": {Day: "2026-10-10", Tokens: 700}})
+	if _, rej := tr.Admit("team"); rej == nil || rej.Reason != "quota_exceeded" {
+		t.Fatalf("1000 of 1000 used across the cluster, still admitted: %+v", rej)
+	}
+	if u := tr.Snapshot()[0]; u.TokensToday != 300 || u.ClusterTokensToday != 1000 {
+		t.Errorf("usage = %+v", u)
+	}
+	// A peer's report for yesterday does not count today.
+	clk.t = clk.t.Add(2 * time.Hour)
+	if r, rej := tr.Admit("team"); rej != nil {
+		t.Errorf("new day, still over quota: %+v", rej)
+	} else {
+		r()
+	}
+	if d := tr.LocalDaily()["team"]; d.Day != "2026-10-11" || d.Tokens != 0 {
+		t.Errorf("local daily = %+v", d)
+	}
+}

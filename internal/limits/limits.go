@@ -35,10 +35,13 @@ type Usage struct {
 	CompletionTokens int64  `json:"completion_tokens"`
 	// EstimatedTokens is the part of the token counts the router estimated
 	// because the backend did not report usage.
-	EstimatedTokens int64  `json:"estimated_tokens"`
-	TokensToday     int64  `json:"tokens_today"`
-	TokensPerDay    int64  `json:"tokens_per_day,omitempty"`
-	Day             string `json:"day"` // UTC date TokensToday counts
+	EstimatedTokens int64 `json:"estimated_tokens"`
+	TokensToday     int64 `json:"tokens_today"`
+	// ClusterTokensToday adds what peer routers reported for this client
+	// today; daily quotas are checked against it.
+	ClusterTokensToday int64  `json:"cluster_tokens_today"`
+	TokensPerDay       int64  `json:"tokens_per_day,omitempty"`
+	Day                string `json:"day"` // UTC date TokensToday counts
 }
 
 type client struct {
@@ -50,14 +53,59 @@ type client struct {
 	day      time.Time // UTC midnight starting the current quota day
 }
 
+// Daily is one client's token use on one UTC day, as exchanged between
+// routers in a cluster.
+type Daily struct {
+	Day    string `json:"day"` // 2006-01-02
+	Tokens int64  `json:"tokens"`
+}
+
 // Tracker holds every client's limits and counters. Safe for concurrent use.
 type Tracker struct {
 	mu      sync.Mutex
 	clients map[string]*client
+	remote  map[string]map[string]Daily // peer -> client -> usage
 	now     func() time.Time
 }
 
-func New() *Tracker { return &Tracker{clients: map[string]*client{}, now: time.Now} }
+func New() *Tracker {
+	return &Tracker{clients: map[string]*client{}, remote: map[string]map[string]Daily{}, now: time.Now}
+}
+
+// LocalDaily returns this router's own token use today, per client, for
+// sharing with peers.
+func (t *Tracker) LocalDaily() map[string]Daily {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]Daily, len(t.clients))
+	for name, c := range t.clients {
+		t.rollDayLocked(c, t.now())
+		out[name] = Daily{Day: c.day.Format(dayFormat), Tokens: c.usage.TokensToday}
+	}
+	return out
+}
+
+// SetRemote records a peer router's latest report of its own usage. Each
+// report replaces the previous one from that peer.
+func (t *Tracker) SetRemote(peer string, usage map[string]Daily) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.remote[peer] = usage
+}
+
+// remoteTodayLocked sums what peers reported for name on today's date.
+func (t *Tracker) remoteTodayLocked(name string, now time.Time) int64 {
+	today := midnight(now).Format(dayFormat)
+	var n int64
+	for _, byClient := range t.remote {
+		if d, ok := byClient[name]; ok && d.Day == today {
+			n += d.Tokens
+		}
+	}
+	return n
+}
+
+const dayFormat = "2006-01-02"
 
 // SetLimits installs limits by client name. Counters are kept, so a config
 // reload does not reset anyone's usage or quota.
@@ -105,7 +153,7 @@ func (t *Tracker) Admit(name string) (release func(), rejected *Rejection) {
 	if l.MaxConcurrent > 0 && c.inflight >= l.MaxConcurrent {
 		return reject(&Rejection{"concurrency_limit", "too many requests in progress for this API key", time.Second})
 	}
-	if l.TokensPerDay > 0 && c.usage.TokensToday >= l.TokensPerDay {
+	if l.TokensPerDay > 0 && c.usage.TokensToday+t.remoteTodayLocked(name, now) >= l.TokensPerDay {
 		return reject(&Rejection{"quota_exceeded", "daily token quota for this API key is used up",
 			c.day.Add(24 * time.Hour).Sub(now)})
 	}
@@ -163,9 +211,30 @@ func (t *Tracker) Snapshot() []Usage {
 		u := c.usage
 		u.InFlight = c.inflight
 		u.TokensPerDay = c.limits.TokensPerDay
-		u.Day = c.day.Format("2006-01-02")
+		u.Day = c.day.Format(dayFormat)
+		u.ClusterTokensToday = u.TokensToday + t.remoteTodayLocked(c.usage.Client, t.now())
 		out = append(out, u)
 	}
 	slices.SortFunc(out, func(a, b Usage) int { return strings.Compare(a.Client, b.Client) })
 	return out
+}
+
+// Restore loads counters saved from Snapshot (for example before a
+// restart). Today's tokens count only if they are from today, so a daily
+// quota survives a restart but still resets at midnight.
+func (t *Tracker) Restore(saved []Usage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	today := midnight(t.now()).Format(dayFormat)
+	for _, u := range saved {
+		c := t.clientLocked(u.Client)
+		c.usage.Requests += u.Requests
+		c.usage.Rejected += u.Rejected
+		c.usage.PromptTokens += u.PromptTokens
+		c.usage.CompletionTokens += u.CompletionTokens
+		c.usage.EstimatedTokens += u.EstimatedTokens
+		if u.Day == today {
+			c.usage.TokensToday += u.TokensToday
+		}
+	}
 }

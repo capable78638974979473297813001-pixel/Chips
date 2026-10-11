@@ -1,0 +1,88 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.existingSecret) }}
+{{- fail "replicaCount > 1 runs routers in cluster mode, which needs existingSecret holding the cluster secret" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "siliconrouter.fullname" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "siliconrouter.fullname" . }}-headless
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "siliconrouter.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siliconrouter.selector" . | nindent 8 }}
+        app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+      annotations:
+        # Changing the config rolls the pods. To change it without a
+        # restart, edit the ConfigMap and POST /admin/reload instead.
+        checksum/config: {{ include "siliconrouter.config" . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: router
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", "/etc/siliconrouter/siliconrouter.yaml", "-log-json"]
+          ports:
+            - {name: http, containerPort: {{ .Values.service.port }}}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef: {name: {{ .Values.existingSecret }}}
+          {{- end }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http, scheme: {{ include "siliconrouter.scheme" . | upper }}}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http, scheme: {{ include "siliconrouter.scheme" . | upper }}}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/siliconrouter/siliconrouter.yaml, subPath: siliconrouter.yaml}
+            {{- if .Values.tls.secretName }}
+            - {name: tls, mountPath: /etc/siliconrouter/tls, readOnly: true}
+            {{- end }}
+            - {name: state, mountPath: /var/lib/siliconrouter}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "siliconrouter.fullname" . }}}
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret: {secretName: {{ .Values.tls.secretName }}}
+        {{- end }}
+        {{- if not .Values.persistence.enabled }}
+        - name: state
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ .Values.persistence.size }}}
+  {{- end }}

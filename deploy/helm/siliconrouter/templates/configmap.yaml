@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "siliconrouter.fullname" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+data:
+  siliconrouter.yaml: |
+    {{- include "siliconrouter.config" . | nindent 4 }}

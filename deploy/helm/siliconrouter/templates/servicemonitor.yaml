@@ -1,0 +1,18 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "siliconrouter.fullname" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "siliconrouter.labels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scheme: {{ include "siliconrouter.scheme" . }}
+      {{- if .Values.tls.secretName }}
+      tlsConfig: {insecureSkipVerify: false}
+      {{- end }}
+{{- end }}
