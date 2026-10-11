@@ -17,6 +17,8 @@
 - Speed: first-token failover for stalled backends, latency-aware routing, response cache
   (embeddings and temperature 0), and a single-pass request scanner (2.2x lower router overhead)
 - Customization: model aliases, named API keys with priority classes, cache controls
+- Operations: built-in HTTPS (hot-swapped certificates, optional mTLS), admin keys, per-key
+  concurrency/rate/daily-token limits, per-client usage for chargeback, live config reload
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
@@ -25,8 +27,7 @@
 | Feature | Why it matters |
 |---|---|
 | Real tokenizers (optional, per model) | Exact token counts for context limits and billing |
-| Per-key rate limits and quotas | Multi-team fairness; stops one team starving the others |
-| Config hot-reload, plus backend add/remove via API | Scale the fleet without a restart |
+| Durable usage storage and quota state across restarts | Quotas survive a router restart; long-term chargeback without Prometheus |
 | Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
 | chipagent: live telemetry for Intel, Gaudi (hl-smi), Neuron, TPU; Apple/Windows GPU utilization; real-hardware validation | Fill the remaining gaps in the vendor matrix |
 | gRPC and WebSocket proxying | Triton/KServe gRPC ports, realtime voice APIs |

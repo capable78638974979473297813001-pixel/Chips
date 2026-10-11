@@ -41,7 +41,11 @@ endpoint.
    answering. Repeated embeddings and temperature-0 requests can be answered from a response cache
    in under a millisecond. Interactive traffic can be given priority over batch jobs. See
    [docs/TUNING.md](docs/TUNING.md).
-6. **Survives failures.** If a server dies mid-request, the request is retried on another server
+6. **Ready for a platform team.** Built-in HTTPS with certificate hot-swap and optional mutual TLS,
+   separate admin keys, per-team limits (concurrency, requests per minute, tokens per day), and
+   per-team usage for chargeback. Config changes apply live via `SIGHUP` or `POST /admin/reload`.
+   See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+7. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover.
 
@@ -115,6 +119,8 @@ OpenAI-compatible servers return).
 | any other path            | Forwarded to a backend: OpenAI `/v1/*`, `/v1/messages`, Ollama `/api/*`, TGI, Triton/KServe `/v2/*`, ... |
 | `GET /v1/models`          | Models served by healthy backends                             |
 | `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
+| `GET /admin/usage`        | Requests, rejections and tokens per client (API key name)     |
+| `POST /admin/reload`      | Re-read the config file and apply it live (also `SIGHUP`)      |
 | `GET /metrics`            | Prometheus metrics                                            |
 | `GET /healthz`, `/readyz` | Liveness, and readiness (at least one healthy backend)        |
 
@@ -171,6 +177,8 @@ internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
 internal/affinity   prefix → backend LRU table
 internal/cache      response cache (LRU, byte budget, TTL)
+internal/limits     per-client limits and usage counters
+internal/tlsconf    HTTPS with certificate hot reload
 internal/prompt     single-pass request scanner, prefix hashing, size estimates
 internal/config     YAML config, defaults, validation
 ```

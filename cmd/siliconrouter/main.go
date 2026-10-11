@@ -11,14 +11,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
-	"github.com/capable78638974979473297813001-pixel/chips/internal/hardware"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/server"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/tlsconf"
 )
+
+func logReload(log *slog.Logger, trigger string, changes []string, err error) {
+	if err != nil {
+		log.Error("config reload failed; previous config still in use", "trigger", trigger, "error", err)
+		return
+	}
+	if len(changes) == 0 {
+		log.Info("config reloaded: no changes", "trigger", trigger)
+	}
+	for _, c := range changes {
+		log.Info("config reloaded", "trigger", trigger, "change", c)
+	}
+}
 
 var version = "dev"
 
@@ -60,20 +74,15 @@ func run() error {
 		return err
 	}
 
-	p, err := pool.New(cfg.Backends, pool.Options{
-		MaxWaiting:           cfg.Queue.MaxWaiting,
-		AffinityMaxImbalance: cfg.Routing.AffinityMaxImbalance,
-		LargeRequestTokens:   cfg.Routing.LargeRequestTokens,
-		UnhealthyThreshold:   cfg.Health.UnhealthyThreshold,
-		HealthyThreshold:     cfg.Health.HealthyThreshold,
-		PassiveHealth:        !cfg.Health.Disabled,
-		Tiers: hardware.Thresholds{
-			HeavyMinBytes:    uint64(cfg.Hardware.HeavyMinMemoryGiB * (1 << 30)),
-			StandardMinBytes: uint64(cfg.Hardware.StandardMinMemoryGiB * (1 << 30)),
-		},
-	}, log)
+	p, err := pool.New(cfg.Backends, pool.OptionsFromConfig(cfg), log)
 	if err != nil {
 		return err
+	}
+	var certs *tlsconf.Store
+	if cfg.TLS.Enabled() {
+		if certs, err = tlsconf.Load(cfg.TLS); err != nil {
+			return err
+		}
 	}
 
 	maxConns := 0
@@ -124,18 +133,67 @@ func run() error {
 		log.Info("backend", attrs...)
 	}
 
+	if cfg.Auth.Enabled() && len(cfg.Auth.AdminKeys) == 0 {
+		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
+	}
+	router := server.New(cfg, p, client, log)
+	// reload re-reads the config file and applies it; on any error the
+	// running config stays in place.
+	var reloadMu sync.Mutex
+	reload := func() ([]string, error) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		next, err := config.Load(*configPath)
+		if err != nil {
+			return nil, err
+		}
+		if certs != nil && next.TLS.Enabled() {
+			if err := certs.Reload(next.TLS); err != nil {
+				return nil, err
+			}
+		}
+		return router.Apply(next)
+	}
+	router.SetReloader(func() ([]string, error) {
+		changes, err := reload()
+		logReload(log, "admin API", changes, err)
+		return changes, err
+	})
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				changes, err := reload()
+				logReload(log, "SIGHUP", changes, err)
+			}
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           server.New(cfg, p, client, log),
+		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// No write timeout: streamed generations can legitimately run for minutes.
 	}
 	errc := make(chan error, 1)
-	go func() {
-		log.Info("siliconrouter listening", "addr", cfg.Listen, "version", version)
-		errc <- srv.ListenAndServe()
-	}()
+	if certs != nil {
+		srv.TLSConfig = certs.ServerConfig()
+		go certs.Watch(ctx, 30*time.Second, log)
+		go func() {
+			log.Info("siliconrouter listening", "addr", cfg.Listen, "tls", true, "version", version)
+			errc <- srv.ListenAndServeTLS("", "")
+		}()
+	} else {
+		go func() {
+			log.Info("siliconrouter listening", "addr", cfg.Listen, "tls", false, "version", version)
+			errc <- srv.ListenAndServe()
+		}()
+	}
 
 	select {
 	case err := <-errc:
