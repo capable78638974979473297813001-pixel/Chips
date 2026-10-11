@@ -20,6 +20,14 @@ config:
   cache:
     enabled: true
   state_dir: /var/lib/siliconrouter
+  # On a rolling update or scale-down: fail readiness and keep serving
+  # until the Service has stopped sending traffic here, then finish what
+  # is in flight. Keep terminationGracePeriodSeconds above the sum.
+  shutdown:
+    drain_delay: 10s
+    timeout: 60s
+
+terminationGracePeriodSeconds: 90
 
 # An existing Secret whose keys become environment variables, for the
 # *_env settings in config (API keys, admin keys, backend keys) and the

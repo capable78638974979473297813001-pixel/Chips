@@ -58,6 +58,8 @@ type Config struct {
 	Health    Health      `yaml:"health"`
 	Upstream  Upstream    `yaml:"upstream"`
 	Hardware  Hardware    `yaml:"hardware"`
+	// Shutdown controls how the router stops on SIGTERM or Ctrl-C.
+	Shutdown Shutdown `yaml:"shutdown"`
 	// EngineMetrics controls scraping of backends' own load metrics (see
 	// Backend.MetricsPath).
 	EngineMetrics EngineMetrics `yaml:"engine_metrics"`
@@ -350,6 +352,15 @@ type Upstream struct {
 	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
 }
 
+// Shutdown: on a stop signal the router first fails /readyz for
+// DrainDelay while still serving, so load balancers (a Kubernetes Service,
+// an L4 balancer's health check) stop sending it requests; then it stops
+// accepting connections and gives in-flight requests up to Timeout.
+type Shutdown struct {
+	DrainDelay Duration `yaml:"drain_delay"`
+	Timeout    Duration `yaml:"timeout"`
+}
+
 // EngineMetrics controls how often backends' /metrics are scraped and when
 // an engine counts as saturated.
 type EngineMetrics struct {
@@ -525,6 +536,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
+	}
+	if c.Shutdown.Timeout == 0 {
+		c.Shutdown.Timeout = Duration(60 * time.Second)
 	}
 	em := &c.EngineMetrics
 	if em.Interval == 0 {
@@ -723,6 +737,9 @@ func (c *Config) validate() error {
 	}
 	if c.Retry.MaxAttempts < 1 {
 		errs = append(errs, errors.New("retry.max_attempts must be at least 1"))
+	}
+	if c.Shutdown.DrainDelay < 0 || c.Shutdown.Timeout < 0 {
+		errs = append(errs, errors.New("shutdown: drain_delay and timeout must not be negative"))
 	}
 	if c.Retry.BudgetMinPerSecond < 0 {
 		errs = append(errs, errors.New("retry.budget_min_per_second must not be negative"))

@@ -18,6 +18,7 @@ import (
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/server"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/supervise"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/tlsconf"
 )
 
@@ -119,7 +120,7 @@ func run() error {
 	}
 	router := server.New(cfg, p, client, log)
 	router.DiscoverNow(ctx) // discovered backends join the first health checks
-	go router.RunDiscovery(ctx)
+	supervise.Go(ctx, log, "discovery", router.RunDiscovery)
 
 	if !cfg.Health.Disabled {
 		checker := &pool.Checker{
@@ -130,7 +131,7 @@ func run() error {
 			Timeout:  cfg.Health.Timeout.D(),
 		}
 		checker.CheckAll(ctx) // know who is up before taking traffic
-		go checker.Run(ctx)
+		supervise.Go(ctx, log, "health checks", checker.Run)
 	}
 	agents := &pool.AgentPoller{
 		Pool:     p,
@@ -141,13 +142,14 @@ func run() error {
 	if agents.HasAgents() {
 		agents.PollAll(ctx) // tier auto backends before taking traffic
 	}
-	go agents.Run(ctx) // also covers agents that a reload or discovery adds later
-	go (&pool.EngineScraper{
+	supervise.Go(ctx, log, "chipagent polling", agents.Run) // also covers agents that a reload or discovery adds later
+	scraper := &pool.EngineScraper{
 		Pool:     p,
 		Client:   client,
 		Interval: cfg.EngineMetrics.Interval.D(),
 		Timeout:  cfg.EngineMetrics.Timeout.D(),
-	}).Run(ctx)
+	}
+	supervise.Go(ctx, log, "engine metrics", scraper.Run)
 	for _, st := range p.Snapshot() {
 		attrs := []any{"name", st.Name, "url", st.URL, "tier", st.Tier, "tier_source", st.TierSource,
 			"healthy", st.Healthy, "max_concurrency", st.MaxConcurrency, "models", st.Models}
@@ -158,8 +160,8 @@ func run() error {
 		log.Info("backend", attrs...)
 	}
 
-	go router.RunCluster(ctx)
-	go router.RunTracing(ctx)
+	supervise.Go(ctx, log, "cluster sync", router.RunCluster)
+	supervise.Go(ctx, log, "trace export", router.RunTracing)
 	if dir := cfg.StateDir; dir != "" {
 		cached, err := router.LoadState(dir)
 		if err != nil {
@@ -167,7 +169,7 @@ func run() error {
 		} else {
 			log.Info("restored saved state", "dir", dir, "cached_responses", cached)
 		}
-		go func() {
+		supervise.Go(ctx, log, "state saving", func(ctx context.Context) {
 			t := time.NewTicker(5 * time.Minute)
 			defer t.Stop()
 			for {
@@ -180,7 +182,7 @@ func run() error {
 					}
 				}
 			}
-		}()
+		})
 	}
 	if cfg.Cluster.Enabled() {
 		log.Info("cluster mode", "node", cfg.Cluster.NodeName, "peers", cfg.Cluster.Peers)
@@ -207,9 +209,9 @@ func run() error {
 		logReload(log, "admin API", changes, err)
 		return changes, err
 	})
-	go func() {
-		hup := make(chan os.Signal, 1)
-		signal.Notify(hup, syscall.SIGHUP)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	supervise.Go(ctx, log, "SIGHUP reload", func(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
@@ -219,7 +221,7 @@ func run() error {
 				logReload(log, "SIGHUP", changes, err)
 			}
 		}
-	}()
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -238,7 +240,7 @@ func run() error {
 	errc := make(chan error, 1)
 	if certs != nil {
 		srv.TLSConfig = certs.ServerConfig()
-		go certs.Watch(ctx, 30*time.Second, log)
+		supervise.Go(ctx, log, "certificate reload", func(ctx context.Context) { certs.Watch(ctx, 30*time.Second, log) })
 		go func() {
 			log.Info("siliconrouter listening", "addr", cfg.Listen, "tls", true, "version", version)
 			errc <- srv.ListenAndServeTLS("", "")
@@ -255,8 +257,22 @@ func run() error {
 		return err
 	case <-ctx.Done():
 	}
-	log.Info("shutting down; draining in-flight requests")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Fail readiness first and keep serving for drain_delay, so load
+	// balancers stop sending new requests before the listener closes; a
+	// second signal skips the wait.
+	router.SetDraining(true)
+	if d := cfg.Shutdown.DrainDelay.D(); d > 0 {
+		log.Info("draining: readiness failing; still serving", "for", d)
+		again := make(chan os.Signal, 1)
+		signal.Notify(again, os.Interrupt, syscall.SIGTERM)
+		select {
+		case <-time.After(d):
+		case <-again:
+		}
+		signal.Stop(again)
+	}
+	log.Info("shutting down; finishing in-flight requests", "timeout", cfg.Shutdown.Timeout.D())
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Shutdown.Timeout.D())
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	if dir := cfg.StateDir; dir != "" {

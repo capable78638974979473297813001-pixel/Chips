@@ -15,6 +15,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -79,6 +80,8 @@ type Server struct {
 	clientTokens  *metrics.CounterVec
 	fallbacks     *metrics.CounterVec
 	budgetSpent   *metrics.CounterVec
+	panics        *metrics.CounterVec
+	draining      atomic.Bool
 	retryBudget   *retryBudget
 	duration      *metrics.Histogram
 	queueWait     *metrics.Histogram
@@ -187,6 +190,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), coalesced (shared the answer of an identical request in flight), miss, or skip (not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
+		panics:        reg.NewCounterVec("siliconrouter_panics_total", "Requests that hit a bug in the router (answered 500 and logged with a stack)."),
 		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
 		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
@@ -319,7 +323,27 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+// ServeHTTP serves r. A panic in a handler is logged with its stack and
+// answered with a 500; slots and limits a request held are released by
+// their deferred calls, so a bug in one request leaks nothing.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if v := recover(); v != nil {
+			if v == http.ErrAbortHandler { // net/http's own way to abort a response: let it through
+				panic(v)
+			}
+			s.panics.Inc()
+			s.log.Error("panic serving request", "method", r.Method, "path", r.URL.Path, "panic", fmt.Sprint(v),
+				"stack", string(debug.Stack()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "the router hit an internal error; see its log")
+		}
+	}()
+	s.mux.ServeHTTP(w, r)
+}
+
+// SetDraining makes /readyz fail, so load balancers stop sending new
+// requests while the ones in flight finish (see shutdown.drain_delay).
+func (s *Server) SetDraining(draining bool) { s.draining.Store(draining) }
 
 // RunTracing exports spans until ctx is done (no-op without an endpoint).
 func (s *Server) RunTracing(ctx context.Context) { s.tracer.Run(ctx, 2*time.Second) }
@@ -400,6 +424,10 @@ func clientKey(h http.Header) string {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if s.draining.Load() {
+		http.Error(w, "draining for shutdown", http.StatusServiceUnavailable)
+		return
+	}
 	for _, st := range s.pool.Snapshot() {
 		if st.Healthy && !st.Drained {
 			io.WriteString(w, "ready\n")
@@ -631,6 +659,11 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	for attempt := 1; ; attempt++ {
 		tries++
 		lease, err := s.pool.Acquire(wait.ctx, req)
+		if err == nil {
+			// The paths below release the slot as soon as they are done with
+			// it; this catches any that does not, panics included.
+			defer lease.Release()
+		}
 		if err != nil {
 			if len(fallbacks) > 0 && r.Context().Err() == nil && (errors.Is(err, pool.ErrNoBackend) ||
 				errors.Is(err, pool.ErrQueueFull) || errors.Is(err, pool.ErrShed) || errors.Is(err, context.DeadlineExceeded)) {

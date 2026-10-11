@@ -184,3 +184,22 @@ func TestModelPatterns(t *testing.T) {
 		t.Error("* should match every model")
 	}
 }
+
+func TestShutdownAndRetryDefaults(t *testing.T) {
+	c, err := Parse([]byte(`backends: [{name: a, url: "http://h:1"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Shutdown.Timeout.D() != 60*time.Second || c.Shutdown.DrainDelay != 0 {
+		t.Errorf("shutdown = %+v", c.Shutdown)
+	}
+	if c.Retry.BudgetRatio != 0.2 || c.Retry.BudgetMinPerSecond != 10 {
+		t.Errorf("retry budget = %v, %v", c.Retry.BudgetRatio, c.Retry.BudgetMinPerSecond)
+	}
+	if c.EngineMetrics.StallAfter.D() != time.Minute || c.EngineMetrics.StallMinTokensPerSecond != 1 {
+		t.Errorf("stall = %v, %v", c.EngineMetrics.StallAfter, c.EngineMetrics.StallMinTokensPerSecond)
+	}
+	if _, err := Parse([]byte("backends: [{name: a, url: \"http://h:1\"}]\nshutdown: {drain_delay: -1s}")); err == nil {
+		t.Error("negative drain_delay accepted")
+	}
+}
