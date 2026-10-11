@@ -63,11 +63,23 @@ binary covers machines with and without NVIDIA drivers.
 | Windows x86_64 | Full test suite, both MinGW (under Wine) and MSVC (CI) |
 | macOS, Apple silicon | Full test suite (CI) |
 | macOS, Intel | Compiled; the IOKit GPU path has not run on an Intel Mac |
+| **NVIDIA GeForce RTX 4090** (driver 580, container) | Real hardware: suite passes, readings match `nvidia-smi` idle and under load ([VALIDATION.md](VALIDATION.md)) |
+| **AMD Instinct MI300X** (ROCm, SR-IOV container) | Real hardware: suite passes, readings match `rocm-smi` idle and under load |
 
-Vendor code paths are tested against fakes: a stand-in NVML library that exports the real C
-functions, and fake `/sys` and `/proc` trees, including `/proc/cpuinfo` samples from 12 CPU
-families. **None of it has run on real NVIDIA, AMD, Gaudi, TPU or other accelerator hardware
-yet.** Please report anything that reads wrong on your machines.
+The first real-hardware run found three bugs, all fixed, which the fakes had missed:
+- in containers, every GPU in the host was counted;
+- the MI300X temperature was missing;
+- NVIDIA memory used was about 484 MiB too high.
+
+Other vendor code paths are tested against fakes: a stand-in NVML library that exports the real
+C functions, and fake `/sys` and `/proc` trees, including `/proc/cpuinfo` samples from 12 CPU
+families. **Intel GPUs, Gaudi, Inferentia/Trainium and TPUs have not run on real hardware yet.**
+Please report anything that reads wrong on your machines.
+
+**In containers,** chipagent counts only the GPUs and accelerators whose `/dev/dri` or
+`/dev/accel` nodes the container was given, so on a shared host it reports its own GPUs, not the
+whole machine's. Run it with the host's `/dev` (or with no `/dev/dri` at all) to inventory the
+whole machine.
 
 ### Plugins: any other chip
 

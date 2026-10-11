@@ -12,6 +12,14 @@ using nvmlDevice = struct nvmlDevice_st*;
 struct nvmlMemory {
   unsigned long long total, free, used;
 };
+// nvmlMemory_v2_t (driver 510+) reports memory the driver reserves for
+// itself separately. The v1 call counts it as used, so an idle GPU shows
+// hundreds of MiB in use; v2's used matches nvidia-smi.
+struct nvmlMemoryV2 {
+  unsigned int version;
+  unsigned long long total, reserved, free, used;
+};
+constexpr unsigned int kMemoryV2 = sizeof(nvmlMemoryV2) | (2u << 24);  // NVML_STRUCT_VERSION(Memory, 2)
 struct nvmlUtilization {
   unsigned int gpu, memory;
 };
@@ -33,6 +41,7 @@ class NvmlProvider : public Provider {
                     Sym(handle_, "nvmlDeviceGetHandleByIndex_v2") &&
                     Sym(name_, "nvmlDeviceGetName") && Sym(memory_, "nvmlDeviceGetMemoryInfo");
     if (!required) return false;
+    Sym(memory2_, "nvmlDeviceGetMemoryInfo_v2");
     Sym(util_, "nvmlDeviceGetUtilizationRates");
     Sym(temp_, "nvmlDeviceGetTemperature");
     Sym(power_, "nvmlDeviceGetPowerUsage");
@@ -57,8 +66,13 @@ class NvmlProvider : public Provider {
       char buf[96] = {};
       d.name = name_(h, buf, sizeof buf) == 0 ? buf : "NVIDIA GPU";
       if (uuid_ && uuid_(h, buf, sizeof buf) == 0) d.id = buf;
+      nvmlMemoryV2 mem2{};
+      mem2.version = kMemoryV2;
       nvmlMemory mem{};
-      if (memory_(h, &mem) == 0) {
+      if (memory2_ && memory2_(h, &mem2) == 0) {
+        d.memory_total_bytes = mem2.total;
+        d.memory_used_bytes = mem2.used;
+      } else if (memory_(h, &mem) == 0) {
         d.memory_total_bytes = mem.total;
         d.memory_used_bytes = mem.used;
       }
@@ -87,6 +101,7 @@ class NvmlProvider : public Provider {
   nvmlReturn (*handle_)(unsigned int, nvmlDevice*) = nullptr;
   nvmlReturn (*name_)(nvmlDevice, char*, unsigned int) = nullptr;
   nvmlReturn (*memory_)(nvmlDevice, nvmlMemory*) = nullptr;
+  nvmlReturn (*memory2_)(nvmlDevice, nvmlMemoryV2*) = nullptr;
   nvmlReturn (*util_)(nvmlDevice, nvmlUtilization*) = nullptr;
   nvmlReturn (*temp_)(nvmlDevice, int, unsigned int*) = nullptr;
   nvmlReturn (*power_)(nvmlDevice, unsigned int*) = nullptr;

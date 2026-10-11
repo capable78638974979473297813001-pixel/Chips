@@ -205,6 +205,10 @@ the C++ standard library and POSIX; it needs no CUDA, ROCm or vendor SDK to buil
 
 ## Status and roadmap
 
+Tested on real hardware so far: an NVIDIA RTX 4090 and an AMD MI300X, behind one router. The
+results, including the three bugs the run found and fixed, are in
+[docs/VALIDATION.md](docs/VALIDATION.md).
+
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's built, what's next, and how the open-source and
 commercial editions split.
 

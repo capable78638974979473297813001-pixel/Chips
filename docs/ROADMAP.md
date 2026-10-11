@@ -37,7 +37,7 @@
 
 | Feature | Why it matters |
 |---|---|
-| Real-hardware validation of chipagent and its plugins | Confirm readings on every vendor; everything is tested against fakes and recorded tool output so far |
+| Real-hardware validation beyond NVIDIA and AMD: Intel GPUs, Gaudi, Inferentia/Trainium, TPU, multi-GPU servers | The RTX 4090 and MI300X runs ([VALIDATION.md](VALIDATION.md)) found three bugs the fakes missed |
 
 ## Research track (hard, and not promised)
 
