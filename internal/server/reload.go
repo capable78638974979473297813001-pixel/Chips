@@ -79,6 +79,7 @@ func settingChanges(old, cfg *config.Config) []string {
 		[]any{cfg.Health.Disabled, cfg.Health.Path, cfg.Health.Interval, cfg.Health.Timeout}, "health check schedule")
 	restart([]any{old.Hardware.PollInterval, old.Hardware.Timeout}, []any{cfg.Hardware.PollInterval, cfg.Hardware.Timeout}, "hardware polling schedule")
 	restart(old.Upstream, cfg.Upstream, "upstream timeouts")
+	restart(old.Cluster, cfg.Cluster, "cluster settings")
 	restart([]any{r1.AffinityTTL, r1.AffinityCapacity}, []any{r2.AffinityTTL, r2.AffinityCapacity}, "prefix table size")
 	return out
 }

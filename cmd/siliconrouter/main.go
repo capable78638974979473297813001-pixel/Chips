@@ -137,6 +137,10 @@ func run() error {
 		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
 	}
 	router := server.New(cfg, p, client, log)
+	go router.RunCluster(ctx)
+	if cfg.Cluster.Enabled() {
+		log.Info("cluster mode", "node", cfg.Cluster.NodeName, "peers", cfg.Cluster.Peers)
+	}
 	// reload re-reads the config file and applies it; on any error the
 	// running config stays in place.
 	var reloadMu sync.Mutex

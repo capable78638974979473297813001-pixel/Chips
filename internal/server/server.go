@@ -23,6 +23,7 @@ import (
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/affinity"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/cluster"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
@@ -47,6 +48,7 @@ type Server struct {
 	pool     *pool.Pool
 	affinity *affinity.Table
 	limits   *limits.Tracker
+	cluster  *cluster.Node // nil when this router runs alone
 	client   *http.Client
 	log      *slog.Logger
 	reg      *metrics.Registry
@@ -166,6 +168,10 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
 	s.state.Store(newState(cfg, nil))
+	if c := cfg.Cluster; c.Enabled() {
+		s.cluster = cluster.New(c.NodeName, c.Peers, c.Secret, client, s.affinity, s.limits, log)
+		s.mux.Handle("POST "+cluster.SyncPath, s.cluster)
+	}
 	reg.NewGaugeFunc("siliconrouter_response_cache_bytes", "Bytes held by the response cache.", nil, func(emit func(float64, ...string)) {
 		if c := s.state.Load().cache; c != nil {
 			_, n := c.Stats()
@@ -248,6 +254,14 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+
+// RunCluster keeps this router in step with its peers until ctx is done.
+// It returns at once when no cluster is configured.
+func (s *Server) RunCluster(ctx context.Context) {
+	if s.cluster != nil {
+		s.cluster.Run(ctx, s.conf().Cluster.SyncInterval.D())
+	}
+}
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -524,6 +538,9 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode < 400 && len(keys) > 0 {
 			s.affinity.Record(keys, b.Name)
+			if s.cluster != nil {
+				s.cluster.Note(keys, b.Name)
+			}
 		}
 		if len(keys) > 0 {
 			switch {

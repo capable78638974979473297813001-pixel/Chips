@@ -56,7 +56,24 @@ type Config struct {
 	Cache        Cache     `yaml:"cache"`
 	Models       Models    `yaml:"models"`
 	TLS          TLS       `yaml:"tls"`
+	Cluster      Cluster   `yaml:"cluster"`
 }
+
+// Cluster lets several routers behind one load balancer act as one: they
+// share which backend holds each conversation's cache and how many tokens
+// each client used today, so either router routes a follow-up turn to the
+// right backend and daily quotas hold across the fleet.
+type Cluster struct {
+	// Peers are the other routers' base URLs (this router may be listed too;
+	// it skips itself by node name).
+	Peers        []string `yaml:"peers"`
+	NodeName     string   `yaml:"node_name"` // default: hostname
+	Secret       string   `yaml:"secret"`
+	SecretEnv    string   `yaml:"secret_env"`
+	SyncInterval Duration `yaml:"sync_interval"`
+}
+
+func (c Cluster) Enabled() bool { return len(c.Peers) > 0 }
 
 // TLS serves the router over HTTPS. Certificate files are re-read when they
 // change, so rotation (cert-manager, Let's Encrypt) needs no restart.
@@ -336,6 +353,12 @@ func (c *Config) applyDefaults() {
 	if c.Upstream.DialTimeout == 0 {
 		c.Upstream.DialTimeout = Duration(5 * time.Second)
 	}
+	if c.Cluster.SyncInterval == 0 {
+		c.Cluster.SyncInterval = Duration(time.Second)
+	}
+	if c.Cluster.NodeName == "" {
+		c.Cluster.NodeName, _ = os.Hostname()
+	}
 	hw := &c.Hardware
 	if hw.PollInterval == 0 {
 		hw.PollInterval = Duration(10 * time.Second)
@@ -367,6 +390,9 @@ func (c *Config) resolveEnv() {
 	}
 	if c.Auth.AdminKeysEnv != "" {
 		c.Auth.AdminKeys = append(c.Auth.AdminKeys, splitEnv(c.Auth.AdminKeysEnv)...)
+	}
+	if c.Cluster.SecretEnv != "" {
+		c.Cluster.Secret = os.Getenv(c.Cluster.SecretEnv)
 	}
 	for i := range c.Auth.Keys {
 		if k := &c.Auth.Keys[i]; k.KeyEnv != "" {
@@ -473,6 +499,16 @@ func (c *Config) validate() error {
 	}
 	if v := c.TLS.MinVersion; v != "" && v != "1.2" && v != "1.3" {
 		errs = append(errs, fmt.Errorf("tls.min_version must be 1.2 or 1.3, got %q", v))
+	}
+	if c.Cluster.Enabled() {
+		if len(c.Cluster.Secret) < 16 {
+			errs = append(errs, errors.New("cluster: a secret of at least 16 characters is required (secret or secret_env)"))
+		}
+		for i, p := range c.Cluster.Peers {
+			if u, err := url.Parse(p); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("cluster.peers[%d]: must be an absolute http(s) URL, got %q", i, p))
+			}
+		}
 	}
 	if m := c.Cache.Mode; m != "deterministic" && m != "all" {
 		errs = append(errs, fmt.Errorf("cache.mode must be deterministic or all, got %q", m))
