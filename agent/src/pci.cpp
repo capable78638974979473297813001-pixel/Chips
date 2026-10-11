@@ -113,6 +113,24 @@ std::optional<fs::path> Hwmon(const fs::path& dev) {
   return dirs.front();
 }
 
+// Temperature(hwmon) reads the GPU's temperature in degrees C. Drivers
+// number their sensors differently (MI300X has no temp1, only junction and
+// memory), so the sensor is chosen by label: edge, else junction, else the
+// lowest-numbered one present.
+std::optional<double> Temperature(const fs::path& hw) {
+  std::optional<double> edge, junction, first;
+  for (int i = 1; i <= 16; ++i) {
+    auto t = ReadUint(hw / ("temp" + std::to_string(i) + "_input"));
+    if (!t) continue;
+    double c = *t / 1000.0;  // millidegrees
+    std::string label = ReadLine(hw / ("temp" + std::to_string(i) + "_label")).value_or("");
+    if (label == "edge" && !edge) edge = c;
+    if ((label == "junction" || label == "hotspot") && !junction) junction = c;
+    if (!first) first = c;
+  }
+  return edge ? edge : junction ? junction : first;
+}
+
 class PciProvider : public Provider {
  public:
   PciProvider(fs::path root, bool skip_nvidia) : root_(std::move(root)), skip_nvidia_(skip_nvidia) {}
@@ -133,6 +151,7 @@ class PciProvider : public Provider {
       unsigned device = static_cast<unsigned>(ReadUint(dev / "device", 16).value_or(0));
       PciIdentity pid = ClassifyPci(static_cast<unsigned>(*vendor), device, static_cast<unsigned>(*cls));
       if (pid.vendor.empty() || (skip_nvidia_ && *vendor == kVendorNvidia)) continue;
+      if (!Assigned(dev)) continue;
 
       Device d;
       d.vendor = pid.vendor;
@@ -148,7 +167,7 @@ class PciProvider : public Provider {
       d.memory_used_bytes = ReadUint(dev / "mem_info_vram_used").value_or(0);
       if (auto busy = ReadUint(dev / "gpu_busy_percent")) d.utilization_percent = static_cast<double>(*busy);
       if (auto hw = Hwmon(dev)) {
-        if (auto t = ReadUint(*hw / "temp1_input")) d.temperature_c = *t / 1000.0;  // millidegrees
+        d.temperature_c = Temperature(*hw);
         auto p = ReadUint(*hw / "power1_average");
         if (!p) p = ReadUint(*hw / "power1_input");
         if (p) d.power_watts = *p / 1e6;  // microwatts
@@ -159,6 +178,27 @@ class PciProvider : public Provider {
   }
 
  private:
+  // Assigned reports whether this machine (or container) may use dev. In a
+  // container, sysfs lists every device on the host, but only the devices
+  // passed in have nodes under /dev. A device with DRM nodes (/dev/dri:
+  // AMD, Intel and most GPUs) or compute-accelerator nodes (/dev/accel)
+  // counts only when one of them is present. Without that /dev directory
+  // there is no telling, and the device counts.
+  bool Assigned(const fs::path& dev) const {
+    static const std::pair<const char*, const char*> kNodes[] = {{"drm", "dev/dri"}, {"accel", "dev/accel"}};
+    for (const auto& [sub, devdir] : kNodes) {
+      std::error_code ec;
+      std::vector<std::string> nodes;
+      for (const auto& e : fs::directory_iterator(dev / sub, ec)) nodes.push_back(e.path().filename().string());
+      if (nodes.empty() || !fs::is_directory(root_ / devdir, ec)) continue;
+      for (const auto& n : nodes) {
+        if (fs::exists(root_ / devdir / n, ec)) return true;
+      }
+      return false;
+    }
+    return true;
+  }
+
   fs::path root_;
   bool skip_nvidia_;
 };

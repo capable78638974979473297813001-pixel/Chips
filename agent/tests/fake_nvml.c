@@ -19,6 +19,10 @@ typedef struct {
   unsigned long long total, free, used;
 } nvmlMemory_t;
 typedef struct {
+  unsigned int version;
+  unsigned long long total, reserved, free, used;
+} nvmlMemory_v2_t;
+typedef struct {
   unsigned int gpu, memory;
 } nvmlUtilization_t;
 
@@ -52,6 +56,17 @@ EXPORT int nvmlDeviceGetMemoryInfo(fake_device* h, nvmlMemory_t* m) {
   m->total = h->index == 0 ? 85899345920ull : 24159191040ull;
   m->used = h->index == 0 ? 42949672960ull : 0;
   m->free = m->total - m->used;
+  return 0;
+}
+/* Like the real driver: the v1 call counts the driver's reserved memory as
+ * used, v2 reports it apart. Only device 0 has v2, as if on an old driver. */
+EXPORT int nvmlDeviceGetMemoryInfo_v2(fake_device* h, nvmlMemory_v2_t* m) {
+  if (m->version != (sizeof(nvmlMemory_v2_t) | (2u << 24))) return 25; /* NVML_ERROR_ARGUMENT_VERSION_MISMATCH */
+  if (h->index != 0) return 3;                                         /* NVML_ERROR_NOT_SUPPORTED */
+  m->total = 85899345920ull;
+  m->reserved = 536870912ull;
+  m->used = 42949672960ull - m->reserved;
+  m->free = m->total - m->reserved - m->used;
   return 0;
 }
 EXPORT int nvmlDeviceGetUtilizationRates(fake_device* h, nvmlUtilization_t* u) {

@@ -205,6 +205,39 @@ static void TestPci() {
   }
   CHECK(chipagent::OpenPci((root / "missing").string(), true)->Devices().empty());
   fs::remove_all(root);
+
+  // In a container, sysfs shows the whole host: only devices whose /dev
+  // nodes were passed in count. Seen on a RunPod MI300X with eight GPUs in
+  // the host and one in the container.
+  root = TempDir("pci-container");
+  pci = root / "sys/bus/pci/devices";
+  fs::path mine = dev("0000:05:00.0", "0x1002", "0x74a1", "0x120000");
+  fs::path theirs = dev("0000:26:00.0", "0x1002", "0x74a1", "0x120000");
+  fs::path gaudi = dev("0000:51:00.0", "0x1da3", "0x1020", "0x120000");
+  dev("0000:6b:00.0", "0x1a03", "0x2000", "0x030000");  // BMC graphics without a DRM node: kept
+  for (const char* n : {"card1", "renderD128"}) fs::create_directories(mine / "drm" / n);
+  for (const char* n : {"card2", "renderD129"}) fs::create_directories(theirs / "drm" / n);
+  fs::create_directories(gaudi / "accel/accel0");
+  // MI300X sensors: junction and memory, no temp1.
+  Write(mine / "hwmon/hwmon2/temp2_input", "44000\n");
+  Write(mine / "hwmon/hwmon2/temp2_label", "junction\n");
+  Write(mine / "hwmon/hwmon2/temp3_input", "41000\n");
+  Write(mine / "hwmon/hwmon2/temp3_label", "mem\n");
+  auto ids = [](const std::vector<chipagent::Device>& v) {
+    std::string s;
+    for (const auto& d : v) s += d.id + " ";
+    return s;
+  };
+  // No /dev/dri or /dev/accel to compare with: everything counts.
+  CHECK_EQ(ids(chipagent::OpenPci(root.string(), true)->Devices()),
+           std::string("0000:05:00.0 0000:26:00.0 0000:51:00.0 0000:6b:00.0 "));
+  Write(root / "dev/dri/card1", "");
+  Write(root / "dev/dri/renderD128", "");
+  fs::create_directories(root / "dev/accel");
+  ds = chipagent::OpenPci(root.string(), true)->Devices();
+  CHECK_EQ(ids(ds), std::string("0000:05:00.0 0000:6b:00.0 "));
+  if (!ds.empty()) CHECK(ds[0].temperature_c && *ds[0].temperature_c == 44);
+  fs::remove_all(root);
 }
 
 static void TestDeviceTree() {
@@ -327,7 +360,8 @@ static void TestNvml() {
   CHECK_EQ(ds[0].name, std::string("NVIDIA H100 80GB HBM3"));
   CHECK_EQ(ds[0].id, std::string("GPU-aaaa"));
   CHECK_EQ(ds[0].memory_total_bytes, uint64_t(85899345920));
-  CHECK_EQ(ds[0].memory_used_bytes, uint64_t(42949672960));
+  CHECK_EQ(ds[0].memory_used_bytes, uint64_t(42949672960 - 536870912));  // v2: without driver-reserved memory
+  CHECK_EQ(ds[1].memory_total_bytes, uint64_t(24159191040));               // v1 fallback
   CHECK(ds[0].utilization_percent && *ds[0].utilization_percent == 87);
   CHECK(ds[0].temperature_c && *ds[0].temperature_c == 61);
   CHECK(ds[0].power_watts && std::fabs(*ds[0].power_watts - 512.5) < 1e-9);
