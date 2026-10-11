@@ -102,6 +102,7 @@ func settingChanges(old, cfg *config.Config) []string {
 	changed(old.Queue, cfg.Queue, "updated queue settings")
 	changed(old.Retry, cfg.Retry, "updated retry settings")
 	changed(old.MaxBodyBytes, cfg.MaxBodyBytes, "updated max_body_bytes")
+	changed(old.EngineMetrics.KVSaturated, cfg.EngineMetrics.KVSaturated, "updated engine_metrics.kv_saturated")
 	changed([]any{old.Hardware.HeavyMinMemoryGiB, old.Hardware.StandardMinMemoryGiB},
 		[]any{cfg.Hardware.HeavyMinMemoryGiB, cfg.Hardware.StandardMinMemoryGiB}, "updated hardware tier thresholds")
 	r1, r2 := old.Routing, cfg.Routing
@@ -117,6 +118,7 @@ func settingChanges(old, cfg *config.Config) []string {
 		[]any{cfg.Health.Disabled, cfg.Health.Path, cfg.Health.Interval, cfg.Health.Timeout}, "health check schedule")
 	restart([]any{old.Hardware.PollInterval, old.Hardware.Timeout}, []any{cfg.Hardware.PollInterval, cfg.Hardware.Timeout}, "hardware polling schedule")
 	restart(old.Upstream, cfg.Upstream, "upstream timeouts")
+	restart([]any{old.EngineMetrics.Interval, old.EngineMetrics.Timeout}, []any{cfg.EngineMetrics.Interval, cfg.EngineMetrics.Timeout}, "engine metrics schedule")
 	restart(old.Cluster, cfg.Cluster, "cluster settings")
 	restart(old.Tracing, cfg.Tracing, "tracing settings")
 	restart(old.StateDir, cfg.StateDir, "state_dir")

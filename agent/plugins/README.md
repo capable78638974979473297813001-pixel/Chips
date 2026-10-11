@@ -25,7 +25,17 @@ the agent.
 |---|---|---|---|
 | `gaudi-hl-smi.sh` | Intel Gaudi (Habana) | `hl-smi` | name, PCI address, memory, utilization, temperature, power |
 | `aws-neuron.py` | AWS Inferentia / Trainium | `neuron-ls`, Python 3 | device, NeuronCore count, memory |
+| `intel-xpu-smi.py` | Intel Data Center GPU Max and Flex, and other GPUs `xpu-smi` supports | `xpu-smi`, Python 3 | name, PCI address, memory total and used, utilization, temperature, power |
+| `google-tpu.py` | Google Cloud TPU v2 to v6e, on TPU VMs | Python 3; `tpu-info` (pip) for usage | generation, PCI address, HBM; HBM used and duty cycle while a workload runs |
 
-**Both are tested only against sample output of the vendor tools**
-(`agent/tests/agent_test.cpp`), not on real Gaudi or Neuron hardware. Run the plugin by hand on
-such a machine and compare the output with the vendor tool before relying on it.
+**Devices are merged by PCI address.** chipagent already lists every PCI accelerator itself. When
+a plugin reports the same PCI address, its readings fill in that device instead of adding a second
+one, so a fleet's accelerator count stays right. Report `id` as the PCI address (`0000:3b:00.0`, or
+`3b:00.0`) whenever the vendor tool gives one. Plugins that read `/sys` themselves should honor
+`CHIPAGENT_SYSFS_ROOT`, which chipagent sets to its `--sysfs-root`.
+
+**All four are tested only against sample output of the vendor tools**
+(`agent/tests/agent_test.cpp`), not on real Gaudi, Neuron, Intel GPU or TPU hardware. The TPU
+plugin's usage readings come from the `tpu-info` package's Python API
+(`device.get_local_chips`, `metrics.get_chip_usage`), which the tests stand in for. Run a plugin by
+hand on such a machine and compare its output with the vendor tool before relying on it.

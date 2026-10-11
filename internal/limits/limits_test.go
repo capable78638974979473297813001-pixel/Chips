@@ -158,32 +158,69 @@ func TestClusterWideConcurrency(t *testing.T) {
 	r2()
 }
 
-func TestClusterSplitsRequestRate(t *testing.T) {
+func burst(tr *Tracker, n int) int {
+	admitted := 0
+	for range n {
+		if r, rej := tr.Admit("team"); rej == nil {
+			admitted++
+			r()
+		}
+	}
+	return admitted
+}
+
+func TestClusterSharesRateByDemand(t *testing.T) {
 	tr, clk := newTracker(Limits{RequestsPerMinute: 60})
 	tr.SetPeerTTL(3 * time.Second)
+
+	// Peers are live but see none of this client's traffic: this router
+	// gets almost the whole rate (all but the peers' even floor).
 	tr.SetRemote("router-b", nil)
 	tr.SetRemote("router-c", map[string]Daily{})
-	admitted := 0
-	for range 60 {
-		if r, rej := tr.Admit("team"); rej == nil {
-			admitted++
-			r()
-		}
+	if got := burst(tr, 100); got < 50 || got > 54 { // 60 * (0.2/3 + 0.8)
+		t.Errorf("sole demand among 3 routers: %d admitted, want about 52", got)
 	}
-	if admitted != 20 {
-		t.Errorf("burst with 3 live routers: %d admitted, want 20", admitted)
+
+	// The client's traffic moves to the peers: this router's share shrinks
+	// to about its floor.
+	clk.t = clk.t.Add(time.Minute)
+	tr.SetRemote("router-b", map[string]Daily{"team": {Demand: 5000}})
+	tr.SetRemote("router-c", map[string]Daily{"team": {Demand: 5000}})
+	if got := burst(tr, 100); got < 4 || got > 6 { // 60 * 0.2/3 plus a sliver of demand
+		t.Errorf("little demand here: %d admitted, want about 4", got)
 	}
+
+	// Even demand everywhere: an even split.
+	clk.t = clk.t.Add(time.Minute)
+	local := tr.Snapshot()[0].Demand
+	tr.SetRemote("router-b", map[string]Daily{"team": {Demand: local}})
+	tr.SetRemote("router-c", map[string]Daily{"team": {Demand: local}})
+	if u := tr.Snapshot()[0]; u.RateShare < 19 || u.RateShare > 21 {
+		t.Errorf("even demand: share %.1f, want 20", u.RateShare)
+	}
+
 	// With the peers gone, this router gets the whole rate back.
 	clk.t = clk.t.Add(time.Minute)
-	admitted = 0
-	for range 60 {
-		if r, rej := tr.Admit("team"); rej == nil {
-			admitted++
-			r()
-		}
+	if got := burst(tr, 100); got != 60 {
+		t.Errorf("burst alone: %d admitted, want 60", got)
 	}
-	if admitted != 60 {
-		t.Errorf("burst alone: %d admitted, want 60", admitted)
+}
+
+func TestDemandTracksAttempts(t *testing.T) {
+	tr, clk := newTracker(Limits{RequestsPerMinute: 1000})
+	for range 120 { // 2 requests a second for a minute
+		burst(tr, 1)
+		clk.t = clk.t.Add(500 * time.Millisecond)
+	}
+	if d := tr.Snapshot()[0].Demand; d < 100 || d > 125 { // approaching 120/min, with a 30s time constant
+		t.Errorf("demand = %.1f/min, want about 105", d)
+	}
+	if d := tr.LocalDaily()["team"].Demand; d < 100 {
+		t.Errorf("reported demand = %.1f", d)
+	}
+	clk.t = clk.t.Add(5 * time.Minute)
+	if d := tr.Snapshot()[0].Demand; d > 1 {
+		t.Errorf("demand did not decay: %.1f", d)
 	}
 }
 

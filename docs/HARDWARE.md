@@ -78,9 +78,14 @@ machine's devices as JSON in chipagent's schema.
 chipagent --plugin /opt/chipagent/plugins/gaudi-hl-smi.sh --plugin "/opt/chipagent/plugins/aws-neuron.py"
 ```
 
-Two plugins are included:
+Four plugins are included:
 - Intel Gaudi, via `hl-smi`;
-- AWS Inferentia and Trainium, via `neuron-ls`.
+- AWS Inferentia and Trainium, via `neuron-ls`;
+- Intel data center GPUs (Max, Flex), via `xpu-smi`;
+- Google Cloud TPUs, from PCI plus `tpu-info` for HBM use and duty cycle.
+
+A plugin's device and chipagent's own PCI listing of the same card are merged by PCI address, so
+nothing is counted twice.
 
 Writing one for another accelerator is a short script around its vendor tool. A plugin that hangs
 is killed after `--plugin-timeout` (default 5 s), and bad output is logged and skipped. See

@@ -38,8 +38,10 @@ endpoint.
    [docs/HARDWARE.md](docs/HARDWARE.md).
 5. **Stays fast.** A streaming request whose backend stalls is moved to another backend before the
    user sees anything. Equally loaded nodes are chosen by how fast they have actually been
-   answering. Repeated embeddings and temperature-0 requests can be answered from a response cache
-   in under a millisecond. Interactive traffic can be given priority over batch jobs. See
+   answering. With `metrics_path`, the router also reads each engine's own queue and KV-cache usage
+   (vLLM, SGLang, TGI, llama.cpp, Triton), so it steers around engines that are backing up, even
+   because of traffic it didn't send. Repeated embeddings and temperature-0 requests can be
+   answered from a response cache in under a millisecond. Interactive traffic can be given priority over batch jobs. See
    [docs/TUNING.md](docs/TUNING.md).
 6. **Ready for a platform team.** Built-in HTTPS with certificate hot-swap and optional mutual TLS,
    separate admin keys, per-team limits (concurrency, requests per minute, tokens per day, allowed
@@ -187,6 +189,7 @@ internal/affinity   prefix → backend LRU table
 internal/cache      response cache (LRU, byte budget, TTL, request coalescing, persistence)
 internal/cluster    multi-router sync of prefix affinity, usage and in-flight counts
 internal/discovery  backends from DNS A/AAAA and SRV records
+internal/engine     inference engines' Prometheus metrics (queue depth, KV usage)
 internal/tracing    W3C trace context and OTLP/HTTP span export
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload

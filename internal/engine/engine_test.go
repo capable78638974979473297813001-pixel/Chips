@@ -1,0 +1,113 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+const vllm = `# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 12.0
+vllm:num_requests_running{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 9.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
+vllm:num_requests_waiting{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.0
+# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.82
+vllm:kv_cache_usage_perc{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.4
+vllm:prompt_tokens_total{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 123456.0
+vllm:e2e_request_latency_seconds_bucket{engine="0",le="0.3",model_name="m"} 4.0
+`
+
+const sglang = `# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="Qwen/Qwen2.5-7B"} 31.0
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="Qwen/Qwen2.5-7B"} 0.0
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="Qwen/Qwen2.5-7B"} 0.27
+`
+
+const tgi = `# TYPE tgi_queue_size gauge
+tgi_queue_size 5
+# TYPE tgi_batch_current_size gauge
+tgi_batch_current_size 32
+tgi_request_count 1000
+`
+
+const llamacpp = `# HELP llamacpp:kv_cache_usage_ratio KV-cache usage. 1 means 100 percent usage.
+# TYPE llamacpp:kv_cache_usage_ratio gauge
+llamacpp:kv_cache_usage_ratio 0.125
+llamacpp:requests_processing 2
+llamacpp:requests_deferred 1
+`
+
+const triton = `nv_inference_pending_request_count{model="resnet",version="1"} 4
+nv_inference_pending_request_count{model="bert",version="2"} 1
+`
+
+func TestParse(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want Stats
+	}{
+		"vllm":     {vllm, Stats{Engine: "vllm", Running: 21, Waiting: 3, KVUsage: 0.82}},
+		"sglang":   {sglang, Stats{Engine: "sglang", Running: 31, Waiting: 0, KVUsage: 0.27}},
+		"tgi":      {tgi, Stats{Engine: "tgi", Running: 32, Waiting: 5, KVUsage: -1}},
+		"llamacpp": {llamacpp, Stats{Engine: "llamacpp", Running: 2, Waiting: 1, KVUsage: 0.125}},
+		"triton":   {triton, Stats{Engine: "triton", Running: -1, Waiting: 5, KVUsage: -1}},
+		"vllm v0 name, timestamps and odd labels": {
+			"vllm:gpu_cache_usage_perc{model_name=\"a } b\",x=\"q\\\"}\"} 0.5 1712345678000\nvllm:num_requests_waiting 2\n",
+			Stats{Engine: "vllm", Running: -1, Waiting: 2, KVUsage: 0.5}},
+		"bad values ignored": {"vllm:num_requests_waiting NaN\nvllm:num_requests_running -3\nvllm:num_requests_running 4\n",
+			Stats{Engine: "vllm", Running: 4, Waiting: 0, KVUsage: -1}},
+	} {
+		got, err := Parse(strings.NewReader(tc.body))
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %+v, %v; want %+v", name, got, err, tc.want)
+		}
+	}
+	if _, err := Parse(strings.NewReader("go_goroutines 12\nprocess_cpu_seconds_total 3\n")); !errors.Is(err, ErrNoMetrics) {
+		t.Errorf("unknown metrics: err = %v", err)
+	}
+}
+
+func TestFetch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer k" {
+			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(sglang))
+	}))
+	defer ts.Close()
+	u, _ := url.Parse(ts.URL + "/metrics")
+	auth := func(h http.Header) { h.Set("Authorization", "Bearer k") }
+	if st, err := Fetch(context.Background(), ts.Client(), u, auth); err != nil || st.Running != 31 {
+		t.Errorf("Fetch = %+v, %v", st, err)
+	}
+	if _, err := Fetch(context.Background(), ts.Client(), u, nil); err == nil {
+		t.Error("401 not reported as an error")
+	}
+}
+
+func FuzzParse(f *testing.F) {
+	for _, s := range []string{vllm, sglang, tgi, llamacpp, triton, "a{b=\"\\\"} 1", "x{"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		st, err := Parse(strings.NewReader(s))
+		if err != nil {
+			return
+		}
+		if st.KVUsage > 1 || st.Waiting < 0 || (st.Running < 0 && st.Running != -1) || (st.KVUsage < 0 && st.KVUsage != -1) {
+			t.Fatalf("out of range: %+v from %q", st, s)
+		}
+	})
+}

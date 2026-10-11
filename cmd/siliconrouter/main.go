@@ -142,6 +142,12 @@ func run() error {
 		agents.PollAll(ctx) // tier auto backends before taking traffic
 	}
 	go agents.Run(ctx) // also covers agents that a reload or discovery adds later
+	go (&pool.EngineScraper{
+		Pool:     p,
+		Client:   client,
+		Interval: cfg.EngineMetrics.Interval.D(),
+		Timeout:  cfg.EngineMetrics.Timeout.D(),
+	}).Run(ctx)
 	for _, st := range p.Snapshot() {
 		attrs := []any{"name", st.Name, "url", st.URL, "tier", st.Tier, "tier_source", st.TierSource,
 			"healthy", st.Healthy, "max_concurrency", st.MaxConcurrency, "models", st.Models}

@@ -15,6 +15,7 @@
 | **Prefix-cache routing** | Re-reading a whole conversation on every turn | `routing.prefix_affinity` (default on) |
 | **Fair queue + backpressure** | Overloading a GPU until every request on it crawls | `max_concurrency`, `queue.*` |
 | **Hardware tiers** | Small requests waiting behind big ones on the big GPUs | `tier` / `tier: auto` |
+| **Engine-aware routing** | Sending work to an engine whose own queue is backing up or whose KV cache is full, including from load the router can't see | backend `metrics_path` |
 
 ### First-token failover
 
@@ -57,6 +58,45 @@ then computes its own.
 By default each API key has its own cache, so one tenant never receives another's answers. Set
 `share_across_keys: true` when every key belongs to the same team. The cache stores hashes of
 requests, never the prompts themselves, but it does hold responses in memory.
+
+### Engine-aware routing
+
+```yaml
+backends:
+  - {name: h100-1, url: "http://10.0.0.11:8000", metrics_path: /metrics}   # vLLM, SGLang, TGI
+  - {name: mac-1, url: "http://10.0.0.20:8080", metrics_path: /metrics}    # llama.cpp --metrics
+engine_metrics:
+  interval: 2s
+  timeout: 1s
+  kv_saturated: 0.95    # KV-cache usage at which an engine counts as full
+```
+
+The router counts its own requests, but it can't see:
+- traffic from other routers or from clients that call an engine directly;
+- how full each engine's KV cache is. GPU memory from chipagent doesn't show it, because engines
+  reserve their memory up front.
+
+With `metrics_path`, the router scrapes each engine's Prometheus metrics: requests running and
+waiting, and KV-cache usage. It understands the metric names of:
+- vLLM, `vllm:num_requests_*` and `vllm:kv_cache_usage_perc` (or `gpu_cache_usage_perc` on v0);
+- SGLang, `sglang:num_running_reqs`, `num_queue_reqs` and `token_usage`;
+- TGI, `tgi_queue_size` and `tgi_batch_current_size`;
+- llama.cpp started with `--metrics`, `llamacpp:requests_*` and `kv_cache_usage_ratio`;
+- Triton, `nv_inference_pending_request_count`.
+
+The readings affect routing in three ways:
+- **Saturated engines go last.** An engine that is queueing requests internally, or whose KV cache
+  is at `kv_saturated` or above, gets new work only when no other suitable backend has room. Extra
+  work there would only wait inside the engine, or evict other conversations' cache.
+- **The busiest view wins.** Within a tier, a backend's load is the higher of the router's own slot
+  use and what its engine reports (requests running and waiting against `max_concurrency`, and KV
+  usage).
+- **A saturated prefix-cache holder is passed over** for a backend with room.
+
+Readings older than three intervals are ignored, so a failing scrape never pins traffic.
+`/admin/backends` shows each engine's state, and three gauges report it:
+`siliconrouter_backend_engine_waiting`, `..._kv_cache_usage` and `..._saturated`. Engines without
+these metrics (Ollama, most custom servers) are routed on the router's own counts, as before.
 
 ### Prompt sizes and context limits
 

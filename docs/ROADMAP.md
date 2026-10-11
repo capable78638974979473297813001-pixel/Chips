@@ -26,6 +26,10 @@
 - Fleet operations: drain/undrain backends for maintenance, priority load shedding, model
   fallbacks, per-key model allow-lists and token caps, DNS/SRV backend discovery, and cluster-wide
   concurrency and rate limits
+- Engine-aware routing from vLLM, SGLang, TGI, llama.cpp and Triton metrics (queue depth and KV
+  usage), and demand-weighted cluster rate limits
+- chipagent plugins for Gaudi, Inferentia/Trainium, Intel data center GPUs and Google TPUs, merged
+  with chipagent's own PCI listing
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
@@ -33,9 +37,7 @@
 
 | Feature | Why it matters |
 |---|---|
-| Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
-| Real-hardware validation of chipagent and its plugins; TPU and Intel GPU plugins | Confirm readings on every vendor |
-| Demand-weighted rate shares in cluster mode | Rates are split evenly across routers today, which under-admits behind sticky load balancing |
+| Real-hardware validation of chipagent and its plugins | Confirm readings on every vendor; everything is tested against fakes and recorded tool output so far |
 
 ## Research track (hard, and not promised)
 

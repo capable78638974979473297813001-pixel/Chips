@@ -42,9 +42,14 @@ type Usage struct {
 	ClusterTokensToday int64 `json:"cluster_tokens_today"`
 	// ClusterInFlight adds the requests peer routers last reported in
 	// flight for this client; max_concurrent is checked against it.
-	ClusterInFlight int    `json:"cluster_in_flight"`
-	TokensPerDay    int64  `json:"tokens_per_day,omitempty"`
-	Day             string `json:"day"` // UTC date TokensToday counts
+	ClusterInFlight int `json:"cluster_in_flight"`
+	// Demand is recent request attempts per minute on this router, and
+	// RateShare this router's current part of requests_per_minute (the
+	// whole limit unless peers are live).
+	Demand       float64 `json:"demand_per_minute"`
+	RateShare    float64 `json:"rate_share_per_minute,omitempty"`
+	TokensPerDay int64   `json:"tokens_per_day,omitempty"`
+	Day          string  `json:"day"` // UTC date TokensToday counts
 }
 
 type client struct {
@@ -54,6 +59,33 @@ type client struct {
 	refilled time.Time
 	usage    Usage
 	day      time.Time // UTC midnight starting the current quota day
+	// demand is a decaying average of this client's request attempts per
+	// minute (admitted or not) as of demandAt; see demandTau.
+	demand   float64
+	demandAt time.Time
+}
+
+// demandTau is the time constant of the demand average: a client's demand
+// follows a change in its traffic within about this long.
+const demandTau = 30 * time.Second
+
+// evenFloor is the part of a cluster-wide rate split evenly between live
+// routers whatever their demand, so a router whose traffic just started
+// can admit some requests at once; the rest is split by demand.
+const evenFloor = 0.2
+
+// demandNow is the client's demand, decayed to now.
+func (c *client) demandNow(now time.Time) float64 {
+	if dt := now.Sub(c.demandAt); dt > 0 {
+		return c.demand * math.Exp(-dt.Seconds()/demandTau.Seconds())
+	}
+	return c.demand
+}
+
+// noteAttempt adds one request attempt to the client's demand.
+func (c *client) noteAttempt(now time.Time) {
+	c.demand = c.demandNow(now) + 60/demandTau.Seconds()
+	c.demandAt = now
 }
 
 // Daily is one client's token use on one UTC day, as exchanged between
@@ -63,6 +95,9 @@ type Daily struct {
 	Tokens int64  `json:"tokens"`
 	// InFlight is the client's requests in progress on the reporting router.
 	InFlight int `json:"in_flight,omitempty"`
+	// Demand is the client's recent request attempts per minute on the
+	// reporting router, admitted or not.
+	Demand float64 `json:"demand,omitempty"`
 }
 
 // Tracker holds every client's limits and counters. Safe for concurrent use.
@@ -105,6 +140,31 @@ func (t *Tracker) livePeersLocked(now time.Time) int {
 	return n
 }
 
+// rateShareLocked is this router's part of a client's requests_per_minute
+// limit. Alone, it is the whole limit. With live peers, evenFloor of it is
+// split evenly and the rest in proportion to each router's recent demand,
+// so routers that receive more of the client's traffic admit more of it
+// and the fleet as a whole admits about the configured rate, however
+// unevenly the load balancer spreads the client.
+func (t *Tracker) rateShareLocked(name string, c *client, limit float64, now time.Time) float64 {
+	peers := t.livePeersLocked(now)
+	if peers == 0 {
+		return limit
+	}
+	routers := float64(1 + peers)
+	local := c.demandNow(now)
+	total := local
+	for peer, byClient := range t.remote {
+		if now.Sub(t.seen[peer]) <= t.peerTTL {
+			total += byClient[name].Demand
+		}
+	}
+	if total <= 0 {
+		return limit / routers
+	}
+	return limit * (evenFloor/routers + (1-evenFloor)*local/total)
+}
+
 // remoteInFlightLocked sums live peers' in-flight requests for name.
 func (t *Tracker) remoteInFlightLocked(name string, now time.Time) int {
 	if t.peerTTL <= 0 {
@@ -127,7 +187,8 @@ func (t *Tracker) LocalDaily() map[string]Daily {
 	out := make(map[string]Daily, len(t.clients))
 	for name, c := range t.clients {
 		t.rollDayLocked(c, t.now())
-		out[name] = Daily{Day: c.day.Format(dayFormat), Tokens: c.usage.TokensToday, InFlight: c.inflight}
+		out[name] = Daily{Day: c.day.Format(dayFormat), Tokens: c.usage.TokensToday, InFlight: c.inflight,
+			Demand: math.Round(c.demandNow(t.now())*100) / 100}
 	}
 	return out
 }
@@ -205,9 +266,10 @@ func (t *Tracker) Admit(name string) (release func(), rejected *Rejection) {
 		return reject(&Rejection{"quota_exceeded", "daily token quota for this API key is used up",
 			c.day.Add(24 * time.Hour).Sub(now)})
 	}
+	c.noteAttempt(now)
 	if l.RequestsPerMinute > 0 {
 		// This router's share of the rate, when peers are live.
-		share := float64(l.RequestsPerMinute) / float64(1+t.livePeersLocked(now))
+		share := t.rateShareLocked(name, c, float64(l.RequestsPerMinute), now)
 		rate := share / 60 // per second
 		capacity := math.Max(1, share)
 		c.bucket = math.Min(capacity, c.bucket+now.Sub(c.refilled).Seconds()*rate)
@@ -264,6 +326,10 @@ func (t *Tracker) Snapshot() []Usage {
 		u.Day = c.day.Format(dayFormat)
 		u.ClusterTokensToday = u.TokensToday + t.remoteTodayLocked(c.usage.Client, t.now())
 		u.ClusterInFlight = c.inflight + t.remoteInFlightLocked(c.usage.Client, t.now())
+		u.Demand = math.Round(c.demandNow(t.now())*100) / 100
+		if rpm := c.limits.RequestsPerMinute; rpm > 0 {
+			u.RateShare = math.Round(t.rateShareLocked(c.usage.Client, c, float64(rpm), t.now())*100) / 100
+		}
 		out = append(out, u)
 	}
 	slices.SortFunc(out, func(a, b Usage) int { return strings.Compare(a.Client, b.Client) })
