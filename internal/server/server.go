@@ -254,6 +254,8 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	s.mux.Handle("GET /admin/backends", s.requireAdmin(http.HandlerFunc(s.handleBackends)))
 	s.mux.Handle("GET /admin/usage", s.requireAdmin(http.HandlerFunc(s.handleUsage)))
 	s.mux.Handle("POST /admin/reload", s.requireAdmin(http.HandlerFunc(s.handleReload)))
+	s.mux.Handle("POST /admin/backends/{name}/drain", s.requireAdmin(s.handleDrain(true)))
+	s.mux.Handle("POST /admin/backends/{name}/undrain", s.requireAdmin(s.handleDrain(false)))
 	s.mux.Handle("GET /v1/models", s.requireAuth(http.HandlerFunc(s.handleModels)))
 	// Everything else is forwarded, so any HTTP inference API works: OpenAI,
 	// Anthropic, Ollama, TGI, Triton/KServe, Gemini-style, or a custom one.
@@ -343,7 +345,7 @@ func clientKey(h http.Header) string {
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	for _, st := range s.pool.Snapshot() {
-		if st.Healthy {
+		if st.Healthy && !st.Drained {
 			io.WriteString(w, "ready\n")
 			return
 		}
@@ -359,6 +361,21 @@ func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// handleDrain takes a backend out of rotation for maintenance, or puts it
+// back. Requests already running on it finish; the drain lasts until undrain
+// or a restart, and survives config reloads.
+func (s *Server) handleDrain(drained bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, ok := s.pool.SetDrained(r.PathValue("name"), drained)
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found", "no backend named "+strconv.Quote(r.PathValue("name")))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(st)
+	})
+}
+
 // handleModels lists the union of models served by healthy backends.
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	type model struct {
@@ -369,7 +386,7 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	seen := map[string]bool{}
 	data := []model{}
 	for _, st := range s.pool.Snapshot() {
-		if !st.Healthy {
+		if !st.Healthy || st.Drained {
 			continue
 		}
 		for _, m := range st.Models {
@@ -752,6 +769,11 @@ func (s *Server) rejectAcquire(w http.ResponseWriter, r *http.Request, err error
 		s.rejected.Inc("queue_full")
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "overloaded", "all backends are busy and the queue is full; retry shortly")
+		return http.StatusTooManyRequests
+	case errors.Is(err, pool.ErrShed):
+		s.rejected.Inc("shed")
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "overloaded", "the queue is full and this request gave its place to higher-priority traffic; retry shortly")
 		return http.StatusTooManyRequests
 	case errors.Is(err, pool.ErrNoBackend) && attempt > 1:
 		s.rejected.Inc("all_backends_failed")

@@ -24,6 +24,9 @@ import (
 var (
 	// ErrQueueFull means too many requests are already waiting.
 	ErrQueueFull = errors.New("request queue is full")
+	// ErrShed means the request was waiting in a full queue and gave its
+	// place to a higher-priority request.
+	ErrShed = errors.New("request displaced from the queue by higher-priority traffic")
 	// ErrNoBackend means no healthy backend can serve the request at all
 	// (wrong model, prompt too long, or everything is down), so waiting is pointless.
 	ErrNoBackend = errors.New("no healthy backend can serve this request")
@@ -51,6 +54,7 @@ type Backend struct {
 	models   map[string]bool
 
 	inflight   int
+	drained    bool // out of rotation for maintenance; in-flight requests finish
 	checked    bool
 	healthy    bool
 	okStreak   int
@@ -264,6 +268,7 @@ func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error)
 			if err != nil {
 				return nil, err
 			}
+			b.drained = old.drained // a drain is an operator decision; a config edit keeps it
 			next = append(next, b)
 			changes = append(changes, "replaced backend "+cb.Name+" (endpoint or credentials changed)")
 		default:
@@ -332,7 +337,7 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 		p.mu.Unlock()
 		return nil, ErrNoBackend
 	}
-	if p.waiters.Len() >= p.opts.MaxWaiting {
+	if p.waiters.Len() >= p.opts.MaxWaiting && !p.shedLocked(req.Priority) {
 		p.mu.Unlock()
 		return nil, ErrQueueFull
 	}
@@ -359,6 +364,47 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 		}
 		return nil, ctx.Err()
 	}
+}
+
+// shedLocked makes room in a full queue for a request of priority prio by
+// dropping the newest waiter of the lowest priority, if that is lower than
+// prio. Under overload, interactive traffic displaces batch work instead of
+// being turned away. It reports whether a place was freed.
+func (p *Pool) shedLocked(prio int) bool {
+	back := p.waiters.Back() // the queue is ordered by priority, so this is the lowest, newest
+	if back == nil {
+		return false
+	}
+	w := back.Value.(*waiter)
+	if w.req.Priority >= prio {
+		return false
+	}
+	p.waiters.Remove(back)
+	w.el = nil
+	w.ch <- result{err: ErrShed}
+	return true
+}
+
+// SetDrained takes a backend out of rotation (or puts it back). New requests
+// go elsewhere while its in-flight requests finish; queued requests that only
+// it could serve fail rather than wait for it.
+func (p *Pool) SetDrained(name string, drained bool) (Status, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b, ok := p.byName[name]
+	if !ok {
+		return Status{}, false
+	}
+	if b.drained != drained {
+		b.drained = drained
+		if drained {
+			p.log.Info("backend drained", "backend", name, "inflight", b.inflight)
+		} else {
+			p.log.Info("backend back in rotation", "backend", name)
+		}
+		p.dispatchLocked(true)
+	}
+	return p.statusLocked(b), true
 }
 
 // enqueueLocked inserts w behind every waiter of equal or higher priority,
@@ -412,7 +458,7 @@ func (p *Pool) dispatchLocked(checkAll bool) {
 
 func (p *Pool) anyFreeLocked() bool {
 	for _, b := range p.backends {
-		if b.healthy && b.inflight < b.MaxConcurrency {
+		if b.healthy && !b.drained && b.inflight < b.MaxConcurrency {
 			return true
 		}
 	}
@@ -429,7 +475,7 @@ func (p *Pool) NearContextLimit(r Request, margin float64) (counter *Backend, ne
 	defer p.mu.Unlock()
 	need := float64(r.PromptTokens + r.MaxTokens)
 	for _, b := range p.backends {
-		if !b.healthy || r.Exclude[b.Name] || !b.serves(r.Model) {
+		if !b.healthy || b.drained || r.Exclude[b.Name] || !b.serves(r.Model) {
 			continue
 		}
 		if b.Tokenize != "" && counter == nil {
@@ -483,7 +529,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {
@@ -733,6 +779,7 @@ type Status struct {
 	// TierSource is "auto" when chipagent's report chose the tier.
 	TierSource       string   `json:"tier_source"`
 	Healthy          bool     `json:"healthy"`
+	Drained          bool     `json:"drained,omitempty"`
 	Inflight         int      `json:"inflight"`
 	MaxConcurrency   int      `json:"max_concurrency"`
 	MaxContextTokens int      `json:"max_context_tokens,omitempty"`
@@ -749,26 +796,31 @@ func (p *Pool) Snapshot() []Status {
 	defer p.mu.Unlock()
 	out := make([]Status, 0, len(p.backends))
 	for _, b := range p.backends {
-		src := b.models
-		if len(src) == 0 {
-			src = b.discovered
-		}
-		models := make([]string, 0, len(src))
-		for m := range src {
-			models = append(models, m)
-		}
-		slices.Sort(models)
-		source := "config"
-		if b.AutoTier {
-			source = "auto"
-		}
-		out = append(out, Status{
-			Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, TierSource: source, Healthy: b.healthy,
-			Inflight: b.inflight, MaxConcurrency: b.MaxConcurrency,
-			MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
-			TTFTMillis: math.Round(b.ttft * 1000),
-			Hardware:   b.hardwareStatus(),
-		})
+		out = append(out, p.statusLocked(b))
 	}
 	return out
+}
+
+func (p *Pool) statusLocked(b *Backend) Status {
+	src := b.models
+	if len(src) == 0 {
+		src = b.discovered
+	}
+	models := make([]string, 0, len(src))
+	for m := range src {
+		models = append(models, m)
+	}
+	slices.Sort(models)
+	source := "config"
+	if b.AutoTier {
+		source = "auto"
+	}
+	return Status{
+		Name: b.Name, URL: b.URL.Redacted(), Tier: b.Tier, TierSource: source, Healthy: b.healthy,
+		Drained:  b.drained,
+		Inflight: b.inflight, MaxConcurrency: b.MaxConcurrency,
+		MaxContextTokens: b.MaxContextTokens, Models: models, LastError: b.lastErr,
+		TTFTMillis: math.Round(b.ttft * 1000),
+		Hardware:   b.hardwareStatus(),
+	}
 }
