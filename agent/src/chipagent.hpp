@@ -105,6 +105,14 @@ Host ReadHost(const std::string& root);
 // whose format differs on every architecture.
 void ParseCpuinfo(const std::string& text, std::string* name, std::vector<std::string>* features);
 
+// Devices reported by an external command that prints JSON (see plugin.cpp
+// for the format). The command runs on each collection, with a timeout.
+std::unique_ptr<Provider> OpenPlugin(const std::string& command, int timeout_ms);
+
+// Runs cmd through the shell, capturing standard output. false (and err)
+// on a non-zero exit or after timeout_ms (the command is then killed).
+bool RunCommand(const std::string& cmd, int timeout_ms, std::string* out, std::string* err);
+
 // Fixed devices for demos and tests. Each spec is
 // "vendor:name:memory_gib[:utilization_percent]".
 std::unique_ptr<Provider> OpenSimulated(const std::vector<std::string>& specs, std::string* err);

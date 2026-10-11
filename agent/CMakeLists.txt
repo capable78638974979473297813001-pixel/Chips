@@ -28,8 +28,10 @@ add_library(chipagent_core STATIC
   src/dynlib.cpp
   src/host.cpp
   src/http.cpp
+  src/json.cpp
   src/nvml.cpp
   src/pci.cpp
+  src/plugin.cpp
   src/simulated.cpp
   src/telemetry.cpp
   src/windows.cpp
@@ -55,7 +57,8 @@ if(BUILD_TESTING)
   target_link_libraries(chipagent_test PRIVATE chipagent_core Threads::Threads)
   target_compile_definitions(chipagent_test PRIVATE
     FAKE_NVML_PATH="$<TARGET_FILE:fakenvml>"
-    TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata")
+    TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata"
+    PLUGINS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/plugins")
   add_dependencies(chipagent_test fakenvml)
   add_test(NAME chipagent_test COMMAND chipagent_test)
 endif()

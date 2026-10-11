@@ -14,6 +14,8 @@ RUN rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 
 FROM debian:bookworm-slim
 COPY --from=build /src/build/chipagent /usr/local/bin/chipagent
+# Example plugins for chips without built-in support (mount the vendor tool too).
+COPY plugins /opt/chipagent/plugins
 # Ask the NVIDIA container runtime to mount libnvidia-ml (NVML) into the container.
 ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=utility
 USER 65532:65532
