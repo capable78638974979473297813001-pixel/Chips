@@ -326,6 +326,12 @@ type Retry struct {
 	// bytes by then, the request moves to another backend before anything
 	// reaches the client. 0 disables it. The last attempt always waits.
 	FirstTokenTimeout Duration `yaml:"first_token_timeout"`
+	// The retry budget caps retries at BudgetRatio of recent requests plus
+	// BudgetMinPerSecond, over a 10-second window, so failures from an
+	// overloaded fleet do not multiply into more load. Past it, a failed
+	// attempt's answer goes to the client. A negative ratio removes the cap.
+	BudgetRatio        float64 `yaml:"budget_ratio"`
+	BudgetMinPerSecond float64 `yaml:"budget_min_per_second"`
 }
 
 type Health struct {
@@ -461,6 +467,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Retry.MaxAttempts == 0 {
 		c.Retry.MaxAttempts = 3
+	}
+	if c.Retry.BudgetRatio == 0 {
+		c.Retry.BudgetRatio = 0.2
+	}
+	if c.Retry.BudgetMinPerSecond == 0 {
+		c.Retry.BudgetMinPerSecond = 10
 	}
 	if c.Retry.FirstTokenTimeout == 0 {
 		// Generous enough for a very long prompt's prefill; catches a backend
@@ -711,6 +723,9 @@ func (c *Config) validate() error {
 	}
 	if c.Retry.MaxAttempts < 1 {
 		errs = append(errs, errors.New("retry.max_attempts must be at least 1"))
+	}
+	if c.Retry.BudgetMinPerSecond < 0 {
+		errs = append(errs, errors.New("retry.budget_min_per_second must not be negative"))
 	}
 	if c.Retry.FirstTokenTimeout < 0 {
 		errs = append(errs, errors.New("retry.first_token_timeout must not be negative"))

@@ -26,6 +26,7 @@ func (s *Server) Apply(cfg *config.Config) ([]string, error) {
 	}
 	s.state.Store(newState(cfg, old))
 	s.limits.SetLimits(limitsFrom(cfg))
+	s.retryBudget.set(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond)
 	return append(changes, settingChanges(old.cfg, cfg)...), nil
 }
 

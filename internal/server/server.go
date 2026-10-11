@@ -78,6 +78,8 @@ type Server struct {
 	clientReqs    *metrics.CounterVec
 	clientTokens  *metrics.CounterVec
 	fallbacks     *metrics.CounterVec
+	budgetSpent   *metrics.CounterVec
+	retryBudget   *retryBudget
 	duration      *metrics.Histogram
 	queueWait     *metrics.Histogram
 	firstByte     *metrics.Histogram
@@ -185,6 +187,8 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), coalesced (shared the answer of an identical request in flight), miss, or skip (not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
+		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
+		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
@@ -623,6 +627,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 
 	var lastErr string
 	tries := 0
+	s.retryBudget.request()
 	for attempt := 1; ; attempt++ {
 		tries++
 		lease, err := s.pool.Acquire(wait.ctx, req)
@@ -648,8 +653,19 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		b := lease.Backend
 		final := tries >= st.cfg.Retry.MaxAttempts && len(fallbacks) == 0
+		if !final && !s.retryBudget.allows() {
+			// No retry would be allowed after this attempt, so it is the
+			// last: it waits for its first token, and its answer is relayed.
+			final = true
+		}
 
 		res := s.attempt(r, path, body, b, info.Stream, final, rl)
+		if failed := res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode)); failed && !final && !s.retryBudget.spend() {
+			final = true // the budget ran out during the attempt
+		}
+		if final && tries < st.cfg.Retry.MaxAttempts && (res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode))) {
+			s.budgetSpent.Inc()
+		}
 		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
 			if res.resp != nil {
 				io.Copy(io.Discard, io.LimitReader(res.resp.Body, 64<<10))
