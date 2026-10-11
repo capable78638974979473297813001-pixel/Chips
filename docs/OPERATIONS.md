@@ -181,19 +181,32 @@ its peers two things every `sync_interval`:
 - each client's token use today and requests in flight, so `tokens_per_day` and `max_concurrent`
   hold across the fleet.
 
-`requests_per_minute` is split evenly among the live routers. A router counts as live while its
-pushes keep arriving, and stops counting three missed sync intervals after it goes quiet. With
-three routers and a limit of 600, each admits 200 a minute. Behind a load balancer that spreads a
-client's requests evenly, the fleet admits about 600. When a router dies, the others take over its
-share within seconds.
+`requests_per_minute` is shared among the live routers by demand. Each router reports how often
+each client has been sending it requests (a 30-second moving average, rejected attempts
+included). It then admits:
+- 20% of the limit split evenly between the live routers, so a router whose traffic just started
+  can admit some requests at once;
+- plus 80% in proportion to its share of that client's demand.
+
+With a limit of 600 and three routers:
+- traffic spread evenly gives each router about 200 a minute;
+- if one router gets nearly all of the client's traffic (sticky load balancing by client IP, say),
+  it admits about 520 and the other two about 40 each.
+
+Either way the fleet admits about 600, and shares follow shifts in traffic within seconds. A
+router counts as live while its pushes keep arriving, and stops counting three missed sync
+intervals after it goes quiet. When a router dies, the others take over its share.
+`GET /admin/usage` shows each client's `demand_per_minute` on this router and its current
+`rate_share_per_minute`.
 
 Nothing else is needed: no Redis, no database.
 
 - **Consistency is eventual.** A turn that arrives within a second of the previous one, on another
   router, may miss the cache once. Quotas and concurrency limits can overshoot by about one sync
   interval's worth of traffic.
-- **Rate shares assume even spreading.** If one router gets most of a client's traffic (sticky
-  load balancing by client IP, say), that client is limited to about its per-router share there.
+- **Bursts can briefly exceed the rate.** When traffic suddenly moves to another router, shares
+  take a few seconds to follow, so the fleet may admit somewhat more, or less, than the limit for a
+  moment.
 - **All routers need the same backend names.** The response cache and the health view stay per
   router.
 

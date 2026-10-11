@@ -56,6 +56,11 @@ backends:
 Calls are relayed over HTTP/2: cleartext h2c for `http://`, TLS for `https://`. Trailers such as
 `grpc-status` pass through. Clients may connect to the router with TLS, or with cleartext HTTP/2.
 
+**Engine load metrics.** With `metrics_path: /metrics`, the router also routes on what the engine
+reports about its own queue and KV cache (see [TUNING.md](TUNING.md)). It understands vLLM,
+SGLang, TGI, llama.cpp (started with `--metrics`) and Triton. Other servers are routed on the
+router's own counts.
+
 **WebSocket.** Upgrades are relayed to a backend chosen by model and load. The session occupies
 one of the backend's `max_concurrency` slots until it closes.
 

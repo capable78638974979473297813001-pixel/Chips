@@ -45,6 +45,7 @@ backends:
     models: [llama-3.1-70b]         # omit to auto-discover from GET /v1/models
     api_key_env: H100_API_KEY       # optional bearer token sent to this backend
     agent_url: http://10.0.0.11:9400  # optional chipagent on this machine (see docs/HARDWARE.md)
+    metrics_path: /metrics          # optional: route on the engine's own queue and KV-cache use (docs/TUNING.md)
     # api_key_header: x-api-key     # send the key in this header instead of "Authorization: Bearer"
     # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)
     # tokenize: vllm                # exact token counts near context limits: vllm, llamacpp or tgi
@@ -142,6 +143,12 @@ health:
 upstream:
   dial_timeout: 5s
   response_header_timeout: 0s       # 0 = none; non-streaming replies only send headers when generation ends
+
+# Scraping of engines' own load metrics (only for backends with metrics_path).
+engine_metrics:
+  interval: 2s
+  timeout: 1s
+  kv_saturated: 0.95                # KV-cache usage at which an engine gets new work only as a last resort
 
 # chipagent telemetry (only used by backends with agent_url).
 hardware:
