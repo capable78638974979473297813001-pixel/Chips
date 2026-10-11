@@ -15,10 +15,12 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -367,6 +369,71 @@ static void TestNvml() {
   CHECK(ds[0].power_watts && std::fabs(*ds[0].power_watts - 512.5) < 1e-9);
   CHECK_EQ(ds[1].name, std::string("NVIDIA L4"));
   CHECK(!ds[1].power_watts);  // the fake reports NOT_SUPPORTED
+  CHECK(ds[0].error.empty());
+
+  // A GPU that fell off the bus is still listed, with an error.
+#ifdef _WIN32
+  _putenv_s("FAKE_NVML_LOST", "1");
+#else
+  setenv("FAKE_NVML_LOST", "1", 1);
+#endif
+  ds = p->Devices();
+  CHECK_EQ(ds.size(), size_t(2));
+  if (ds.size() == 2) {
+    CHECK(ds[0].error.empty());
+    CHECK(ds[1].error.find("GPU is lost") != std::string::npos);
+    std::string json = chipagent::RenderTelemetry(ds, chipagent::Host{}, "t");
+    CHECK(json.find("\"error\":\"GPU is lost") != std::string::npos);
+  }
+#ifdef _WIN32
+  _putenv_s("FAKE_NVML_LOST", "");
+#else
+  unsetenv("FAKE_NVML_LOST");
+#endif
+}
+
+static void TestCollector() {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool hang = false;
+  int started = 0;
+  chipagent::Collector c(
+      [&] {
+        std::unique_lock<std::mutex> lock(mu);
+        ++started;
+        cv.wait(lock, [&] { return !hang; });
+        chipagent::Device d;
+        d.vendor = "x";
+        d.name = "collection " + std::to_string(started);
+        return chipagent::Collector::Snapshot{{d}, chipagent::Host{}};
+      },
+      std::chrono::milliseconds(100));
+
+  std::string fresh = c.Telemetry("t");
+  CHECK(fresh.find("collection 1") != std::string::npos);
+  CHECK(fresh.find("stale") == std::string::npos);
+
+  {
+    std::lock_guard<std::mutex> g(mu);
+    hang = true;  // the next collection blocks, like a read from a wedged GPU
+  }
+  auto start = std::chrono::steady_clock::now();
+  std::string stale = c.Telemetry("t");
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+  CHECK(stale.find("collection 1") != std::string::npos);  // the last good readings
+  CHECK(stale.find("\"stale\":true") != std::string::npos);
+  CHECK(stale.find("did not finish within 100 ms") != std::string::npos);
+  c.Telemetry("t");  // still stuck: no second collection is started
+  {
+    std::lock_guard<std::mutex> g(mu);
+    CHECK_EQ(started, 2);
+    hang = false;
+  }
+  cv.notify_all();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  std::string after = c.Telemetry("t");  // the stuck one finished; this call collects again
+  CHECK(after.find("stale") == std::string::npos);
+  CHECK(after.find("collection 3") != std::string::npos);
 }
 
 static void TestJson() {
@@ -653,6 +720,7 @@ int main() {
   TestJson();
   TestPlugins();
   TestCollectMerges();
+  TestCollector();
   TestNvml();
   TestHttp();
   if (failures) {

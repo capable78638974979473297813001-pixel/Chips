@@ -1,5 +1,6 @@
 /* A two-GPU stand-in for libnvidia-ml, exporting the NVML entry points
  * chipagent uses with their real C signatures. */
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -39,8 +40,10 @@ EXPORT int nvmlDeviceGetCount_v2(unsigned int* n) {
   *n = 2;
   return 0;
 }
+/* With FAKE_NVML_LOST set, device 1 has fallen off the bus. */
 EXPORT int nvmlDeviceGetHandleByIndex_v2(unsigned int i, fake_device** h) {
   if (i >= 2) return 2; /* NVML_ERROR_INVALID_ARGUMENT */
+  if (i == 1 && getenv("FAKE_NVML_LOST")) return 15; /* NVML_ERROR_GPU_IS_LOST */
   *h = &devices[i];
   return 0;
 }

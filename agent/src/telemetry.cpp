@@ -2,7 +2,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <thread>
 
 #include "chipagent.hpp"
 
@@ -114,7 +118,7 @@ std::string Num(const std::optional<double>& v) {
 }  // namespace
 
 std::string RenderTelemetry(const std::vector<Device>& devices, const Host& host,
-                            const std::string& version) {
+                            const std::string& version, const std::string& collect_error) {
   std::string out = "{\"schema\":1,\"agent\":\"chipagent\",\"version\":" + Str(version) +
                     ",\"hostname\":" + Str(host.hostname);
   out += ",\"host\":{\"os\":" + Str(host.os) + ",\"arch\":" + Str(host.arch) + ",\"cpu\":" + Str(host.cpu);
@@ -139,10 +143,61 @@ std::string RenderTelemetry(const std::vector<Device>& devices, const Host& host
     out += ",\"utilization_percent\":" + Num(d.utilization_percent);
     out += ",\"temperature_c\":" + Num(d.temperature_c);
     out += ",\"power_watts\":" + Num(d.power_watts);
+    if (!d.error.empty()) out += ",\"error\":" + Str(d.error);
     out += '}';
   }
-  out += "]}\n";
+  out += ']';
+  if (!collect_error.empty()) out += ",\"stale\":true,\"collect_error\":" + Str(collect_error);
+  out += "}\n";
   return out;
+}
+
+struct Collector::State {
+  std::mutex mu;
+  std::condition_variable done;
+  bool busy = false;
+  uint64_t generation = 0;  // completed collections
+  std::optional<Snapshot> last;
+  std::chrono::steady_clock::time_point last_at;
+};
+
+Collector::Collector(std::function<Snapshot()> collect, std::chrono::milliseconds deadline)
+    : state_(std::make_shared<State>()), collect_(std::move(collect)), deadline_(deadline) {}
+
+std::string Collector::Telemetry(const std::string& version) {
+  std::unique_lock<std::mutex> lock(state_->mu);
+  const uint64_t start = state_->generation;
+  if (!state_->busy) {
+    state_->busy = true;
+    std::thread([st = state_, collect = collect_] {
+      std::optional<Snapshot> s;
+      try {
+        s = collect();
+      } catch (...) {  // a provider bug: keep the last good readings
+      }
+      std::lock_guard<std::mutex> g(st->mu);
+      if (s) {
+        st->last = std::move(s);
+        st->last_at = std::chrono::steady_clock::now();
+      }
+      st->busy = false;
+      ++st->generation;
+      st->done.notify_all();
+    }).detach();
+  }
+  bool finished = state_->done.wait_for(lock, deadline_, [&] { return state_->generation != start; });
+  // Fresh: a collection succeeded during this call (it may have been one a
+  // previous call started and gave up waiting for).
+  if (finished && state_->last && std::chrono::steady_clock::now() - state_->last_at < deadline_) {
+    return RenderTelemetry(state_->last->devices, state_->last->host, version);
+  }
+  std::string why = finished ? "collection failed" : "collection did not finish within " +
+                                                         std::to_string(deadline_.count()) +
+                                                         " ms (a driver or sysfs read is hanging)";
+  if (!state_->last) return RenderTelemetry({}, Host{}, version, why + "; no readings yet");
+  auto age = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - state_->last_at);
+  return RenderTelemetry(state_->last->devices, state_->last->host, version,
+                         why + "; readings are " + std::to_string(age.count()) + " s old");
 }
 
 }  // namespace chipagent

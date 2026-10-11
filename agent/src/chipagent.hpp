@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -40,6 +41,9 @@ struct Device {
   std::optional<double> utilization_percent;
   std::optional<double> temperature_c;
   std::optional<double> power_watts;
+  // Error says the device is present but failing (e.g. an NVIDIA GPU that
+  // fell off the bus); the router takes such a machine out of rotation.
+  std::string error;
 };
 
 // The machine itself. CPU inference (llama.cpp and friends) runs on any of
@@ -125,8 +129,32 @@ std::vector<Device> Collect(const std::vector<std::unique_ptr<Provider>>& provid
 std::string DeviceKey(std::string_view id);
 
 // The JSON document served at /v1/telemetry.
+// collect_error, when set, says the readings are not fresh (see Collector)
+// and is reported along with them.
 std::string RenderTelemetry(const std::vector<Device>& devices, const Host& host,
-                            const std::string& version);
+                            const std::string& version, const std::string& collect_error = "");
+
+// Collector runs collections on a worker thread with a deadline. A GPU
+// that wedges can make driver or sysfs reads block indefinitely; instead of
+// hanging with them, the agent then answers with the last good readings,
+// marked stale, and starts no further collection until the stuck one returns.
+class Collector {
+ public:
+  struct Snapshot {
+    std::vector<Device> devices;
+    Host host;
+  };
+  Collector(std::function<Snapshot()> collect, std::chrono::milliseconds deadline);
+  // Telemetry renders a fresh collection, or the last good one if a fresh
+  // one does not finish within the deadline.
+  std::string Telemetry(const std::string& version);
+
+ private:
+  struct State;
+  std::shared_ptr<State> state_;  // shared with worker threads that may outlive a call
+  std::function<Snapshot()> collect_;
+  std::chrono::milliseconds deadline_;
+};
 
 std::string JsonEscape(std::string_view s);
 

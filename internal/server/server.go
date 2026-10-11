@@ -298,6 +298,13 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewGaugeFunc("siliconrouter_backend_hardware_faults", "Accelerators chipagent reports as failing per backend; while any are, the backend gets no new work.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.Hardware != nil {
+				emit(float64(len(st.Hardware.Faults)), st.Name)
+			}
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))
 	})
