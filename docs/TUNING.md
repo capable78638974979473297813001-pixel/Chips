@@ -26,8 +26,12 @@ slightly late first token, not a hang. The last attempt (`retry.max_attempts`) a
 a slow answer beats none.
 
 A non-streaming response arrives all at once when generation ends, so a timeout can't tell
-"stalled" from "writing a long answer". Use `upstream.response_header_timeout` if you want a hard
-limit there.
+"stalled" from "writing a long answer". Set `upstream.response_header_timeout` to put a hard limit
+there, longer than your longest legitimate generation (for example `300s`). Without it, a hung
+engine holds non-streaming requests for as long as clients wait. This happened in the
+[real-hardware tests](VALIDATION.md), when two engines sharing one GPU stalled. With
+`metrics_path`, a hung engine with requests piling up inside it is also marked saturated, so new
+work goes elsewhere.
 
 ### Latency-aware routing
 

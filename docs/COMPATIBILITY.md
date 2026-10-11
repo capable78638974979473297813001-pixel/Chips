@@ -111,5 +111,6 @@ from each and which platforms are verified.
 - **Phones and laptop NPUs** (Snapdragon, Apple Neural Engine, Ryzen AI) are only usable through
   whatever HTTP server runs on them. chipagent doesn't detect NPUs built into a system-on-chip,
   apart from NVIDIA Jetson.
-- **None of this has run on real accelerator hardware yet.** Coverage comes from fakes and
-  emulation; see the verification table in [HARDWARE.md](HARDWARE.md).
+- **Real-hardware testing so far covers an NVIDIA RTX 4090 and an AMD MI300X**, mixed behind one
+  router ([VALIDATION.md](VALIDATION.md)). Everything else is covered by fakes and emulation; see
+  the verification table in [HARDWARE.md](HARDWARE.md).
