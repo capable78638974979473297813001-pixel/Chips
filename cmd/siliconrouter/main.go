@@ -63,7 +63,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s: OK (%d backends)\n", *configPath, len(cfg.Backends))
+		fmt.Printf("%s: OK (%d backends, %d discovery sources)\n", *configPath, len(cfg.Backends), len(cfg.Discovery))
 		return nil
 	}
 
@@ -98,6 +98,9 @@ func run() error {
 	for _, b := range cfg.Backends {
 		maxConns = max(maxConns, b.MaxConcurrency)
 	}
+	for _, d := range cfg.Discovery {
+		maxConns = max(maxConns, d.Backend.MaxConcurrency)
+	}
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: cfg.Upstream.DialTimeout.D(), KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns:          0,
@@ -110,6 +113,13 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.Auth.Enabled() && len(cfg.Auth.AdminKeys) == 0 {
+		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
+	}
+	router := server.New(cfg, p, client, log)
+	router.DiscoverNow(ctx) // discovered backends join the first health checks
+	go router.RunDiscovery(ctx)
 
 	if !cfg.Health.Disabled {
 		checker := &pool.Checker{
@@ -130,8 +140,8 @@ func run() error {
 	}
 	if agents.HasAgents() {
 		agents.PollAll(ctx) // tier auto backends before taking traffic
-		go agents.Run(ctx)
 	}
+	go agents.Run(ctx) // also covers agents that a reload or discovery adds later
 	for _, st := range p.Snapshot() {
 		attrs := []any{"name", st.Name, "url", st.URL, "tier", st.Tier, "tier_source", st.TierSource,
 			"healthy", st.Healthy, "max_concurrency", st.MaxConcurrency, "models", st.Models}
@@ -142,10 +152,6 @@ func run() error {
 		log.Info("backend", attrs...)
 	}
 
-	if cfg.Auth.Enabled() && len(cfg.Auth.AdminKeys) == 0 {
-		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
-	}
-	router := server.New(cfg, p, client, log)
 	go router.RunCluster(ctx)
 	go router.RunTracing(ctx)
 	if dir := cfg.StateDir; dir != "" {

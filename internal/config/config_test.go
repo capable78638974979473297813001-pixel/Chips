@@ -134,11 +134,52 @@ func TestValidation(t *testing.T) {
 		"bad health path":      `backends: [{name: a, url: "http://h:1", health_path: "health"}]`,
 		"auto no agent":        `backends: [{name: a, url: "http://h:1", tier: auto}]`,
 		"bad agent url":        `backends: [{name: a, url: "http://h:1", agent_url: "h:9400"}]`,
+		"fallback to itself":   "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {fallbacks: {big: [big]}}",
+		"fallback repeated":    "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {fallbacks: {big: [s, s]}}",
+		"fallback on alias":    "backends: [{name: a, url: \"http://h:1\"}]\nmodels: {aliases: {gpt: big}, fallbacks: {gpt: [small]}}",
+		"key model pattern":    "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key: k, models: [\"*llama\"]}]}",
+		"key negative cap":     "backends: [{name: a, url: \"http://h:1\"}]\nauth: {keys: [{name: x, key: k, max_tokens: -5}]}",
+		"discovery no name":    "discovery: [{dns: v.svc, port: 8000}]",
+		"discovery both":       "discovery: [{name: v, dns: v.svc, srv: _h._tcp.v.svc, port: 8000}]",
+		"discovery no port":    "discovery: [{name: v, dns: v.svc}]",
+		"discovery srv port":   "discovery: [{name: v, srv: _h._tcp.v.svc, port: 80}]",
+		"discovery fixed url":  "discovery: [{name: v, dns: v.svc, port: 80, backend: {url: \"http://x:1\"}}]",
+		"discovery bad tier":   "discovery: [{name: v, dns: v.svc, port: 80, backend: {tier: turbo}}]",
+		"discovery auto tier":  "discovery: [{name: v, dns: v.svc, port: 80, backend: {tier: auto}}]",
+		"discovery clash":      "backends: [{name: v-static, url: \"http://h:1\"}]\ndiscovery: [{name: v, dns: v.svc, port: 80}]",
+		"discovery fast":       "discovery: [{name: v, dns: v.svc, port: 80, interval: 10ms}]",
 		"bad thresholds":       "backends: [{name: a, url: \"http://h:1\"}]\nhardware: {heavy_min_memory_gib: 10, standard_min_memory_gib: 40}",
 	}
 	for name, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+func TestDiscoveryOnly(t *testing.T) {
+	c, err := Parse([]byte("discovery: [{name: v, dns: v.svc, port: 8000, agent_port: 9400, backend: {tier: auto, models: [llama]}}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := c.Discovery[0]
+	if d.Scheme != "http" || d.Interval.D() != 15*time.Second || d.Backend.MaxConcurrency != 16 {
+		t.Errorf("defaults not applied: %+v", d)
+	}
+	b := d.Expand("10.1.2.3", 8000)
+	if b.Name != "v-10.1.2.3:8000" || b.URL != "http://10.1.2.3:8000" || b.AgentURL != "http://10.1.2.3:9400" || b.Tier != TierAuto {
+		t.Errorf("Expand = %+v", b)
+	}
+}
+
+func TestModelPatterns(t *testing.T) {
+	patterns := []string{"llama-*", "mistral"}
+	for name, want := range map[string]bool{"llama-8b": true, "llama-": true, "mistral": true, "mistral-large": false, "gpt": false} {
+		if got := MatchModel(patterns, name); got != want {
+			t.Errorf("MatchModel(%q) = %v", name, got)
+		}
+	}
+	if !MatchModel([]string{"*"}, "anything") {
+		t.Error("* should match every model")
 	}
 }

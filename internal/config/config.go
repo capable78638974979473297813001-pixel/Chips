@@ -4,8 +4,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,16 +49,19 @@ type Config struct {
 	MaxBodyBytes int64     `yaml:"max_body_bytes"`
 	Auth         Auth      `yaml:"auth"`
 	Backends     []Backend `yaml:"backends"`
-	Routing      Routing   `yaml:"routing"`
-	Queue        Queue     `yaml:"queue"`
-	Retry        Retry     `yaml:"retry"`
-	Health       Health    `yaml:"health"`
-	Upstream     Upstream  `yaml:"upstream"`
-	Hardware     Hardware  `yaml:"hardware"`
-	Cache        Cache     `yaml:"cache"`
-	Models       Models    `yaml:"models"`
-	TLS          TLS       `yaml:"tls"`
-	Cluster      Cluster   `yaml:"cluster"`
+	// Discovery finds more backends in DNS, so a fleet that scales (a
+	// Kubernetes headless service, Consul, round-robin DNS) needs no config edits.
+	Discovery []Discovery `yaml:"discovery"`
+	Routing   Routing     `yaml:"routing"`
+	Queue     Queue       `yaml:"queue"`
+	Retry     Retry       `yaml:"retry"`
+	Health    Health      `yaml:"health"`
+	Upstream  Upstream    `yaml:"upstream"`
+	Hardware  Hardware    `yaml:"hardware"`
+	Cache     Cache       `yaml:"cache"`
+	Models    Models      `yaml:"models"`
+	TLS       TLS         `yaml:"tls"`
+	Cluster   Cluster     `yaml:"cluster"`
 	// StateDir, when set, is where the router saves its response cache and
 	// usage counters (on shutdown and every few minutes) and restores them
 	// at startup, so a restart keeps cached answers and daily quotas.
@@ -143,6 +148,26 @@ type APIKey struct {
 	MaxConcurrent     int   `yaml:"max_concurrent"`      // requests in flight or queued at once
 	RequestsPerMinute int   `yaml:"requests_per_minute"` // sustained rate; bursts up to a minute's worth
 	TokensPerDay      int64 `yaml:"tokens_per_day"`      // prompt + completion tokens per UTC day
+
+	// Models, when set, are the only models this key may use: exact names,
+	// or a prefix ending in * (llama-*). A request may name an alias or the
+	// model behind it. Requests that name no model are refused.
+	Models []string `yaml:"models"`
+	// MaxTokens caps each request's completion budget. Larger budgets are
+	// refused; requests to OpenAI- or Anthropic-style endpoints that set none
+	// get this one.
+	MaxTokens int `yaml:"max_tokens"`
+}
+
+// MatchModel reports whether name matches one of patterns: an exact model
+// name, or a prefix ending in *.
+func MatchModel(patterns []string, name string) bool {
+	for _, p := range patterns {
+		if prefix, ok := strings.CutSuffix(p, "*"); ok && strings.HasPrefix(name, prefix) || p == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Cache answers repeated requests from memory instead of a GPU. Only
@@ -164,6 +189,12 @@ type Models struct {
 	// Aliases maps the name a client asks for to the model that serves it,
 	// e.g. gpt-4o: llama-3.1-70b, so apps keep working when models change.
 	Aliases map[string]string `yaml:"aliases"`
+	// Fallbacks lists models to try, in order, when a model cannot take a
+	// request: no healthy backend serves it, every one failed, or the queue
+	// is full. E.g. llama-3.1-70b: [llama-3.1-8b] keeps answering, from a
+	// smaller model, while the big GPUs are down or saturated. Keys are the
+	// real model names (after aliases).
+	Fallbacks map[string][]string `yaml:"fallbacks"`
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
@@ -179,6 +210,44 @@ type Auth struct {
 
 // Enabled reports whether the router requires a key.
 func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 }
+
+// Discovery is a DNS name whose records are backends. Every address (for
+// dns) or target (for srv) becomes a backend named <name>-<host>:<port>,
+// with the settings in Backend. A failed lookup keeps the last known
+// backends; health checks take out any that are really gone.
+type Discovery struct {
+	Name string `yaml:"name"`
+	// DNS is a hostname whose A/AAAA records are backends listening on Port.
+	DNS  string `yaml:"dns"`
+	Port int    `yaml:"port"`
+	// SRV is an SRV record name (e.g. _http._tcp.vllm.ai.svc.cluster.local);
+	// each target and port is a backend.
+	SRV      string   `yaml:"srv"`
+	Scheme   string   `yaml:"scheme"`   // http (default) or https
+	Interval Duration `yaml:"interval"` // between lookups; default 15s
+	// AgentPort and GRPCPort, when set, are where chipagent and a gRPC
+	// endpoint listen on each discovered host.
+	AgentPort int `yaml:"agent_port"`
+	GRPCPort  int `yaml:"grpc_port"`
+	// Backend is what each discovered backend is configured with (tier,
+	// max_concurrency, models, api_key_env, ...). Its name and urls come from DNS.
+	Backend Backend `yaml:"backend"`
+}
+
+// Expand returns the backend for one discovered endpoint.
+func (d Discovery) Expand(host string, port int) Backend {
+	b := d.Backend
+	hostPort := net.JoinHostPort(host, strconv.Itoa(port))
+	b.Name = d.Name + "-" + hostPort
+	b.URL = d.Scheme + "://" + hostPort
+	if d.AgentPort > 0 {
+		b.AgentURL = "http://" + net.JoinHostPort(host, strconv.Itoa(d.AgentPort))
+	}
+	if d.GRPCPort > 0 {
+		b.GRPCURL = d.Scheme + "://" + net.JoinHostPort(host, strconv.Itoa(d.GRPCPort))
+	}
+	return b
+}
 
 type Backend struct {
 	Name             string   `yaml:"name"`
@@ -311,13 +380,25 @@ func (c *Config) applyDefaults() {
 	if c.MaxBodyBytes == 0 {
 		c.MaxBodyBytes = 16 << 20
 	}
-	for i := range c.Backends {
-		b := &c.Backends[i]
+	backendDefaults := func(b *Backend) {
 		if b.Tier == "" {
 			b.Tier = TierStandard
 		}
 		if b.MaxConcurrency == 0 {
 			b.MaxConcurrency = 16
+		}
+	}
+	for i := range c.Backends {
+		backendDefaults(&c.Backends[i])
+	}
+	for i := range c.Discovery {
+		d := &c.Discovery[i]
+		backendDefaults(&d.Backend)
+		if d.Scheme == "" {
+			d.Scheme = "http"
+		}
+		if d.Interval == 0 {
+			d.Interval = Duration(15 * time.Second)
 		}
 	}
 	r := &c.Routing
@@ -451,12 +532,108 @@ func (c *Config) resolveEnv() {
 			c.Backends[i].APIKey = os.Getenv(env)
 		}
 	}
+	for i := range c.Discovery {
+		if env := c.Discovery[i].Backend.APIKeyEnv; env != "" {
+			c.Discovery[i].Backend.APIKey = os.Getenv(env)
+		}
+	}
+}
+
+func (c *Config) validateDiscovery(backendNames map[string]bool) []error {
+	var errs []error
+	names := map[string]bool{}
+	for i, d := range c.Discovery {
+		where := fmt.Sprintf("discovery[%d]", i)
+		switch {
+		case d.Name == "":
+			errs = append(errs, fmt.Errorf("%s: name is required", where))
+		case names[d.Name]:
+			errs = append(errs, fmt.Errorf("%s: duplicate name %q", where, d.Name))
+		}
+		names[d.Name] = true
+		for n := range backendNames {
+			if d.Name != "" && strings.HasPrefix(n, d.Name+"-") {
+				errs = append(errs, fmt.Errorf("%s: backend %q could clash with discovered names %s-<host>:<port>", where, n, d.Name))
+			}
+		}
+		if (d.DNS == "") == (d.SRV == "") {
+			errs = append(errs, fmt.Errorf("%s: set exactly one of dns and srv", where))
+		}
+		if d.DNS != "" && (d.Port < 1 || d.Port > 65535) {
+			errs = append(errs, fmt.Errorf("%s: dns needs a port", where))
+		}
+		if d.SRV != "" && d.Port != 0 {
+			errs = append(errs, fmt.Errorf("%s: srv records carry their own port; remove port", where))
+		}
+		for _, p := range []int{d.AgentPort, d.GRPCPort} {
+			if p < 0 || p > 65535 {
+				errs = append(errs, fmt.Errorf("%s: agent_port and grpc_port must be valid ports", where))
+			}
+		}
+		if d.Scheme != "http" && d.Scheme != "https" {
+			errs = append(errs, fmt.Errorf("%s: scheme must be http or https", where))
+		}
+		if d.Interval.D() < time.Second {
+			errs = append(errs, fmt.Errorf("%s: interval must be at least 1s", where))
+		}
+		if b := d.Backend; b.Name != "" || b.URL != "" || b.AgentURL != "" || b.GRPCURL != "" {
+			errs = append(errs, fmt.Errorf("%s: backend.name and the backend urls come from DNS; set name, agent_port and grpc_port instead", where))
+		}
+		errs = append(errs, validateBackend(where+".backend", d.Expand("192.0.2.1", max(d.Port, 1)))...)
+	}
+	return errs
+}
+
+// validateBackend checks one backend's settings (the name is checked by the caller).
+func validateBackend(where string, b Backend) []error {
+	var errs []error
+	u, err := url.Parse(b.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		errs = append(errs, fmt.Errorf("%s: url must be an absolute http(s) URL, got %q", where, b.URL))
+	}
+	switch b.Tier {
+	case TierHeavy, TierStandard, TierLight, TierReserve:
+	case TierAuto:
+		if b.AgentURL == "" {
+			errs = append(errs, fmt.Errorf("%s: tier auto needs agent_url so chipagent can report the hardware", where))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("%s: tier must be heavy, standard, light, reserve or auto, got %q", where, b.Tier))
+	}
+	if b.AgentURL != "" {
+		if u, err := url.Parse(b.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("%s: agent_url must be an absolute http(s) URL, got %q", where, b.AgentURL))
+		}
+	}
+	if b.MaxConcurrency < 0 {
+		errs = append(errs, fmt.Errorf("%s: max_concurrency must be positive", where))
+	}
+	if b.MaxContextTokens < 0 {
+		errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
+	}
+	if b.GRPCURL != "" {
+		if u, err := url.Parse(b.GRPCURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("%s: grpc_url must be an absolute http(s) URL (http for plaintext h2c), got %q", where, b.GRPCURL))
+		}
+	}
+	switch b.Tokenize {
+	case "", "vllm", "llamacpp", "tgi":
+	default:
+		errs = append(errs, fmt.Errorf("%s: tokenize must be vllm, llamacpp or tgi, got %q", where, b.Tokenize))
+	}
+	if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
+		errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
+	}
+	if b.APIKeyEnv != "" && b.APIKey == "" {
+		errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))
+	}
+	return errs
 }
 
 func (c *Config) validate() error {
 	var errs []error
-	if len(c.Backends) == 0 {
-		errs = append(errs, errors.New("at least one backend is required"))
+	if len(c.Backends) == 0 && len(c.Discovery) == 0 {
+		errs = append(errs, errors.New("at least one backend or discovery source is required"))
 	}
 	seen := map[string]bool{}
 	for i, b := range c.Backends {
@@ -467,47 +644,9 @@ func (c *Config) validate() error {
 			errs = append(errs, fmt.Errorf("%s: duplicate name %q", where, b.Name))
 		}
 		seen[b.Name] = true
-		u, err := url.Parse(b.URL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			errs = append(errs, fmt.Errorf("%s: url must be an absolute http(s) URL, got %q", where, b.URL))
-		}
-		switch b.Tier {
-		case TierHeavy, TierStandard, TierLight, TierReserve:
-		case TierAuto:
-			if b.AgentURL == "" {
-				errs = append(errs, fmt.Errorf("%s: tier auto needs agent_url so chipagent can report the hardware", where))
-			}
-		default:
-			errs = append(errs, fmt.Errorf("%s: tier must be heavy, standard, light, reserve or auto, got %q", where, b.Tier))
-		}
-		if b.AgentURL != "" {
-			if u, err := url.Parse(b.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				errs = append(errs, fmt.Errorf("%s: agent_url must be an absolute http(s) URL, got %q", where, b.AgentURL))
-			}
-		}
-		if b.MaxConcurrency < 0 {
-			errs = append(errs, fmt.Errorf("%s: max_concurrency must be positive", where))
-		}
-		if b.MaxContextTokens < 0 {
-			errs = append(errs, fmt.Errorf("%s: max_context_tokens must not be negative", where))
-		}
-		if b.GRPCURL != "" {
-			if u, err := url.Parse(b.GRPCURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				errs = append(errs, fmt.Errorf("%s: grpc_url must be an absolute http(s) URL (http for plaintext h2c), got %q", where, b.GRPCURL))
-			}
-		}
-		switch b.Tokenize {
-		case "", "vllm", "llamacpp", "tgi":
-		default:
-			errs = append(errs, fmt.Errorf("%s: tokenize must be vllm, llamacpp or tgi, got %q", where, b.Tokenize))
-		}
-		if b.HealthPath != "" && !strings.HasPrefix(b.HealthPath, "/") {
-			errs = append(errs, fmt.Errorf("%s: health_path must start with /", where))
-		}
-		if b.APIKeyEnv != "" && b.APIKey == "" {
-			errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))
-		}
+		errs = append(errs, validateBackend(where, b)...)
 	}
+	errs = append(errs, c.validateDiscovery(seen)...)
 	r := c.Routing
 	if r.BlockChars < 16 {
 		errs = append(errs, errors.New("routing.block_chars must be at least 16"))
@@ -551,6 +690,14 @@ func (c *Config) validate() error {
 		if _, ok := PriorityRank(k.Priority); !ok {
 			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, k.Priority))
 		}
+		if k.MaxTokens < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_tokens must not be negative", where))
+		}
+		for _, m := range k.Models {
+			if m == "" || strings.Contains(strings.TrimSuffix(m, "*"), "*") {
+				errs = append(errs, fmt.Errorf("%s: models entry %q must be a model name or a prefix ending in *", where, m))
+			}
+		}
 	}
 	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
 		errs = append(errs, errors.New("tls: cert_file and key_file must be set together"))
@@ -592,6 +739,19 @@ func (c *Config) validate() error {
 			errs = append(errs, errors.New("models.aliases: names must not be empty"))
 		} else if _, chained := c.Models.Aliases[target]; chained {
 			errs = append(errs, fmt.Errorf("models.aliases: %q points to %q, which is itself an alias", alias, target))
+		}
+	}
+	for model, list := range c.Models.Fallbacks {
+		seen := map[string]bool{model: true}
+		for _, f := range list {
+			if f == "" || seen[f] {
+				errs = append(errs, fmt.Errorf("models.fallbacks[%q]: entries must be non-empty, distinct and not the model itself", model))
+				break
+			}
+			seen[f] = true
+		}
+		if _, isAlias := c.Models.Aliases[model]; isAlias {
+			errs = append(errs, fmt.Errorf("models.fallbacks: %q is an alias; key fallbacks by the model it points to", model))
 		}
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {

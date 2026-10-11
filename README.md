@@ -42,14 +42,17 @@ endpoint.
    in under a millisecond. Interactive traffic can be given priority over batch jobs. See
    [docs/TUNING.md](docs/TUNING.md).
 6. **Ready for a platform team.** Built-in HTTPS with certificate hot-swap and optional mutual TLS,
-   separate admin keys, per-team limits (concurrency, requests per minute, tokens per day), and
-   per-team usage for chargeback. Config changes apply live via `SIGHUP` or `POST /admin/reload`.
-   Several routers can run as one cluster, sharing conversation placement and quotas. Traces go
+   separate admin keys, per-team limits (concurrency, requests per minute, tokens per day, allowed
+   models, max tokens per request), and per-team usage for chargeback. Config changes apply live
+   via `SIGHUP` or `POST /admin/reload`. Backends can be found in DNS (Kubernetes headless
+   services, Consul SRV) and drained for maintenance without dropping a request. Several routers
+   can run as one cluster, sharing conversation placement, quotas and limits. Traces go
    to any OpenTelemetry collector. A Helm chart, systemd units and release builds are included.
    See [docs/OPERATIONS.md](docs/OPERATIONS.md).
 7. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
-   back when they recover.
+   back when they recover. When a model has no capacity left, requests can fall back to a smaller
+   model instead of failing, and under overload high-priority traffic displaces queued batch work.
 
 Your apps don't change: point any OpenAI client at SiliconRouter instead of a single server.
 Other AI APIs work too, including Anthropic-style, Ollama, TGI, Triton/KServe, Gemini-style, and any custom
@@ -123,6 +126,7 @@ OpenAI-compatible servers return).
 | `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
 | `GET /admin/usage`        | Requests, rejections and tokens per client (API key name)     |
 | `POST /admin/reload`      | Re-read the config file and apply it live (also `SIGHUP`)      |
+| `POST /admin/backends/{name}/drain`, `/undrain` | Take a backend out of rotation for maintenance, or put it back |
 | `GET /metrics`            | Prometheus metrics                                            |
 | `GET /healthz`, `/readyz` | Liveness, and readiness (at least one healthy backend)        |
 
@@ -134,8 +138,9 @@ Request headers:
   old messages.
 
 Response headers: `X-SiliconRouter-Backend` (which server answered),
-`X-SiliconRouter-Prefix-Cache` (`hit` when routed to the server holding the conversation), and
-`X-SiliconRouter-Cache` (`hit`/`miss` when the response cache is enabled).
+`X-SiliconRouter-Prefix-Cache` (`hit` when routed to the server holding the conversation),
+`X-SiliconRouter-Cache` (`hit`/`miss` when the response cache is enabled), and
+`X-SiliconRouter-Fallback` (the model that answered, when it was a fallback).
 
 Optional request headers: `X-SiliconRouter-Priority: high|normal|low` (when `queue.priority_header` is
 on) and `Cache-Control: no-cache` (skip the response cache).
@@ -180,11 +185,12 @@ internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
 internal/pool       backends, scheduler/queue, health checking
 internal/affinity   prefix → backend LRU table
 internal/cache      response cache (LRU, byte budget, TTL, request coalescing, persistence)
-internal/cluster    multi-router sync of prefix affinity and daily usage
+internal/cluster    multi-router sync of prefix affinity, usage and in-flight counts
+internal/discovery  backends from DNS A/AAAA and SRV records
 internal/tracing    W3C trace context and OTLP/HTTP span export
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload
-internal/prompt     single-pass request scanner, prefix hashing, size estimates
+internal/prompt     single-pass request scanner, prefix hashing, size estimates, policy claims
 internal/config     YAML config, defaults, validation
 ```
 

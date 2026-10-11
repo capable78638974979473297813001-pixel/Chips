@@ -1,5 +1,5 @@
 # SiliconRouter configuration reference.
-# Every setting except `backends` is optional; the values shown are the defaults.
+# Every setting except `backends` (or `discovery`) is optional; the values shown are the defaults.
 
 listen: ":8080"
 max_body_bytes: 16777216          # reject request bodies larger than this (16 MiB)
@@ -28,6 +28,10 @@ auth:
   #     max_concurrent: 8            # requests in flight or queued at once
   #     requests_per_minute: 120     # sustained rate; bursts up to a minute's worth
   #     tokens_per_day: 2000000      # prompt + completion tokens per UTC day
+  #   - name: interns
+  #     key_env: INTERN_KEY
+  #     models: ["llama-3.1-8b", "qwen2.5-*"]  # only these models (exact, or prefix*)
+  #     max_tokens: 1024             # completion budget cap per request
 
 # Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
 # llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.
@@ -109,6 +113,23 @@ models:
   # aliases:
   #   gpt-4o: llama-3.1-70b
   #   text-embedding-3-small: bge-large-en
+  # When a model's backends are down, saturated or too slow to free a slot,
+  # try these models instead, in order.
+  fallbacks: {}
+  # fallbacks:
+  #   llama-3.1-70b: [llama-3.1-8b]
+
+# Find backends in DNS instead of (or as well as) listing them above.
+# Each A/AAAA record or SRV target becomes a backend named <name>-<host>:<port>.
+# discovery:
+#   - name: vllm
+#     dns: vllm-headless.ai.svc.cluster.local   # or srv: _http._tcp.vllm.service.consul
+#     port: 8000                                # dns only; SRV records carry the port
+#     scheme: http
+#     interval: 15s
+#     agent_port: 9400                          # chipagent on each host (optional)
+#     grpc_port: 0                              # gRPC endpoint on each host (optional)
+#     backend: {tier: auto, max_concurrency: 32}  # any backend setting except name/urls
 
 health:
   disabled: false

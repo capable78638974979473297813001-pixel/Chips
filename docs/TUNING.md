@@ -10,6 +10,8 @@
 | **Request coalescing** | Many identical requests arriving together each using a GPU | automatic with the cache |
 | **Exact token counts near limits** | A prompt sent to a backend too small for it, or a large backend left unused | backend `tokenize` |
 | **Priority classes** | Batch jobs filling the queue ahead of interactive users | `auth.keys[].priority`, `queue.priority_header` |
+| **Load shedding** | Interactive users turned away because batch work filled the queue | automatic with priorities |
+| **Model fallbacks** | Errors or long waits while a model's GPUs are down or saturated | `models.fallbacks` |
 | **Prefix-cache routing** | Re-reading a whole conversation on every turn | `routing.prefix_affinity` (default on) |
 | **Fair queue + backpressure** | Overloading a GPU until every request on it crawls | `max_concurrency`, `queue.*` |
 | **Hardware tiers** | Small requests waiting behind big ones on the big GPUs | `tier` / `tier: auto` |
@@ -109,6 +111,31 @@ Aliases work for model names in the JSON body and in URLs (Triton, KServe, Gemin
 `GET /v1/models` lists each alias whose target is being served, so OpenAI SDKs that check the
 model list keep working.
 
+### Model fallbacks
+
+```yaml
+models:
+  fallbacks:
+    llama-3.1-70b: [llama-3.1-8b]          # tried in order
+    qwen2.5-72b: [qwen2.5-32b, qwen2.5-7b]
+```
+
+When a request's model can't take it, the router tries the next model in its list. That happens
+when:
+- no healthy backend serves the model;
+- every backend for it failed;
+- its queue is full, or the request was shed;
+- the request waited `queue.max_wait` without getting a slot.
+
+The fallback gets a fresh retry budget and a fresh queue wait. The backend receives the fallback's
+name, and the response carries `X-SiliconRouter-Fallback: llama-3.1-8b`, so clients can tell. A
+fallback's answer is never stored in the response cache under the original request.
+`siliconrouter_model_fallbacks_total{model,fallback}` counts how often each fallback is used, and
+request logs show it. Keys are real model names: put the alias's target, not the alias.
+
+Fallbacks respect key policy: a key is never moved to a model its `models` list doesn't allow (see
+OPERATIONS.md).
+
 ### Priority classes
 
 ```yaml
@@ -126,6 +153,12 @@ in arrival order within each class. Priorities only matter under load; with free
 request is dispatched immediately. Request logs include the key's `client` name and `priority`.
 Leave `priority_header` off unless every client is trusted, since it lets a client raise its own
 priority.
+
+**Load shedding.** When the queue is full (`queue.max_waiting`) and a request arrives with a higher
+priority than the lowest one waiting, the newest lowest-priority waiter gives up its place. It gets
+`429` with `Retry-After` (counted as `siliconrouter_rejected_total{reason="shed"}`), and the new
+request queues instead. Under overload, interactive traffic displaces batch work instead of being
+turned away. Requests of equal priority never displace each other.
 
 ### Per-backend settings
 

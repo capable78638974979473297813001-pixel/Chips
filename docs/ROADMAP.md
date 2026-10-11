@@ -23,6 +23,9 @@
   coalescing, exact token counts near context limits, gRPC and WebSocket passthrough, OTLP
   tracing, log sampling, Grafana dashboard, Helm chart, systemd units, release builds, chipagent
   plugins
+- Fleet operations: drain/undrain backends for maintenance, priority load shedding, model
+  fallbacks, per-key model allow-lists and token caps, DNS/SRV backend discovery, and cluster-wide
+  concurrency and rate limits
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
 
@@ -32,7 +35,7 @@
 |---|---|
 | Queue-depth and KV-usage signals scraped from vLLM/SGLang `/metrics` | Route on real KV-cache pressure. Raw GPU memory from chipagent can't show it, because engines reserve memory up front |
 | Real-hardware validation of chipagent and its plugins; TPU and Intel GPU plugins | Confirm readings on every vendor |
-| Fleet-wide rate limits in cluster mode | Today only daily quotas are shared; per-minute and concurrency limits apply per router |
+| Demand-weighted rate shares in cluster mode | Rates are split evenly across routers today, which under-admits behind sticky load balancing |
 
 ## Research track (hard, and not promised)
 

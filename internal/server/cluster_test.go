@@ -112,6 +112,14 @@ func TestQuotaHoldsAcrossRouters(t *testing.T) {
 	if code := chat(t, b.URL, `{}`, auth...).StatusCode; code != 200 { // 60 on B: each alone is under 100
 		t.Fatal(code)
 	}
+	// Usage is recorded after the response is relayed, so wait for it
+	// before pushing it to the peer.
+	for _, r := range []*httptest.Server{a, b} {
+		waitUntil(t, func() bool {
+			u := r.Config.Handler.(*Server).limits.Snapshot()
+			return len(u) == 1 && u[0].TokensToday == 60
+		})
+	}
 	syncNow(a)
 	syncNow(b)
 	for _, r := range []*httptest.Server{a, b} {
@@ -133,5 +141,28 @@ func TestClusterRejectsWrongSecret(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 401 {
 		t.Errorf("wrong secret: %d", resp.StatusCode)
+	}
+}
+
+func TestConcurrencyLimitIsClusterWide(t *testing.T) {
+	release := make(chan struct{})
+	g := newFake(t, func(w http.ResponseWriter, r *http.Request) { <-release })
+	a, b := twoRouters(t, func(c *config.Config) {
+		c.Auth.Keys = []config.APIKey{{Name: "team", Key: "k", MaxConcurrent: 1}}
+	}, g.URL)
+	defer close(release)
+	key := []string{"Authorization", "Bearer k"}
+
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, a.URL+"/v1/chat/completions", strings.NewReader(`{}`))
+		req.Header.Set(key[0], key[1])
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	waitUntil(t, func() bool { return g.hits.Load() == 1 })
+	syncNow(a) // B learns that team has a request in flight on A
+	if resp := chat(t, b.URL, `{}`, key...); resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("router B admitted a second concurrent request: %d", resp.StatusCode)
 	}
 }
