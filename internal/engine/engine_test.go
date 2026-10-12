@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -75,7 +76,8 @@ func TestParse(t *testing.T) {
 			Stats{Engine: "vllm", Running: 4, Waiting: 0, KVUsage: -1, Generated: -1}},
 	} {
 		got, err := Parse(strings.NewReader(tc.body))
-		if err != nil || got != tc.want {
+		tc.want.MaxLoRA = -1
+		if err != nil || !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: got %+v, %v; want %+v", name, got, err, tc.want)
 		}
 	}
@@ -93,7 +95,7 @@ func TestRealVLLM(t *testing.T) {
 	}
 	defer f.Close()
 	got, err := Parse(f)
-	if want := (Stats{Engine: "vllm", Running: 0, Waiting: 0, KVUsage: 0, Generated: 0}); err != nil || got != want {
+	if want := (Stats{Engine: "vllm", Running: 0, Waiting: 0, KVUsage: 0, Generated: 0, MaxLoRA: -1}); err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -130,4 +132,39 @@ func FuzzParse(f *testing.F) {
 			t.Fatalf("out of range: %+v from %q", st, s)
 		}
 	})
+}
+
+// vLLM reports LoRA use as one gauge series per adapter set, valued with
+// the time it was current.
+func TestParsesLoRAAdapters(t *testing.T) {
+	text := vllm + `# HELP vllm:lora_requests_info Running stats on lora requests.
+# TYPE vllm:lora_requests_info gauge
+vllm:lora_requests_info{max_lora="4",running_lora_adapters="old",waiting_lora_adapters=""} 1.7e9
+vllm:lora_requests_info{max_lora="4",running_lora_adapters="sql-bot,support-v3",waiting_lora_adapters="legal, sql-bot"} 1.7600000001e9
+vllm:lora_requests_info{max_lora="4",running_lora_adapters="",waiting_lora_adapters=""} 1.75e9
+`
+	st, err := Parse(strings.NewReader(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(st.Adapters, ","); got != "sql-bot,support-v3,legal" || st.MaxLoRA != 4 {
+		t.Errorf("adapters %q max %d, want sql-bot,support-v3,legal and 4", got, st.MaxLoRA)
+	}
+	if st.Running != 21 {
+		t.Errorf("other metrics still parsed: running %v", st.Running)
+	}
+	plain, _ := Parse(strings.NewReader(vllm))
+	if plain.Adapters != nil || plain.MaxLoRA != -1 {
+		t.Errorf("without LoRA info: %v %d", plain.Adapters, plain.MaxLoRA)
+	}
+}
+
+func TestLabels(t *testing.T) {
+	got := labels(`m{a="x,y",b="q\"uote\\",c=""} 1`)
+	if got["a"] != "x,y" || got["b"] != `q"uote\` || got["c"] != "" || len(got) != 3 {
+		t.Errorf("labels = %#v", got)
+	}
+	if labels("m 1") != nil {
+		t.Error("no labels should be nil")
+	}
 }

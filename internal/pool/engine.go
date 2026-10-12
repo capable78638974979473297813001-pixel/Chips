@@ -181,8 +181,11 @@ type EngineStatus struct {
 	KVUsage   *float64 `json:"kv_cache_usage,omitempty"`
 	Saturated bool     `json:"saturated"`
 	Stalled   bool     `json:"stalled,omitempty"`
-	Stale     bool     `json:"stale,omitempty"`
-	Error     string   `json:"error,omitempty"`
+	// LoRA adapters with requests running or waiting, and adapter slots.
+	LoRAAdapters []string `json:"lora_adapters,omitempty"`
+	MaxLoRA      *int     `json:"max_lora,omitempty"`
+	Stale        bool     `json:"stale,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }
 
 func (p *Pool) engineStatusLocked(b *Backend, now time.Time) *EngineStatus {
@@ -203,6 +206,10 @@ func (p *Pool) engineStatusLocked(b *Backend, now time.Time) *EngineStatus {
 	}
 	if st.KVUsage >= 0 {
 		es.KVUsage = &st.KVUsage
+	}
+	es.LoRAAdapters = st.Adapters
+	if st.MaxLoRA >= 0 {
+		es.MaxLoRA = &st.MaxLoRA
 	}
 	_, fresh := b.engineStats(now)
 	es.Stale = !fresh

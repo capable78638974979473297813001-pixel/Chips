@@ -64,10 +64,16 @@ type Backend struct {
 	okStreak   int
 	failStreak int
 	discovered map[string]bool
-	lastErr    string
-	hw         *hardware.Report
-	hwErr      string
-	hwFault    bool // chipagent reports a failed accelerator: no new work
+	// discoveredAt is when discovered was last refreshed.
+	discoveredAt time.Time
+	// dynamicLoRA: the engine loads adapters at runtime. adapters records
+	// when this router last loaded or used each adapter here (see lora.go).
+	dynamicLoRA bool
+	adapters    map[string]time.Time
+	lastErr     string
+	hw          *hardware.Report
+	hwErr       string
+	hwFault     bool // chipagent reports a failed accelerator: no new work
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
@@ -99,6 +105,8 @@ type Request struct {
 	// Priority orders the wait queue: higher ranks are served first
 	// (see config.PriorityRank). Requests of equal priority stay FIFO.
 	Priority int
+	// Base is set when Model is a LoRA adapter: the model it adapts.
+	Base string
 }
 
 // Lease is a held concurrency slot. Release must be called exactly once
@@ -109,8 +117,13 @@ type Lease struct {
 	Affinity bool
 	// Waited is how long the request queued for the slot.
 	Waited time.Duration
-	pool   *Pool
-	once   sync.Once
+	// For a request naming a LoRA adapter: AdapterLoaded says the backend
+	// was known to have it, and NeedsLoad that it must be loaded first
+	// (the backend has dynamic_lora and isn't known to have it).
+	AdapterLoaded bool
+	NeedsLoad     bool
+	pool          *Pool
+	once          sync.Once
 	// Cost accounting: the backend's cost clock at grant, its prices and
 	// cost-report name then, and the time cost charged at release.
 	costStart float64
@@ -270,6 +283,7 @@ func (b *Backend) setCapacity(cb config.Backend) {
 	b.setPricingLocked(pricingOf(cb), time.Now())
 	b.MaxConcurrency = cb.MaxConcurrency
 	b.MaxContextTokens = cb.MaxContextTokens
+	b.dynamicLoRA = cb.DynamicLoRA
 	b.models = map[string]bool{}
 	for _, m := range cb.Models {
 		b.models[m] = true
@@ -330,10 +344,10 @@ func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error)
 			next = append(next, b)
 			changes = append(changes, "replaced backend "+cb.Name+" (endpoint or credentials changed)")
 		default:
-			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price)
+			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price, old.dynamicLoRA)
 			old.setCapacity(cb)
 			old.index = i
-			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price) != before {
+			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price, old.dynamicLoRA) != before {
 				changes = append(changes, "updated backend "+cb.Name)
 			}
 			next = append(next, old)
@@ -387,7 +401,7 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 			return nil, err
 		}
 		if b != nil {
-			l := p.grantLocked(b, aff, start)
+			l := p.grantLocked(b, req, aff, start)
 			p.mu.Unlock()
 			return l, nil
 		}
@@ -483,11 +497,17 @@ func (p *Pool) QueueDepth() int {
 	return p.waiters.Len()
 }
 
-func (p *Pool) grantLocked(b *Backend, affinity bool, start time.Time) *Lease {
-	b.advanceCostLocked(p.now())
+func (p *Pool) grantLocked(b *Backend, r Request, affinity bool, start time.Time) *Lease {
+	now := p.now()
+	b.advanceCostLocked(now)
 	b.inflight++
-	return &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p,
+	l := &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p,
 		costStart: b.costClock, price: b.price, hardware: b.hardwareNameLocked()}
+	if r.Base != "" {
+		l.AdapterLoaded = b.hasAdapterLocked(r.Model, now)
+		l.NeedsLoad = !l.AdapterLoaded && b.dynamicLoRA
+	}
+	return l
 }
 
 // dispatchLocked hands freed slots to waiters in arrival order. A waiter that
@@ -510,7 +530,7 @@ func (p *Pool) dispatchLocked(checkAll bool) {
 		case b != nil:
 			p.waiters.Remove(el)
 			w.el = nil
-			w.ch <- result{lease: p.grantLocked(b, aff, w.start)}
+			w.ch <- result{lease: p.grantLocked(b, w.req, aff, w.start)}
 		}
 		el = next
 	}
@@ -535,7 +555,7 @@ func (p *Pool) NearContextLimit(r Request, margin float64) (counter *Backend, ne
 	defer p.mu.Unlock()
 	need := float64(r.PromptTokens + r.MaxTokens)
 	for _, b := range p.backends {
-		if !b.healthy || b.drained || r.Exclude[b.Name] || !b.serves(r.Model) {
+		if !b.healthy || b.drained || r.Exclude[b.Name] || !b.servesRequest(r) {
 			continue
 		}
 		if b.Tokenize != "" && counter == nil {
@@ -589,7 +609,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {
@@ -662,6 +682,9 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 				return b, true, nil
 			}
 		}
+	}
+	if r.Base != "" {
+		free = p.loraCandidatesLocked(free, r.Model, loads, minLoad, now)
 	}
 
 	order := smallOrder
@@ -782,7 +805,7 @@ func (p *Pool) SetDiscoveredModels(b *Backend, models []string) {
 		set[m] = true
 	}
 	p.mu.Lock()
-	b.discovered = set
+	b.discovered, b.discoveredAt = set, time.Now()
 	p.mu.Unlock()
 }
 
@@ -890,6 +913,9 @@ type Status struct {
 	TTFTMillis float64         `json:"ttft_ms"`
 	Hardware   *HardwareStatus `json:"hardware,omitempty"`
 	Engine     *EngineStatus   `json:"engine,omitempty"`
+	// LoRAAdapters are adapters known to be loaded here (see lora.go).
+	LoRAAdapters []string `json:"lora_adapters,omitempty"`
+	DynamicLoRA  bool     `json:"dynamic_lora,omitempty"`
 }
 
 func (p *Pool) Snapshot() []Status {
@@ -924,5 +950,8 @@ func (p *Pool) statusLocked(b *Backend) Status {
 		TTFTMillis: math.Round(b.ttft * 1000),
 		Hardware:   b.hardwareStatus(),
 		Engine:     p.engineStatusLocked(b, time.Now()),
+
+		LoRAAdapters: b.knownAdaptersLocked(time.Now()),
+		DynamicLoRA:  b.dynamicLoRA,
 	}
 }

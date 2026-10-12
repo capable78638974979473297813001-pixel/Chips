@@ -32,6 +32,11 @@ type Stats struct {
 	// when it does not count them as it goes. Its growth between scrapes
 	// shows whether an engine with running requests is making progress.
 	Generated float64
+	// Adapters are the LoRA adapters with requests running or waiting, and
+	// MaxLoRA how many the engine can hold on the GPU at once (-1 when the
+	// engine does not say). vLLM only.
+	Adapters []string
+	MaxLoRA  int
 }
 
 type role int
@@ -78,8 +83,9 @@ var ErrNoMetrics = errors.New("no known inference engine metrics (vLLM, SGLang, 
 
 // Parse reads Prometheus text exposition format.
 func Parse(r io.Reader) (Stats, error) {
-	st := Stats{Running: -1, KVUsage: -1, Generated: -1}
+	st := Stats{Running: -1, KVUsage: -1, Generated: -1, MaxLoRA: -1}
 	found := false
+	loraAt := math.Inf(-1) // the newest lora_requests_info sample wins
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -89,6 +95,15 @@ func Parse(r io.Reader) (Stats, error) {
 		}
 		name, value, ok := sample(line)
 		if !ok {
+			continue
+		}
+		if name == loraInfo {
+			// One series per adapter set, valued with the time it was
+			// current; only the newest describes the engine now.
+			if value > loraAt {
+				loraAt = value
+				st.Adapters, st.MaxLoRA = loraAdapters(labels(line))
+			}
 			continue
 		}
 		m, ok := known[name]
@@ -117,6 +132,72 @@ func Parse(r io.Reader) (Stats, error) {
 		return Stats{}, ErrNoMetrics
 	}
 	return st, nil
+}
+
+// loraInfo is vLLM's gauge of which LoRA adapters are in use. Its labels
+// carry the data: running_lora_adapters and waiting_lora_adapters (comma
+// separated names) and max_lora.
+const loraInfo = "vllm:lora_requests_info"
+
+func loraAdapters(l map[string]string) ([]string, int) {
+	var out []string
+	seen := map[string]bool{}
+	for _, k := range []string{"running_lora_adapters", "waiting_lora_adapters"} {
+		for _, a := range strings.Split(l[k], ",") {
+			if a = strings.TrimSpace(a); a != "" && !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	maxLoRA := -1
+	if n, err := strconv.Atoi(l["max_lora"]); err == nil && n >= 0 {
+		maxLoRA = n
+	}
+	return out, maxLoRA
+}
+
+// labels parses the label set of a sample line; nil when it has none.
+func labels(line string) map[string]string {
+	i := strings.IndexByte(line, '{')
+	if i < 0 {
+		return nil
+	}
+	rest := line[i:]
+	end := labelsEnd(rest)
+	if end < 0 {
+		return nil
+	}
+	body := rest[1:end]
+	out := map[string]string{}
+	for len(body) > 0 {
+		eq := strings.IndexByte(body, '=')
+		if eq < 0 || eq+1 >= len(body) || body[eq+1] != '"' {
+			return out
+		}
+		name := strings.TrimSpace(strings.TrimLeft(body[:eq], ", "))
+		var val strings.Builder
+		j := eq + 2
+		for ; j < len(body) && body[j] != '"'; j++ {
+			if body[j] == '\\' && j+1 < len(body) {
+				j++
+				switch body[j] {
+				case 'n':
+					val.WriteByte('\n')
+				default:
+					val.WriteByte(body[j])
+				}
+				continue
+			}
+			val.WriteByte(body[j])
+		}
+		out[name] = val.String()
+		if j+1 >= len(body) {
+			break
+		}
+		body = body[j+1:]
+	}
+	return out
 }
 
 // sample splits `name{labels} value [timestamp]`.

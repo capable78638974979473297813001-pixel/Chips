@@ -104,6 +104,50 @@ Readings older than three intervals are ignored, so a failing scrape never pins 
 `siliconrouter_backend_engine_waiting`, `..._kv_cache_usage` and `..._saturated`. Engines without
 these metrics (Ollama, most custom servers) are routed on the router's own counts, as before.
 
+### LoRA-aware routing
+
+Companies often serve dozens of fine-tuned LoRA adapters on one base model. An engine answers an
+adapter's request fastest when that adapter is already loaded. Otherwise it has to read the
+adapter's weights, and once its adapter slots (vLLM's `--max-loras`) are full, it evicts another
+adapter that is still in use. Declare your adapters and the router keeps each one on the servers
+that have it:
+
+```yaml
+models:
+  adapters:
+    - {name: support-bot-v3, base: llama-3.1-8b, path: /models/loras/support-bot-v3}
+    - {name: sql-writer, base: llama-3.1-8b, path: acme/sql-writer-lora}   # a Hugging Face repo works too
+backends:
+  - name: gpu-1
+    url: http://10.0.0.21:8000
+    metrics_path: /metrics      # shows which adapters each engine is using right now
+    dynamic_lora: true          # vLLM started with VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+```
+
+A request whose `model` is an adapter goes, in order of preference, to:
+
+1. a backend that has the adapter loaded, unless it is much busier than the least busy alternative
+   (`routing.affinity_max_imbalance`, the same guard prefix-cache routing uses);
+2. a backend with a free adapter slot;
+3. any other backend that can serve it.
+
+A backend counts as having an adapter when its model list says so (`models` in the config, or
+`/v1/models`, where vLLM lists loaded adapters), when its engine metrics show requests for it
+(`vllm:lora_requests_info`), or when this router loaded or used it there since the model list was
+last refreshed. Free slots come from the same metric's `max_lora`.
+
+With `dynamic_lora: true`, a backend that serves the base model can take any of its adapters. If the
+backend doesn't have the adapter, the router loads it first with vLLM's
+`POST /v1/load_lora_adapter`, from `path`. Concurrent requests share one load. If a load fails,
+the request moves to another backend, and the failure doesn't count against that backend's health.
+Without `dynamic_lora`, an adapter only goes to backends that list it, for example from
+`--lora-modules`.
+
+`siliconrouter_lora_routing_total{result}` counts placements: `loaded`, `loaded_on_demand`,
+`load_failed`, and `unknown` (sent to a backend not known to have the adapter). `/admin/backends`
+lists each backend's `lora_adapters`. `mockllm -max-loras 2` simulates adapter slots, loading and
+swap delay, so you can try this without GPUs.
+
 ### Prompt sizes and context limits
 
 Routing needs each prompt's size to skip backends whose `max_context_tokens` it would exceed. The

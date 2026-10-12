@@ -200,6 +200,30 @@ type Models struct {
 	// smaller model, while the big GPUs are down or saturated. Keys are the
 	// real model names (after aliases).
 	Fallbacks map[string][]string `yaml:"fallbacks"`
+	// Adapters are LoRA fine-tunes of a base model. A request naming an
+	// adapter goes to a backend that already has it loaded when one has room,
+	// else to one with a free adapter slot, so engines don't keep swapping
+	// adapters in and out. Backends with dynamic_lora load it on demand.
+	Adapters []Adapter `yaml:"adapters"`
+}
+
+// Adapter is one LoRA adapter clients can ask for by name.
+type Adapter struct {
+	Name string `yaml:"name"` // the model name clients send
+	Base string `yaml:"base"` // the model it was trained on
+	// Path is where an engine loads it from (a directory or a Hugging Face
+	// repo id), for backends with dynamic_lora.
+	Path string `yaml:"path"`
+}
+
+// Adapter returns the adapter named name, if one is configured.
+func (m Models) Adapter(name string) (Adapter, bool) {
+	for _, a := range m.Adapters {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return Adapter{}, false
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
@@ -284,6 +308,11 @@ type Backend struct {
 	// usually /metrics, to route on the engine's real queue and KV-cache
 	// pressure, including load from clients that bypass this router.
 	MetricsPath string `yaml:"metrics_path"`
+	// DynamicLoRA means the backend can load LoRA adapters at runtime (vLLM
+	// with VLLM_ALLOW_RUNTIME_LORA_UPDATING=True): any adapter in
+	// models.adapters whose base model it serves can be sent to it, and the
+	// router loads the adapter first if the backend doesn't have it.
+	DynamicLoRA bool `yaml:"dynamic_lora"`
 
 	// CostPerHour is what this server costs to run, in dollars per hour (a
 	// cloud price, or hardware amortization plus power). Its time is charged
@@ -852,6 +881,22 @@ func (c *Config) validate() error {
 		if _, isAlias := c.Models.Aliases[model]; isAlias {
 			errs = append(errs, fmt.Errorf("models.fallbacks: %q is an alias; key fallbacks by the model it points to", model))
 		}
+	}
+	adapters := map[string]bool{}
+	for i, a := range c.Models.Adapters {
+		where := fmt.Sprintf("models.adapters[%d]", i)
+		switch {
+		case a.Name == "" || a.Base == "":
+			errs = append(errs, fmt.Errorf("%s: name and base are required", where))
+		case a.Name == a.Base:
+			errs = append(errs, fmt.Errorf("%s: an adapter can't be its own base model", where))
+		case adapters[a.Name]:
+			errs = append(errs, fmt.Errorf("%s: duplicate name %q", where, a.Name))
+		}
+		if _, isAlias := c.Models.Aliases[a.Name]; isAlias {
+			errs = append(errs, fmt.Errorf("%s: %q is also an alias; aliases may point to adapters instead", where, a.Name))
+		}
+		adapters[a.Name] = true
 	}
 	if !strings.HasPrefix(c.Health.Path, "/") {
 		errs = append(errs, errors.New("health.path must start with /"))

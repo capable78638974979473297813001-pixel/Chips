@@ -85,6 +85,8 @@ type Server struct {
 	clientCost    *metrics.CounterVec
 	budgetSpent   *metrics.CounterVec
 	panics        *metrics.CounterVec
+	loraRouting   *metrics.CounterVec
+	loads         adapterLoads
 	draining      atomic.Bool
 	// idleBooked is each backend's idle cost already in the ledger.
 	idleMu      sync.Mutex
@@ -202,6 +204,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
 		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
+		loraRouting:   reg.NewCounterVec("siliconrouter_lora_routing_total", "Requests for LoRA adapters by placement: loaded (backend had the adapter), loaded_on_demand (the router loaded it first), load_failed, or unknown (backend not known to have it).", "result"),
 		clientCost:    reg.NewCounterVec("siliconrouter_client_cost_dollars_total", "Dollars charged per client and hardware: each request's share of its backend's cost_per_hour while it ran, plus token prices.", "client", "hardware"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
@@ -637,6 +640,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		Exclude:      map[string]bool{},
 		Priority:     priority,
 	}
+	adapter, _ := setAdapter(&req, st.cfg.Models)
 	// Near a backend's context limit, an estimate is not good enough: count
 	// exactly, so the prompt neither goes to a backend that must reject it
 	// nor skips one it would fit.
@@ -679,6 +683,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			path = prompt.ReplacePathModel(path, m)
 		}
 		info.Model, req.Model, rl.fallback = m, m, m
+		adapter, _ = setAdapter(&req, st.cfg.Models)
 		req.Exclude = map[string]bool{}
 		s.fallbacks.Inc(asked, m)
 	}
@@ -715,6 +720,29 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 				Name: "queue wait", Start: now.Add(-lease.Waited), End: now})
 		}
 		b := lease.Backend
+		if lease.NeedsLoad {
+			if err := s.loadAdapter(r.Context(), b, adapter); err != nil {
+				lease.Release()
+				s.charge(rl, who, lease, 0, 0)
+				s.loraRouting.Inc("load_failed")
+				if r.Context().Err() != nil {
+					s.logRequest(rl, b.Name, 499, attempt, false, r.Context().Err())
+					return
+				}
+				lastErr = fmt.Sprintf("%s: load LoRA adapter %s: %v", b.Name, adapter.Name, err)
+				req.Exclude[b.Name] = true
+				if tries >= st.cfg.Retry.MaxAttempts {
+					if len(fallbacks) == 0 {
+						writeError(w, http.StatusBadGateway, "adapter_load_failed", lastErr)
+						s.logRequest(rl, b.Name, http.StatusBadGateway, attempt, false, err)
+						return
+					}
+					fallBack()
+					tries = 0
+				}
+				continue
+			}
+		}
 		final := tries >= st.cfg.Retry.MaxAttempts && len(fallbacks) == 0
 		if !final && !s.retryBudget.allows() {
 			// No retry would be allowed after this attempt, so it is the
@@ -768,6 +796,19 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		resp := res.resp
 		if resp.StatusCode < 500 {
 			s.pool.Observe(b, true, true, "")
+		}
+		if req.Base != "" {
+			switch {
+			case lease.AdapterLoaded:
+				s.loraRouting.Inc("loaded")
+			case lease.NeedsLoad:
+				s.loraRouting.Inc("loaded_on_demand")
+			default:
+				s.loraRouting.Inc("unknown")
+			}
+			if resp.StatusCode < 400 {
+				s.pool.NoteAdapter(b, req.Model)
+			}
 		}
 		if resp.StatusCode < 400 && len(keys) > 0 {
 			s.affinity.Record(keys, b.Name)
