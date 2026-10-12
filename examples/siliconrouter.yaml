@@ -202,6 +202,13 @@ hardware:
   heavy_min_memory_gib: 64          # tier auto: total accelerator memory for heavy...
   standard_min_memory_gib: 20       # ...and for standard; below this a node is light
 
+# Be the endpoint picker of a Kubernetes Gateway API Inference Extension
+# InferencePool: gateways ask over ext_proc gRPC which pod gets each request
+# (docs/GATEWAY.md).
+# gateway:
+#   listen: ":9002"
+#   secure_serving: true            # self-signed TLS unless cert_file/key_file
+
 # Hold requests while GPU servers start, and publish demand for autoscalers
 # (docs/OPERATIONS.md, deploy/kubernetes/keda-scaledobject.yaml).
 autoscaling:

@@ -77,7 +77,25 @@ type Config struct {
 	// demand autoscalers scale on.
 	Autoscaling Autoscaling `yaml:"autoscaling"`
 	Audit       Audit       `yaml:"audit"`
+	// Gateway makes the router the endpoint picker of a Kubernetes Gateway
+	// API Inference Extension InferencePool.
+	Gateway Gateway `yaml:"gateway"`
 }
+
+// Gateway serves Envoy's external processing gRPC protocol (ext_proc) on
+// Listen, so a gateway can ask the router which pod gets each request.
+type Gateway struct {
+	Listen string `yaml:"listen"` // e.g. ":9002"; empty = off
+	// SecureServing serves TLS, as gateways expect from an endpoint picker
+	// by default: with CertFile/KeyFile, or a self-signed certificate.
+	// Off, it serves plaintext HTTP/2 (h2c). Default true.
+	SecureServing *bool  `yaml:"secure_serving"`
+	CertFile      string `yaml:"cert_file"`
+	KeyFile       string `yaml:"key_file"`
+}
+
+func (g Gateway) Enabled() bool { return g.Listen != "" }
+func (g Gateway) TLS() bool     { return g.SecureServing == nil || *g.SecureServing }
 
 // Autoscaling: with ColdStartWait set, a request whose model has no
 // backend up (all down, starting, or scaled to zero) waits for one instead
@@ -1031,6 +1049,16 @@ func (c *Config) validate() error {
 		}
 	}
 	errs = append(errs, c.validateOIDC(names)...)
+	if g := c.Gateway; g.Enabled() {
+		if _, _, err := net.SplitHostPort(g.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("gateway.listen must be host:port, got %q", g.Listen))
+		} else if g.Listen == c.Listen {
+			errs = append(errs, errors.New("gateway.listen must differ from listen"))
+		}
+		if (g.CertFile == "") != (g.KeyFile == "") || (g.CertFile != "" && !g.TLS()) {
+			errs = append(errs, errors.New("gateway: cert_file and key_file go together, and need secure_serving"))
+		}
+	}
 	if c.Audit.MaxSizeMB < 0 || c.Audit.MaxFiles < 0 {
 		errs = append(errs, errors.New("audit: max_size_mb and max_files must not be negative"))
 	}

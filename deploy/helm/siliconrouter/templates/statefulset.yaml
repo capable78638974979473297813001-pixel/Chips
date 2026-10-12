@@ -34,6 +34,9 @@ spec:
           args: ["-config", "/etc/siliconrouter/siliconrouter.yaml", "-log-json"]
           ports:
             - {name: http, containerPort: {{ .Values.service.port }}}
+            {{- if .Values.gateway.enabled }}
+            - {name: grpc-epp, containerPort: {{ .Values.gateway.port }}}
+            {{- end }}
           {{- if .Values.existingSecret }}
           envFrom:
             - secretRef: {name: {{ .Values.existingSecret }}}

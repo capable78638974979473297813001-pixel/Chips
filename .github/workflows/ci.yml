@@ -60,6 +60,7 @@ jobs:
           helm lint deploy/helm/siliconrouter --set existingSecret=s
           helm template sr deploy/helm/siliconrouter --set existingSecret=s,agent.enabled=true,tls.secretName=t,persistence.enabled=true > /dev/null
           helm template sr deploy/helm/siliconrouter --set replicaCount=1 > /dev/null
+          helm template sr deploy/helm/siliconrouter --set existingSecret=s,gateway.enabled=true,gateway.inferencePool.create=true,gateway.inferencePool.selector.app=vllm > /dev/null
       - name: systemd units
         run: |
           sudo touch /usr/local/bin/siliconrouter /usr/local/bin/chipagent

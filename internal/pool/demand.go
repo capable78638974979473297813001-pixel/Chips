@@ -27,7 +27,7 @@ func demandModel(r Request) string {
 // serve it if it were up.
 func (p *Pool) couldServeLocked(r Request) bool {
 	for _, b := range p.backends {
-		if !b.drained && !r.Exclude[b.Name] && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil) {
+		if !b.drained && !r.Exclude[b.Name] && (r.Only == nil || r.Only[b.Name]) && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil) {
 			return true
 		}
 	}

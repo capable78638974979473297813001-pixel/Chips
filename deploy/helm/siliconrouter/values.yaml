@@ -65,6 +65,30 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
+# Gateway API Inference Extension: make the routers the endpoint picker of
+# an InferencePool. The gateway (Envoy Gateway, Istio, kgateway, GKE, ...)
+# then asks them which model server pod gets each request (ext_proc gRPC
+# on gateway.port). See docs/GATEWAY.md.
+gateway:
+  enabled: false
+  port: 9002
+  # TLS with a self-signed certificate, which gateways expect from an
+  # endpoint picker by default. false serves plaintext HTTP/2.
+  secureServing: true
+  inferencePool:
+    # Create the InferencePool (inference.networking.k8s.io/v1) pointing at
+    # these routers, plus a headless Service over the same pods that the
+    # routers discover them from.
+    create: false
+    name: ""                  # default: <release>-pool
+    selector: {}              # the model server pods, e.g. {app: vllm-llama3-8b}
+    targetPort: 8000          # their inference port
+    failureMode: FailClose    # or FailOpen: the gateway picks a pod itself if the routers are down
+    # Backend settings for each discovered pod (any backend setting).
+    backend:
+      max_concurrency: 32
+      metrics_path: /metrics
+
 # Scrape /metrics with the Prometheus Operator.
 serviceMonitor:
   enabled: false

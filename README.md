@@ -51,6 +51,10 @@ endpoint.
    can run as one cluster, sharing conversation placement, quotas and limits. Traces go
    to any OpenTelemetry collector. A Helm chart, systemd units and release builds are included.
    See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+   It can also be the endpoint picker of a Kubernetes Gateway API Inference Extension
+   InferencePool, so Envoy Gateway, Istio, kgateway or GKE gateways route with its decisions; see
+   [docs/GATEWAY.md](docs/GATEWAY.md). Single sign-on (OIDC), per-user quotas, a tamper-evident
+   audit log, and cost reports in dollars per team are built in.
 7. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover. When a model has no capacity left, requests can fall back to a smaller
@@ -198,6 +202,10 @@ internal/discovery  backends from DNS A/AAAA and SRV records
 internal/engine     inference engines' Prometheus metrics (queue depth, KV usage, progress)
 internal/supervise  restarts background loops that panic
 internal/tracing    W3C trace context and OTLP/HTTP span export
+internal/extproc    Gateway API Inference Extension endpoint picker (Envoy ext_proc over gRPC)
+internal/oidc       single sign-on: JWT verification against an OIDC provider's keys
+internal/audit      tamper-evident audit log (hash-chained JSON lines)
+internal/costs      dollars per client, hardware and day
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload
 internal/prompt     single-pass request scanner, prefix hashing, size estimates, policy claims

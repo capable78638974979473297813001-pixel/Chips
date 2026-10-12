@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -285,6 +286,25 @@ func run() error {
 		}()
 	}
 
+	var gw *http.Server
+	if g := cfg.Gateway; g.Enabled() {
+		if gw, err = gatewayServer(g, router); err != nil {
+			return err
+		}
+		go func() {
+			log.Info("gateway endpoint picker listening (ext_proc)", "addr", g.Listen, "tls", g.TLS())
+			var err error
+			if g.TLS() {
+				err = gw.ListenAndServeTLS("", "")
+			} else {
+				err = gw.ListenAndServe()
+			}
+			if !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("gateway listener: %w", err)
+			}
+		}()
+	}
+
 	select {
 	case err := <-errc:
 		return err
@@ -307,6 +327,9 @@ func run() error {
 	log.Info("shutting down; finishing in-flight requests", "timeout", cfg.Shutdown.Timeout.D())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Shutdown.Timeout.D())
 	defer cancel()
+	if gw != nil {
+		go gw.Shutdown(shutdownCtx) // in-flight streams end with their requests
+	}
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	if dir := cfg.StateDir; dir != "" {
 		if err := router.SaveState(dir); err != nil {
@@ -319,4 +342,28 @@ func run() error {
 		return shutdownErr
 	}
 	return nil
+}
+
+// gatewayServer serves the ext_proc endpoint picker over HTTP/2: TLS
+// (configured or self-signed certificate) or plaintext h2c.
+func gatewayServer(g config.Gateway, router *server.Server) (*http.Server, error) {
+	var protocols http.Protocols
+	gw := &http.Server{Addr: g.Listen, Handler: router.Gateway(), ReadHeaderTimeout: 10 * time.Second, Protocols: &protocols}
+	if !g.TLS() {
+		protocols.SetUnencryptedHTTP2(true)
+		return gw, nil
+	}
+	protocols.SetHTTP2(true)
+	var cert tls.Certificate
+	var err error
+	if g.CertFile != "" {
+		cert, err = tls.LoadX509KeyPair(g.CertFile, g.KeyFile)
+	} else {
+		cert, err = tlsconf.SelfSigned()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gateway TLS: %w", err)
+	}
+	gw.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	return gw, nil
 }

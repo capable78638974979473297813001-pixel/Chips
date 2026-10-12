@@ -416,17 +416,14 @@ func clientKey(h http.Header) string {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	if s.draining.Load() {
+	switch {
+	case s.draining.Load():
 		http.Error(w, "draining for shutdown", http.StatusServiceUnavailable)
-		return
+	case s.Ready():
+		io.WriteString(w, "ready\n")
+	default:
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 	}
-	for _, st := range s.pool.Snapshot() {
-		if st.Healthy && !st.Drained {
-			io.WriteString(w, "ready\n")
-			return
-		}
-	}
-	http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 }
 
 func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {

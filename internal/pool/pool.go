@@ -110,6 +110,9 @@ type Request struct {
 	// Hold lets the request wait for a backend to start when none is up
 	// (see Options.ColdStart) instead of failing with ErrNoBackend.
 	Hold bool
+	// Only, when non-nil, restricts the request to these backends (a
+	// gateway's subset hint).
+	Only map[string]bool
 }
 
 // Lease is a held concurrency slot. Release must be called exactly once
@@ -631,7 +634,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && (r.Only == nil || r.Only[b.Name]) && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {

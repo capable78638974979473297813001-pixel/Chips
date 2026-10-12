@@ -6,3 +6,13 @@ In-cluster endpoint:
 Point OpenAI-compatible clients at <endpoint>/v1.
 Change backends or keys without a restart: edit the ConfigMap, wait for it
 to sync into the pods (about a minute), then POST /admin/reload on each router.
+{{- if .Values.gateway.enabled }}
+
+Gateway API Inference Extension endpoint picker (ext_proc gRPC{{ if .Values.gateway.secureServing }}, TLS{{ end }}):
+  {{ include "siliconrouter.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.gateway.port }}
+{{- if .Values.gateway.inferencePool.create }}
+InferencePool {{ include "siliconrouter.poolName" . }} uses it. Route to the pool from an HTTPRoute:
+  backendRefs:
+    - {group: inference.networking.k8s.io, kind: InferencePool, name: {{ include "siliconrouter.poolName" . }}}
+{{- end }}
+{{- end }}
