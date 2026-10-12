@@ -14,9 +14,10 @@ import (
 const (
 	cacheFile = "response-cache.gob"
 	usageFile = "usage.json"
+	costsFile = "costs.json"
 )
 
-// SaveState writes the response cache and usage counters to dir. Each file
+// SaveState writes the response cache, usage counters and costs to dir. Each file
 // is written to a temporary name and renamed, so a crash mid-write never
 // leaves a half-written file behind.
 func (s *Server) SaveState(dir string) error {
@@ -30,6 +31,8 @@ func (s *Server) SaveState(dir string) error {
 	errs = append(errs, writeAtomic(filepath.Join(dir, usageFile), func(w io.Writer) error {
 		return json.NewEncoder(w).Encode(s.limits.Snapshot())
 	}))
+	s.bookIdle()
+	errs = append(errs, writeAtomic(filepath.Join(dir, costsFile), s.costs.Save))
 	return errors.Join(errs...)
 }
 
@@ -50,6 +53,13 @@ func (s *Server) LoadState(dir string) (cached int, err error) {
 			return cached, fmt.Errorf("restore usage: %w", err)
 		}
 		s.limits.Restore(saved)
+	}
+	if f, err := os.Open(filepath.Join(dir, costsFile)); err == nil {
+		err = s.costs.Load(f)
+		f.Close()
+		if err != nil {
+			return cached, fmt.Errorf("restore costs: %w", err)
+		}
 	}
 	return cached, nil
 }

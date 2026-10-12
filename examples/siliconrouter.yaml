@@ -50,6 +50,10 @@ backends:
     # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)
     # tokenize: vllm                # exact token counts near context limits: vllm, llamacpp or tgi
     # grpc_url: http://10.0.0.11:8001  # gRPC endpoint, if it has one (Triton/KServe)
+    # cost_per_hour: 31.20          # dollars per hour; charged to the teams whose requests run on it
+    # hardware_name: H100           # group in cost reports (default: chipagent's GPU name, else this name)
+    # cost_per_million_prompt_tokens: 0      # token prices, for backends billed per token
+    # cost_per_million_completion_tokens: 0
 
   - name: mac-studio-2
     url: http://10.0.0.12:11434     # Ollama

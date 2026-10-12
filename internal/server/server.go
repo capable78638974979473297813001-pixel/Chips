@@ -28,6 +28,7 @@ import (
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cluster"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/costs"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/discovery"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
@@ -61,6 +62,7 @@ type Server struct {
 	pool       *pool.Pool
 	affinity   *affinity.Table
 	limits     *limits.Tracker
+	costs      *costs.Ledger
 	cluster    *cluster.Node // nil when this router runs alone
 	tracer     *tracing.Tracer
 	client     *http.Client
@@ -80,13 +82,17 @@ type Server struct {
 	clientReqs    *metrics.CounterVec
 	clientTokens  *metrics.CounterVec
 	fallbacks     *metrics.CounterVec
+	clientCost    *metrics.CounterVec
 	budgetSpent   *metrics.CounterVec
 	panics        *metrics.CounterVec
 	draining      atomic.Bool
-	retryBudget   *retryBudget
-	duration      *metrics.Histogram
-	queueWait     *metrics.Histogram
-	firstByte     *metrics.Histogram
+	// idleBooked is each backend's idle cost already in the ledger.
+	idleMu      sync.Mutex
+	idleBooked  map[string]float64
+	retryBudget *retryBudget
+	duration    *metrics.Histogram
+	queueWait   *metrics.Histogram
+	firstByte   *metrics.Histogram
 }
 
 // state is an immutable snapshot of the reloadable configuration.
@@ -171,6 +177,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	s := &Server{
 		pool:   p,
 		limits: limits.New(),
+		costs:  costs.New(),
 
 		grpcTransport: newGRPCTransport(client),
 		affinity:      affinity.New(cfg.Routing.AffinityCapacity, cfg.Routing.AffinityTTL.D()),
@@ -195,6 +202,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
 		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
+		clientCost:    reg.NewCounterVec("siliconrouter_client_cost_dollars_total", "Dollars charged per client and hardware: each request's share of its backend's cost_per_hour while it ran, plus token prices.", "client", "hardware"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
@@ -306,6 +314,11 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewCounterFunc("siliconrouter_backend_idle_cost_dollars_total", "Running cost of each backend's time with no requests on it (cost_per_hour while idle).", []string{"backend", "hardware"}, func(emit func(float64, ...string)) {
+		for _, c := range p.IdleCosts() {
+			emit(c.Dollars, c.Backend, c.Hardware)
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_goroutines", "Goroutines in the router; steady growth means a leak.", nil, func(emit func(float64, ...string)) {
 		emit(float64(runtime.NumGoroutine()))
 	})
@@ -329,6 +342,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	})
 	s.mux.Handle("GET /admin/backends", s.requireAdmin(http.HandlerFunc(s.handleBackends)))
 	s.mux.Handle("GET /admin/usage", s.requireAdmin(http.HandlerFunc(s.handleUsage)))
+	s.mux.Handle("GET /admin/costs", s.requireAdmin(http.HandlerFunc(s.handleCosts)))
 	s.mux.Handle("POST /admin/reload", s.requireAdmin(http.HandlerFunc(s.handleReload)))
 	s.mux.Handle("POST /admin/backends/{name}/drain", s.requireAdmin(s.handleDrain(true)))
 	s.mux.Handle("POST /admin/backends/{name}/undrain", s.requireAdmin(s.handleDrain(false)))
@@ -722,6 +736,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			}
 			res.cancel()
 			lease.Release()
+			s.charge(rl, who, lease, 0, 0)
 			if r.Context().Err() != nil {
 				s.logRequest(rl, b.Name, 499, attempt, lease.Affinity, r.Context().Err())
 				return // client went away; nobody to answer
@@ -786,9 +801,11 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		res.cancel()
 		lease.Release()
+		var in, out int64
 		if resp.StatusCode < 400 {
-			s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
+			in, out = s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
 		}
+		s.charge(rl, who, lease, in, out)
 		if capture != nil && copyErr == nil && !capture.overflow {
 			st.cache.Put(cacheKey, &cache.Entry{Status: resp.StatusCode, Header: cacheableHeader(resp.Header), Body: capture.buf.Bytes(), Backend: b.Name})
 		}
@@ -1071,10 +1088,10 @@ func (m *usageMeter) write(p []byte) {
 }
 
 // recordUsage counts a finished request's tokens: as the backend reported
-// them when it did, otherwise estimated.
-func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, charsPerToken float64) {
+// them when it did, otherwise estimated. It returns the counts.
+func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, charsPerToken float64) (in, out int64) {
 	u := prompt.ParseUsage(m.tail)
-	in, out := u.PromptTokens, u.CompletionTokens
+	in, out = u.PromptTokens, u.CompletionTokens
 	inSource, outSource := "reported", "reported"
 	if in < 0 {
 		in, inSource = int64(prompt.EstimateTokens(info.Text, charsPerToken)), "estimated"
@@ -1096,6 +1113,7 @@ func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, 
 	s.limits.Record(who, in, out, inSource == "estimated" || outSource == "estimated")
 	s.clientTokens.Add(float64(in), who, "prompt", inSource)
 	s.clientTokens.Add(float64(out), who, "completion", outSource)
+	return in, out
 }
 
 // first holds body bytes already read from resp; capture, when non-nil,
@@ -1164,7 +1182,8 @@ type requestLog struct {
 	fallback    string // the model that served the request instead of the one asked for
 	cache       string
 	exactTokens int
-	kind        string // websocket or grpc for passthrough sessions
+	cost        float64 // dollars charged, over every attempt
+	kind        string  // websocket or grpc for passthrough sessions
 	trace       tracing.Context
 	span        tracing.SpanID
 }
@@ -1203,6 +1222,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.exactTokens > 0 {
 		attrs = append(attrs, "prompt_tokens_exact", l.exactTokens)
+	}
+	if l.cost > 0 {
+		attrs = append(attrs, "cost_usd", math.Round(l.cost*1e6)/1e6)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())

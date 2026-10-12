@@ -162,6 +162,7 @@ func run() error {
 
 	supervise.Go(ctx, log, "cluster sync", router.RunCluster)
 	supervise.Go(ctx, log, "trace export", router.RunTracing)
+	supervise.Go(ctx, log, "cost accounting", router.RunCosts)
 	if dir := cfg.StateDir; dir != "" {
 		cached, err := router.LoadState(dir)
 		if err != nil {

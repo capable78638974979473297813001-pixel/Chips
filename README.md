@@ -131,6 +131,7 @@ OpenAI-compatible servers return).
 | `GET /v1/models`          | Models served by healthy backends                             |
 | `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
 | `GET /admin/usage`        | Requests, rejections and tokens per client (API key name)     |
+| `GET /admin/costs`        | Dollars per client and hardware over a range of days (`?days=7`) |
 | `POST /admin/reload`      | Re-read the config file and apply it live (also `SIGHUP`)      |
 | `POST /admin/backends/{name}/drain`, `/undrain` | Take a backend out of rotation for maintenance, or put it back |
 | `GET /metrics`            | Prometheus metrics                                            |

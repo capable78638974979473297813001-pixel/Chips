@@ -79,14 +79,25 @@ type GaugeFunc struct {
 	name, help string
 	labels     []string
 	fn         func(emit func(v float64, labelValues ...string))
+	counter    bool
 }
 
 func (r *Registry) NewGaugeFunc(name, help string, labels []string, fn func(emit func(v float64, labelValues ...string))) {
 	r.add(&GaugeFunc{name: name, help: help, labels: labels, fn: fn})
 }
 
+// NewCounterFunc is like NewGaugeFunc for values that only grow, so
+// Prometheus's rate() and increase() apply to them.
+func (r *Registry) NewCounterFunc(name, help string, labels []string, fn func(emit func(v float64, labelValues ...string))) {
+	r.add(&GaugeFunc{name: name, help: help, labels: labels, fn: fn, counter: true})
+}
+
 func (g *GaugeFunc) write(w io.Writer) {
-	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", g.name, g.help, g.name)
+	typ := "gauge"
+	if g.counter {
+		typ = "counter"
+	}
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", g.name, g.help, g.name, typ)
 	g.fn(func(v float64, values ...string) {
 		fmt.Fprintf(w, "%s%s %s\n", g.name, labelString(g.labels, values), formatFloat(v))
 	})

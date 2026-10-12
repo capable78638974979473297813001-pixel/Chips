@@ -132,6 +132,60 @@ For exact numbers on OpenAI-style streams, have clients send
 Counters live in memory, and a config reload keeps them. To keep them across restarts, including
 today's quota, set `state_dir` (see below). Use the Prometheus counters for long-term reporting.
 
+## Cost in dollars
+
+Token counts don't answer the question finance asks: what did each team cost? Give each backend a
+price, and the router turns GPU time into dollars per team and per kind of hardware.
+
+```yaml
+backends:
+  - name: h100-node-1
+    url: http://10.0.0.11:8000
+    cost_per_hour: 31.20          # e.g. an 8x H100 instance; or amortized hardware + power
+    hardware_name: H100           # how it's grouped in reports (default: chipagent's GPU name)
+  - name: hosted-fallback
+    url: https://api.example.com
+    cost_per_million_prompt_tokens: 0.60
+    cost_per_million_completion_tokens: 2.40
+```
+
+**How time becomes dollars.** At each moment, a backend's hourly cost is split evenly between the
+requests running on it. A request that ran alone for 2 seconds on a $36/hour server cost 2 cents. If
+three other requests shared the server for that time, it cost half a cent. The router keeps a
+running "cost clock" per backend, so this costs nothing per request no matter how many share a
+server. Time with nothing running is booked as **idle**, so the bill for unused capacity is visible
+too. Token prices, when set, are added on top. Retries are charged to the client too: a failed
+attempt used the GPU as well.
+
+When a backend has `metrics_path`, the count of running requests is the larger of the router's own
+and what the engine reports. Requests from other routers (cluster mode) or from clients that call
+the engine directly then take their share, and this router's teams aren't billed for them. Without
+engine metrics in cluster mode, each router splits the cost among only its own requests, so the
+fleet-wide sum overcounts. Turn on `metrics_path` for cost reports across several routers.
+
+**Reports:**
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_KEY" 'localhost:8080/admin/costs?days=7'
+curl -H "Authorization: Bearer $ADMIN_KEY" 'localhost:8080/admin/costs?from=2026-10-01&to=2026-10-31'
+```
+
+```json
+{"from": "2026-10-06", "to": "2026-10-12", "currency": "USD",
+ "total_dollars": 1904.17, "idle_dollars": 377.40,
+ "clients": [{"client": "team-x", "dollars": 412.08,
+              "by_hardware": {"H100": 398.51, "MI300X": 13.57},
+              "by_day": {"2026-10-06": 61.20, "2026-10-07": 58.94}}],
+ "hardware": [{"hardware": "H100", "dollars": 1501.33, "idle_dollars": 290.10}]}
+```
+
+Days are UTC. The ledger keeps 400 days in memory, and `state_dir` keeps it across restarts. Each
+request's cost is also in its log line (`cost_usd`). For Prometheus, use
+`siliconrouter_client_cost_dollars_total{client,hardware}` and
+`siliconrouter_backend_idle_cost_dollars_total{backend,hardware}`. For example,
+`sum by (client) (increase(siliconrouter_client_cost_dollars_total[7d]))` gives spend per team per
+week across every router. The Grafana dashboard has these panels.
+
 ## Changing config without downtime
 
 Edit the config file, then either:

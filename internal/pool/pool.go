@@ -78,6 +78,11 @@ type Backend struct {
 	// Recent generated-token counts while requests ran, for stall detection.
 	progress []progressSample
 	stalled  bool
+	// Cost accounting (see cost.go).
+	price     pricing
+	costClock float64 // dollars charged so far to one request running throughout
+	idleCost  float64 // dollars of running cost with nothing running
+	costAt    time.Time
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -106,12 +111,20 @@ type Lease struct {
 	Waited time.Duration
 	pool   *Pool
 	once   sync.Once
+	// Cost accounting: the backend's cost clock at grant, its prices and
+	// cost-report name then, and the time cost charged at release.
+	costStart float64
+	price     pricing
+	hardware  string
+	timeCost  float64
 }
 
 func (l *Lease) Release() {
 	l.once.Do(func() {
 		p := l.pool
 		p.mu.Lock()
+		l.Backend.advanceCostLocked(p.now())
+		l.timeCost = l.Backend.costClock - l.costStart
 		l.Backend.inflight--
 		p.dispatchLocked(false)
 		p.mu.Unlock()
@@ -146,6 +159,7 @@ type Pool struct {
 	waiters  *list.List
 	opts     Options
 	log      *slog.Logger
+	now      func() time.Time // the cost clock's time source
 }
 
 type waiter struct {
@@ -196,7 +210,7 @@ func OptionsFromConfig(cfg *config.Config) Options {
 
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
 	opts = opts.withDefaults()
-	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
+	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log, now: time.Now}
 	for i, cb := range backends {
 		b, err := newBackend(cb, i)
 		if err != nil {
@@ -253,6 +267,7 @@ func newBackend(cb config.Backend, index int) (*Backend, error) {
 // setCapacity applies the settings that may change in place (under Pool.mu
 // once the backend is in a pool).
 func (b *Backend) setCapacity(cb config.Backend) {
+	b.setPricingLocked(pricingOf(cb), time.Now())
 	b.MaxConcurrency = cb.MaxConcurrency
 	b.MaxContextTokens = cb.MaxContextTokens
 	b.models = map[string]bool{}
@@ -315,10 +330,10 @@ func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error)
 			next = append(next, b)
 			changes = append(changes, "replaced backend "+cb.Name+" (endpoint or credentials changed)")
 		default:
-			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models))
+			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price)
 			old.setCapacity(cb)
 			old.index = i
-			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models)) != before {
+			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price) != before {
 				changes = append(changes, "updated backend "+cb.Name)
 			}
 			next = append(next, old)
@@ -469,8 +484,10 @@ func (p *Pool) QueueDepth() int {
 }
 
 func (p *Pool) grantLocked(b *Backend, affinity bool, start time.Time) *Lease {
+	b.advanceCostLocked(p.now())
 	b.inflight++
-	return &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p}
+	return &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p,
+		costStart: b.costClock, price: b.price, hardware: b.hardwareNameLocked()}
 }
 
 // dispatchLocked hands freed slots to waiters in arrival order. A waiter that

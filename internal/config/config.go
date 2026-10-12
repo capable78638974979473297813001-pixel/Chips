@@ -285,7 +285,25 @@ type Backend struct {
 	// pressure, including load from clients that bypass this router.
 	MetricsPath string `yaml:"metrics_path"`
 
+	// CostPerHour is what this server costs to run, in dollars per hour (a
+	// cloud price, or hardware amortization plus power). Its time is charged
+	// to the clients whose requests ran on it, split evenly between the
+	// requests running at each moment; time with nothing running is idle cost.
+	CostPerHour float64 `yaml:"cost_per_hour"`
+	// Token prices in dollars per million, for backends billed by the token
+	// (a hosted API, or a contract priced that way). They add to CostPerHour.
+	CostPerMillionPromptTokens     float64 `yaml:"cost_per_million_prompt_tokens"`
+	CostPerMillionCompletionTokens float64 `yaml:"cost_per_million_completion_tokens"`
+	// HardwareName groups this backend in cost reports, e.g. "H100". It
+	// defaults to the accelerator chipagent reports, else the backend's name.
+	HardwareName string `yaml:"hardware_name"`
+
 	APIKey string `yaml:"-"`
+}
+
+// Costed reports whether the backend has any price set.
+func (b Backend) Costed() bool {
+	return b.CostPerHour > 0 || b.CostPerMillionPromptTokens > 0 || b.CostPerMillionCompletionTokens > 0
 }
 
 type Routing struct {
@@ -695,6 +713,9 @@ func validateBackend(where string, b Backend) []error {
 	}
 	if b.MetricsPath != "" && !strings.HasPrefix(b.MetricsPath, "/") {
 		errs = append(errs, fmt.Errorf("%s: metrics_path must start with /", where))
+	}
+	if b.CostPerHour < 0 || b.CostPerMillionPromptTokens < 0 || b.CostPerMillionCompletionTokens < 0 {
+		errs = append(errs, fmt.Errorf("%s: costs must not be negative", where))
 	}
 	if b.APIKeyEnv != "" && b.APIKey == "" {
 		errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))

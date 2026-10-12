@@ -139,6 +139,8 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, st *state, 
 		},
 	}
 	rp.ServeHTTP(w, r)
+	lease.Release()
+	s.charge(rl, usageName(st, client), lease, 0, 0)
 	s.requests.Inc(b.Name, strconv.Itoa(status))
 	s.duration.Observe(time.Since(start).Seconds())
 	rl.kind = kind
