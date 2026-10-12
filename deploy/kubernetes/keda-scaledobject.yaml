@@ -1,0 +1,56 @@
+# Scale a vLLM Deployment from zero with KEDA, on demand the router sees.
+#
+# The router (autoscaling.cold_start_wait set, the model listed in
+# autoscaling.scale_to_zero_models) holds requests while the first pod
+# boots, and reports how many backends the model needs. KEDA reads that
+# from GET /autoscale/<model> and sets the Deployment's replicas.
+#
+#   kubectl apply -f keda-scaledobject.yaml
+#
+# Edit the names: the Deployment (vllm-llama-70b), the model
+# (llama-3.1-70b) and the router Service URL.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama-70b
+spec:
+  scaleTargetRef:
+    name: vllm-llama-70b          # the Deployment running vLLM
+  minReplicaCount: 0              # scale to zero when idle
+  maxReplicaCount: 8
+  pollingInterval: 5              # seconds; how fast a cold start is noticed
+  cooldownPeriod: 900             # idle seconds before scaling back to zero
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    # Desired backends straight from the router: ceil((in flight + queued) /
+    # (max_concurrency x autoscaling.target_utilization)). Above zero while
+    # any request is held, which is what wakes the Deployment from zero.
+    - type: metrics-api
+      metadata:
+        url: "http://siliconrouter.ai.svc:8080/autoscale/llama-3.1-70b"
+        valueLocation: desired_backends
+        targetValue: "1"          # one replica per desired backend
+        activationTargetValue: "0"
+---
+# Alternative: the same signal from Prometheus, summed over every router
+# replica (use this one in cluster mode, where each router sees only its
+# own requests).
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: vllm-llama-70b
+# spec:
+#   scaleTargetRef: {name: vllm-llama-70b}
+#   minReplicaCount: 0
+#   maxReplicaCount: 8
+#   triggers:
+#     - type: prometheus
+#       metadata:
+#         serverAddress: http://prometheus.monitoring.svc:9090
+#         query: sum(siliconrouter_model_inflight{model="llama-3.1-70b"}) + sum(siliconrouter_model_queued{model="llama-3.1-70b"})
+#         threshold: "12"                # requests per replica: max_concurrency x target utilization
+#         activationThreshold: "0"

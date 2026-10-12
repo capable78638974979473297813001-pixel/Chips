@@ -1,4 +1,4 @@
-.PHONY: build test lint cross dist demo demo-mixed bench soak agent agent-test agent-cross clean
+.PHONY: build test lint cross dist demo demo-mixed bench soak agent agent-test agent-cross dashboard alerts-test clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS = -s -w -X main.version=$(VERSION)
@@ -80,6 +80,17 @@ soak: build
 
 bench: build
 	bin/srbench -conversations 30 -turns 10 -concurrency 8 -system-chars 400 -user-chars 2000
+
+# Regenerates the Grafana dashboard from scripts/grafana-dashboard.py.
+dashboard:
+	python3 scripts/grafana-dashboard.py
+
+# Checks and unit-tests the Prometheus alert rules (needs promtool), and
+# that the Helm chart's copy matches.
+alerts-test:
+	promtool check rules deploy/prometheus/alerts.yaml
+	promtool test rules deploy/prometheus/alerts_test.yaml
+	cmp deploy/prometheus/alerts.yaml deploy/helm/siliconrouter/files/alerts.yaml || (echo "copy deploy/prometheus/alerts.yaml into the chart's files/" && exit 1)
 
 clean:
 	rm -rf bin dist agent/build agent/build-*

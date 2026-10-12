@@ -2,6 +2,6 @@ apiVersion: v2
 name: siliconrouter
 description: Load balancer for self-hosted AI inference across mixed hardware, with an optional per-node hardware agent.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.4.0"
 keywords: [llm, inference, load-balancer, gpu, vllm]

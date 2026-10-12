@@ -1,0 +1,37 @@
+{{- if and .Values.gateway.enabled .Values.gateway.inferencePool.create }}
+{{- if not .Values.gateway.inferencePool.selector }}
+{{- fail "gateway.inferencePool.selector must select the model server pods" }}
+{{- end }}
+# The pool of model server pods, with these routers as its endpoint picker.
+# Reference it from an HTTPRoute backendRef:
+#   {group: inference.networking.k8s.io, kind: InferencePool, name: {{ include "siliconrouter.poolName" . }}}
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: {{ include "siliconrouter.poolName" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- toYaml .Values.gateway.inferencePool.selector | nindent 6 }}
+  targetPorts:
+    - number: {{ .Values.gateway.inferencePool.targetPort }}
+  endpointPickerRef:
+    name: {{ include "siliconrouter.fullname" . }}
+    port:
+      number: {{ .Values.gateway.port }}
+    failureMode: {{ .Values.gateway.inferencePool.failureMode }}
+---
+# The same pods in DNS, so the routers know every endpoint the pool has
+# (including ones not ready yet, which health checks keep out of rotation).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siliconrouter.poolService" . }}
+  labels: {{- include "siliconrouter.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- toYaml .Values.gateway.inferencePool.selector | nindent 4 }}
+  ports:
+    - {name: inference, port: {{ .Values.gateway.inferencePool.targetPort }}, targetPort: {{ .Values.gateway.inferencePool.targetPort }}}
+{{- end }}

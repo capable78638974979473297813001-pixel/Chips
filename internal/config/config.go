@@ -73,6 +73,54 @@ type Config struct {
 	StateDir string  `yaml:"state_dir"`
 	Tracing  Tracing `yaml:"tracing"`
 	Logging  Logging `yaml:"logging"`
+	// Autoscaling holds requests while GPU servers start and publishes the
+	// demand autoscalers scale on.
+	Autoscaling Autoscaling `yaml:"autoscaling"`
+	Audit       Audit       `yaml:"audit"`
+	// Gateway makes the router the endpoint picker of a Kubernetes Gateway
+	// API Inference Extension InferencePool.
+	Gateway Gateway `yaml:"gateway"`
+}
+
+// Gateway serves Envoy's external processing gRPC protocol (ext_proc) on
+// Listen, so a gateway can ask the router which pod gets each request.
+type Gateway struct {
+	Listen string `yaml:"listen"` // e.g. ":9002"; empty = off
+	// SecureServing serves TLS, as gateways expect from an endpoint picker
+	// by default: with CertFile/KeyFile, or a self-signed certificate.
+	// Off, it serves plaintext HTTP/2 (h2c). Default true.
+	SecureServing *bool  `yaml:"secure_serving"`
+	CertFile      string `yaml:"cert_file"`
+	KeyFile       string `yaml:"key_file"`
+}
+
+func (g Gateway) Enabled() bool { return g.Listen != "" }
+func (g Gateway) TLS() bool     { return g.SecureServing == nil || *g.SecureServing }
+
+// Autoscaling: with ColdStartWait set, a request whose model has no
+// backend up (all down, starting, or scaled to zero) waits for one instead
+// of failing at once, and the router calls Webhook so something can start one.
+type Autoscaling struct {
+	ColdStartWait Duration `yaml:"cold_start_wait"` // 0 = off
+	// ScaleToZeroModels may have no backends at all; requests for them are
+	// held too, and /v1/models keeps listing them.
+	ScaleToZeroModels []string `yaml:"scale_to_zero_models"`
+	Webhook           Webhook  `yaml:"webhook"`
+	// TargetUtilization is the share of a backend's max_concurrency the
+	// desired backend count aims to keep busy (default 0.8).
+	TargetUtilization float64 `yaml:"target_utilization"`
+	// BackendCapacity is the max_concurrency assumed for a model's
+	// backends when none is known, e.g. while scaled to zero (default 16).
+	BackendCapacity int `yaml:"backend_capacity"`
+}
+
+// Webhook is called (POST, JSON) when requests start waiting for a model
+// with no backend up, at most once per Interval per model.
+type Webhook struct {
+	URL       string   `yaml:"url"`
+	SecretEnv string   `yaml:"secret_env"` // sent as Authorization: Bearer
+	Interval  Duration `yaml:"interval"`   // default 30s
+	Secret    string   `yaml:"-"`
 }
 
 // Tracing exports a span per request (plus queue wait and each backend
@@ -200,6 +248,30 @@ type Models struct {
 	// smaller model, while the big GPUs are down or saturated. Keys are the
 	// real model names (after aliases).
 	Fallbacks map[string][]string `yaml:"fallbacks"`
+	// Adapters are LoRA fine-tunes of a base model. A request naming an
+	// adapter goes to a backend that already has it loaded when one has room,
+	// else to one with a free adapter slot, so engines don't keep swapping
+	// adapters in and out. Backends with dynamic_lora load it on demand.
+	Adapters []Adapter `yaml:"adapters"`
+}
+
+// Adapter is one LoRA adapter clients can ask for by name.
+type Adapter struct {
+	Name string `yaml:"name"` // the model name clients send
+	Base string `yaml:"base"` // the model it was trained on
+	// Path is where an engine loads it from (a directory or a Hugging Face
+	// repo id), for backends with dynamic_lora.
+	Path string `yaml:"path"`
+}
+
+// Adapter returns the adapter named name, if one is configured.
+func (m Models) Adapter(name string) (Adapter, bool) {
+	for _, a := range m.Adapters {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return Adapter{}, false
 }
 
 // Auth protects the router itself. When no keys are configured the router is open.
@@ -211,10 +283,76 @@ type Auth struct {
 	// AdminKeys alone may use /admin/*. Without any, every client key can.
 	AdminKeys    []string `yaml:"admin_keys"`
 	AdminKeysEnv string   `yaml:"admin_keys_env"` // comma-separated keys read from this env var
+	// OIDC accepts JWT access tokens from the company's identity provider
+	// (single sign-on) alongside, or instead of, API keys.
+	OIDC OIDC `yaml:"oidc"`
 }
 
-// Enabled reports whether the router requires a key.
-func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 }
+// Enabled reports whether the router requires a key or token.
+func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 || a.OIDC.Enabled() }
+
+// OIDC: a request with "Authorization: Bearer <JWT>" is let in when the
+// token is signed by Issuer's keys, is for one of Audiences, and is
+// current. The user is the UserClaim; their groups (GroupsClaim) pick the
+// team whose limits and policy apply, and the team is what usage and cost
+// are reported under.
+type OIDC struct {
+	Issuer    string   `yaml:"issuer"`
+	Audiences []string `yaml:"audiences"`
+	JWKSURL   string   `yaml:"jwks_url"`  // instead of OIDC discovery
+	JWKSFile  string   `yaml:"jwks_file"` // keys from a file (air-gapped)
+	// UserClaim names the user (default sub; email or preferred_username
+	// read better in reports). GroupsClaim lists their groups (default
+	// groups; dots reach nested claims, e.g. realm_access.roles).
+	UserClaim   string   `yaml:"user_claim"`
+	GroupsClaim string   `yaml:"groups_claim"`
+	Leeway      Duration `yaml:"leeway"`       // clock skew on exp/nbf; default 60s
+	JWKSRefresh Duration `yaml:"jwks_refresh"` // default 1h
+	// AdminGroups may use /admin/* (as admin keys can).
+	AdminGroups []string `yaml:"admin_groups"`
+	// Teams map groups to a team, checked in order; the first group the
+	// user is in wins.
+	Teams []Team `yaml:"teams"`
+	// DefaultTeam is the team of users in none of Teams (default "oidc"),
+	// unless RequireTeam refuses them.
+	DefaultTeam string `yaml:"default_team"`
+	RequireTeam bool   `yaml:"require_team"`
+	// UserLimits apply to each user on their own, on top of their team's.
+	UserLimits UserLimits `yaml:"user_limits"`
+}
+
+func (o OIDC) Enabled() bool { return o.Issuer != "" || o.JWKSURL != "" || o.JWKSFile != "" }
+
+// Team is the policy for users in Group, like a named API key's.
+type Team struct {
+	Group             string   `yaml:"group"`
+	Name              string   `yaml:"name"` // default: the group
+	Priority          string   `yaml:"priority"`
+	MaxConcurrent     int      `yaml:"max_concurrent"`
+	RequestsPerMinute int      `yaml:"requests_per_minute"`
+	TokensPerDay      int64    `yaml:"tokens_per_day"`
+	Models            []string `yaml:"models"`
+	MaxTokens         int      `yaml:"max_tokens"`
+}
+
+// UserLimits cap each single-sign-on user. Zero means unlimited.
+type UserLimits struct {
+	MaxConcurrent     int   `yaml:"max_concurrent"`
+	RequestsPerMinute int   `yaml:"requests_per_minute"`
+	TokensPerDay      int64 `yaml:"tokens_per_day"`
+}
+
+// Audit writes a tamper-evident log of requests, logins and admin actions.
+type Audit struct {
+	File string `yaml:"file"` // path, or "-" for stdout; empty = off
+	// Requests logs every inference request (who, model, backend, status,
+	// tokens, cost; never content). Default true.
+	Requests  *bool `yaml:"requests"`
+	MaxSizeMB int   `yaml:"max_size_mb"` // rotate past this (default 100)
+	MaxFiles  int   `yaml:"max_files"`   // rotated files kept (default 10)
+}
+
+func (a Audit) LogRequests() bool { return a.Requests == nil || *a.Requests }
 
 // Discovery is a DNS name whose records are backends. Every address (for
 // dns) or target (for srv) becomes a backend named <name>-<host>:<port>,
@@ -284,8 +422,31 @@ type Backend struct {
 	// usually /metrics, to route on the engine's real queue and KV-cache
 	// pressure, including load from clients that bypass this router.
 	MetricsPath string `yaml:"metrics_path"`
+	// DynamicLoRA means the backend can load LoRA adapters at runtime (vLLM
+	// with VLLM_ALLOW_RUNTIME_LORA_UPDATING=True): any adapter in
+	// models.adapters whose base model it serves can be sent to it, and the
+	// router loads the adapter first if the backend doesn't have it.
+	DynamicLoRA bool `yaml:"dynamic_lora"`
+
+	// CostPerHour is what this server costs to run, in dollars per hour (a
+	// cloud price, or hardware amortization plus power). Its time is charged
+	// to the clients whose requests ran on it, split evenly between the
+	// requests running at each moment; time with nothing running is idle cost.
+	CostPerHour float64 `yaml:"cost_per_hour"`
+	// Token prices in dollars per million, for backends billed by the token
+	// (a hosted API, or a contract priced that way). They add to CostPerHour.
+	CostPerMillionPromptTokens     float64 `yaml:"cost_per_million_prompt_tokens"`
+	CostPerMillionCompletionTokens float64 `yaml:"cost_per_million_completion_tokens"`
+	// HardwareName groups this backend in cost reports, e.g. "H100". It
+	// defaults to the accelerator chipagent reports, else the backend's name.
+	HardwareName string `yaml:"hardware_name"`
 
 	APIKey string `yaml:"-"`
+}
+
+// Costed reports whether the backend has any price set.
+func (b Backend) Costed() bool {
+	return b.CostPerHour > 0 || b.CostPerMillionPromptTokens > 0 || b.CostPerMillionCompletionTokens > 0
 }
 
 type Routing struct {
@@ -537,6 +698,43 @@ func (c *Config) applyDefaults() {
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
 	}
+	o := &c.Auth.OIDC
+	if o.UserClaim == "" {
+		o.UserClaim = "sub"
+	}
+	if o.GroupsClaim == "" {
+		o.GroupsClaim = "groups"
+	}
+	if o.Leeway == 0 {
+		o.Leeway = Duration(time.Minute)
+	}
+	if o.JWKSRefresh == 0 {
+		o.JWKSRefresh = Duration(time.Hour)
+	}
+	if o.DefaultTeam == "" {
+		o.DefaultTeam = "oidc"
+	}
+	for i := range o.Teams {
+		if o.Teams[i].Name == "" {
+			o.Teams[i].Name = o.Teams[i].Group
+		}
+	}
+	if c.Audit.MaxSizeMB == 0 {
+		c.Audit.MaxSizeMB = 100
+	}
+	if c.Audit.MaxFiles == 0 {
+		c.Audit.MaxFiles = 10
+	}
+	as := &c.Autoscaling
+	if as.TargetUtilization == 0 {
+		as.TargetUtilization = 0.8
+	}
+	if as.BackendCapacity == 0 {
+		as.BackendCapacity = 16
+	}
+	if as.Webhook.Interval == 0 {
+		as.Webhook.Interval = Duration(30 * time.Second)
+	}
 	if c.Shutdown.Timeout == 0 {
 		c.Shutdown.Timeout = Duration(60 * time.Second)
 	}
@@ -587,6 +785,9 @@ func (c *Config) resolveEnv() {
 	}
 	if c.Auth.AdminKeysEnv != "" {
 		c.Auth.AdminKeys = append(c.Auth.AdminKeys, splitEnv(c.Auth.AdminKeysEnv)...)
+	}
+	if env := c.Autoscaling.Webhook.SecretEnv; env != "" {
+		c.Autoscaling.Webhook.Secret = os.Getenv(env)
 	}
 	if c.Cluster.SecretEnv != "" {
 		c.Cluster.Secret = os.Getenv(c.Cluster.SecretEnv)
@@ -653,6 +854,73 @@ func (c *Config) validateDiscovery(backendNames map[string]bool) []error {
 	return errs
 }
 
+// validateOIDC checks single sign-on settings; keyNames are the named API
+// keys, which share the namespace usage is reported in.
+func (c *Config) validateOIDC(keyNames map[string]bool) []error {
+	o := c.Auth.OIDC
+	if !o.Enabled() {
+		if len(o.Teams) > 0 || len(o.AdminGroups) > 0 {
+			return []error{errors.New("auth.oidc: teams and admin_groups need issuer (or jwks_url/jwks_file)")}
+		}
+		return nil
+	}
+	var errs []error
+	for _, u := range []struct{ name, v string }{{"issuer", o.Issuer}, {"jwks_url", o.JWKSURL}} {
+		if u.v == "" {
+			continue
+		}
+		if pu, err := url.Parse(u.v); err != nil || (pu.Scheme != "https" && pu.Scheme != "http") || pu.Host == "" {
+			errs = append(errs, fmt.Errorf("auth.oidc.%s must be an absolute https URL, got %q", u.name, u.v))
+		}
+	}
+	for n := range keyNames {
+		if strings.HasPrefix(n, "user:") {
+			errs = append(errs, fmt.Errorf("auth.keys: name %q: names starting with user: are reserved for single sign-on users", n))
+		}
+	}
+	if o.Issuer == "" {
+		errs = append(errs, errors.New("auth.oidc.issuer is required: tokens are checked against it"))
+	}
+	if len(o.Audiences) == 0 {
+		errs = append(errs, errors.New("auth.oidc.audiences is required, so tokens issued for other applications are refused"))
+	}
+	if o.Leeway < 0 || o.JWKSRefresh.D() < time.Minute {
+		errs = append(errs, errors.New("auth.oidc: leeway must not be negative and jwks_refresh must be at least 1m"))
+	}
+	if u := o.UserLimits; u.MaxConcurrent < 0 || u.RequestsPerMinute < 0 || u.TokensPerDay < 0 {
+		errs = append(errs, errors.New("auth.oidc.user_limits must not be negative"))
+	}
+	teams := map[string]bool{o.DefaultTeam: true}
+	if keyNames[o.DefaultTeam] {
+		errs = append(errs, fmt.Errorf("auth.oidc.default_team %q is also an API key name", o.DefaultTeam))
+	}
+	for i, t := range o.Teams {
+		where := fmt.Sprintf("auth.oidc.teams[%d]", i)
+		if t.Group == "" {
+			errs = append(errs, fmt.Errorf("%s: group is required", where))
+		}
+		if teams[t.Name] && t.Name != o.DefaultTeam || keyNames[t.Name] {
+			errs = append(errs, fmt.Errorf("%s: name %q is already used by another team or API key", where, t.Name))
+		}
+		teams[t.Name] = true
+		if strings.HasPrefix(t.Name, "user:") {
+			errs = append(errs, fmt.Errorf("%s: names starting with user: are reserved for users", where))
+		}
+		if _, ok := PriorityRank(t.Priority); !ok {
+			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, t.Priority))
+		}
+		if t.MaxConcurrent < 0 || t.RequestsPerMinute < 0 || t.TokensPerDay < 0 || t.MaxTokens < 0 {
+			errs = append(errs, fmt.Errorf("%s: limits must not be negative", where))
+		}
+		for _, m := range t.Models {
+			if m == "" || strings.Contains(strings.TrimSuffix(m, "*"), "*") {
+				errs = append(errs, fmt.Errorf("%s: models entry %q must be a model name or a prefix ending in *", where, m))
+			}
+		}
+	}
+	return errs
+}
+
 // validateBackend checks one backend's settings (the name is checked by the caller).
 func validateBackend(where string, b Backend) []error {
 	var errs []error
@@ -695,6 +963,9 @@ func validateBackend(where string, b Backend) []error {
 	}
 	if b.MetricsPath != "" && !strings.HasPrefix(b.MetricsPath, "/") {
 		errs = append(errs, fmt.Errorf("%s: metrics_path must start with /", where))
+	}
+	if b.CostPerHour < 0 || b.CostPerMillionPromptTokens < 0 || b.CostPerMillionCompletionTokens < 0 {
+		errs = append(errs, fmt.Errorf("%s: costs must not be negative", where))
 	}
 	if b.APIKeyEnv != "" && b.APIKey == "" {
 		errs = append(errs, fmt.Errorf("%s: api_key_env %q is not set", where, b.APIKeyEnv))
@@ -777,6 +1048,20 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	errs = append(errs, c.validateOIDC(names)...)
+	if g := c.Gateway; g.Enabled() {
+		if _, _, err := net.SplitHostPort(g.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("gateway.listen must be host:port, got %q", g.Listen))
+		} else if g.Listen == c.Listen {
+			errs = append(errs, errors.New("gateway.listen must differ from listen"))
+		}
+		if (g.CertFile == "") != (g.KeyFile == "") || (g.CertFile != "" && !g.TLS()) {
+			errs = append(errs, errors.New("gateway: cert_file and key_file go together, and need secure_serving"))
+		}
+	}
+	if c.Audit.MaxSizeMB < 0 || c.Audit.MaxFiles < 0 {
+		errs = append(errs, errors.New("audit: max_size_mb and max_files must not be negative"))
+	}
 	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
 		errs = append(errs, errors.New("tls: cert_file and key_file must be set together"))
 	} else if t.ClientCAFile != "" && t.CertFile == "" {
@@ -832,6 +1117,22 @@ func (c *Config) validate() error {
 			errs = append(errs, fmt.Errorf("models.fallbacks: %q is an alias; key fallbacks by the model it points to", model))
 		}
 	}
+	adapters := map[string]bool{}
+	for i, a := range c.Models.Adapters {
+		where := fmt.Sprintf("models.adapters[%d]", i)
+		switch {
+		case a.Name == "" || a.Base == "":
+			errs = append(errs, fmt.Errorf("%s: name and base are required", where))
+		case a.Name == a.Base:
+			errs = append(errs, fmt.Errorf("%s: an adapter can't be its own base model", where))
+		case adapters[a.Name]:
+			errs = append(errs, fmt.Errorf("%s: duplicate name %q", where, a.Name))
+		}
+		if _, isAlias := c.Models.Aliases[a.Name]; isAlias {
+			errs = append(errs, fmt.Errorf("%s: %q is also an alias; aliases may point to adapters instead", where, a.Name))
+		}
+		adapters[a.Name] = true
+	}
 	if !strings.HasPrefix(c.Health.Path, "/") {
 		errs = append(errs, errors.New("health.path must start with /"))
 	}
@@ -842,6 +1143,19 @@ func (c *Config) validate() error {
 	}
 	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
 		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))
+	}
+	if as := c.Autoscaling; as.ColdStartWait < 0 || as.TargetUtilization <= 0 || as.TargetUtilization > 1 || as.BackendCapacity < 1 || as.Webhook.Interval.D() < time.Second {
+		errs = append(errs, errors.New("autoscaling: need cold_start_wait >= 0, 0 < target_utilization <= 1, backend_capacity >= 1 and webhook.interval >= 1s"))
+	} else if len(as.ScaleToZeroModels) > 0 && as.ColdStartWait == 0 {
+		errs = append(errs, errors.New("autoscaling: scale_to_zero_models needs cold_start_wait, so their requests wait for a backend to start"))
+	}
+	if u := c.Autoscaling.Webhook.URL; u != "" {
+		if pu, err := url.Parse(u); err != nil || (pu.Scheme != "http" && pu.Scheme != "https") || pu.Host == "" {
+			errs = append(errs, fmt.Errorf("autoscaling.webhook.url must be an absolute http(s) URL, got %q", u))
+		}
+	}
+	if env := c.Autoscaling.Webhook.SecretEnv; env != "" && c.Autoscaling.Webhook.Secret == "" {
+		errs = append(errs, fmt.Errorf("autoscaling.webhook.secret_env %q is not set", env))
 	}
 	if c.MaxBodyBytes < 0 {
 		errs = append(errs, errors.New("max_body_bytes must not be negative"))

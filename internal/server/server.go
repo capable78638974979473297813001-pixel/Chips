@@ -5,7 +5,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +24,15 @@ import (
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/affinity"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/audit"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cluster"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/costs"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/discovery"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/oidc"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/tracing"
@@ -61,8 +63,10 @@ type Server struct {
 	pool       *pool.Pool
 	affinity   *affinity.Table
 	limits     *limits.Tracker
+	costs      *costs.Ledger
 	cluster    *cluster.Node // nil when this router runs alone
 	tracer     *tracing.Tracer
+	audit      *audit.Logger // nil when off
 	client     *http.Client
 	// grpcTransport speaks HTTP/2 (h2c for plaintext) to gRPC backends.
 	grpcTransport *http.Transport
@@ -80,13 +84,21 @@ type Server struct {
 	clientReqs    *metrics.CounterVec
 	clientTokens  *metrics.CounterVec
 	fallbacks     *metrics.CounterVec
+	clientCost    *metrics.CounterVec
 	budgetSpent   *metrics.CounterVec
 	panics        *metrics.CounterVec
+	loraRouting   *metrics.CounterVec
+	coldStarts    *metrics.CounterVec
+	scaled        scaleUps
+	loads         adapterLoads
 	draining      atomic.Bool
-	retryBudget   *retryBudget
-	duration      *metrics.Histogram
-	queueWait     *metrics.Histogram
-	firstByte     *metrics.Histogram
+	// idleBooked is each backend's idle cost already in the ledger.
+	idleMu      sync.Mutex
+	idleBooked  map[string]float64
+	retryBudget *retryBudget
+	duration    *metrics.Histogram
+	queueWait   *metrics.Histogram
+	firstByte   *metrics.Histogram
 }
 
 // state is an immutable snapshot of the reloadable configuration.
@@ -94,11 +106,12 @@ type state struct {
 	cfg       *config.Config
 	keys      map[string]clientInfo
 	adminKeys []string
-	cache     *cache.Cache // nil when disabled
+	cache     *cache.Cache   // nil when disabled
+	verifier  *oidc.Verifier // nil without auth.oidc
 }
 
-func newState(cfg *config.Config, prev *state) *state {
-	st := &state{cfg: cfg, keys: map[string]clientInfo{}, adminKeys: cfg.Auth.AdminKeys}
+func newState(cfg *config.Config, prev *state, client *http.Client) *state {
+	st := &state{cfg: cfg, keys: map[string]clientInfo{}, adminKeys: cfg.Auth.AdminKeys, verifier: newVerifier(cfg, prev, client)}
 	for _, k := range cfg.Auth.APIKeys {
 		st.keys[k] = clientInfo{key: k, priority: 1}
 	}
@@ -146,10 +159,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"clients": s.limits.Snapshot()})
 }
 
-// clientInfo is who sent a request, from the API key it used.
+// clientInfo is who sent a request, from the API key or token it used.
 type clientInfo struct {
-	name     string
+	name     string // team or key name: limits, usage and costs are counted under it
 	key      string
+	user     string // the single sign-on user, for tokens
+	admin    bool   // the user is in auth.oidc.admin_groups
 	priority int
 	// Policy from the key: the models it may use (all when empty) and its
 	// cap on each request's completion budget (none when 0).
@@ -171,6 +186,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	s := &Server{
 		pool:   p,
 		limits: limits.New(),
+		costs:  costs.New(),
 
 		grpcTransport: newGRPCTransport(client),
 		affinity:      affinity.New(cfg.Routing.AffinityCapacity, cfg.Routing.AffinityTTL.D()),
@@ -195,10 +211,14 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
 		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
+		loraRouting:   reg.NewCounterVec("siliconrouter_lora_routing_total", "Requests for LoRA adapters by placement: loaded (backend had the adapter), loaded_on_demand (the router loaded it first), load_failed, or unknown (backend not known to have it).", "result"),
+		coldStarts:    reg.NewCounterVec("siliconrouter_cold_starts_total", "Requests that arrived for a model with no backend up (each may trigger the scale-up webhook).", "model"),
+		clientCost:    reg.NewCounterVec("siliconrouter_client_cost_dollars_total", "Dollars charged per client and hardware: each request's share of its backend's cost_per_hour while it ran, plus token prices.", "client", "hardware"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
-	s.state.Store(newState(cfg, nil))
+	s.limits.SetDefaults(userDefaults(cfg))
+	s.state.Store(newState(cfg, nil, client))
 	s.watcher = &discovery.Watcher{
 		Resolver: net.DefaultResolver,
 		Log:      log,
@@ -306,6 +326,11 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewCounterFunc("siliconrouter_backend_idle_cost_dollars_total", "Running cost of each backend's time with no requests on it (cost_per_hour while idle).", []string{"backend", "hardware"}, func(emit func(float64, ...string)) {
+		for _, c := range p.IdleCosts() {
+			emit(c.Dollars, c.Backend, c.Hardware)
+		}
+	})
 	reg.NewGaugeFunc("siliconrouter_goroutines", "Goroutines in the router; steady growth means a leak.", nil, func(emit func(float64, ...string)) {
 		emit(float64(runtime.NumGoroutine()))
 	})
@@ -321,6 +346,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		emit(float64(s.affinity.Len()))
 	})
 
+	s.registerDemandMetrics()
+	s.mux.HandleFunc("GET /autoscale", s.handleAutoscale)
+	s.mux.HandleFunc("GET /autoscale/{model...}", s.handleAutoscale)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok\n") })
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
@@ -329,6 +357,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	})
 	s.mux.Handle("GET /admin/backends", s.requireAdmin(http.HandlerFunc(s.handleBackends)))
 	s.mux.Handle("GET /admin/usage", s.requireAdmin(http.HandlerFunc(s.handleUsage)))
+	s.mux.Handle("GET /admin/costs", s.requireAdmin(http.HandlerFunc(s.handleCosts)))
 	s.mux.Handle("POST /admin/reload", s.requireAdmin(http.HandlerFunc(s.handleReload)))
 	s.mux.Handle("POST /admin/backends/{name}/drain", s.requireAdmin(s.handleDrain(true)))
 	s.mux.Handle("POST /admin/backends/{name}/undrain", s.requireAdmin(s.handleDrain(false)))
@@ -372,59 +401,6 @@ func (s *Server) RunCluster(ctx context.Context) {
 	}
 }
 
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		st := s.state.Load()
-		if !st.cfg.Auth.Enabled() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if got := clientKey(r.Header); got != "" {
-			// Compare against every key in constant time, so timing does not
-			// reveal how much of a guess was right.
-			var match clientInfo
-			found := false
-			for k, c := range st.keys {
-				if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
-					match, found = c, true
-				}
-			}
-			if found {
-				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientKeyCtx{}, match)))
-				return
-			}
-		}
-		s.rejected.Inc("unauthorized")
-		writeError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-	})
-}
-
-// requireAdmin guards /admin/*: only admin keys when any are configured,
-// otherwise any client key (or nothing, when auth is off).
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	clientAuth := s.requireAuth(next)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		st := s.state.Load()
-		if len(st.adminKeys) == 0 {
-			clientAuth.ServeHTTP(w, r)
-			return
-		}
-		got := clientKey(r.Header)
-		ok := false
-		for _, k := range st.adminKeys {
-			if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
-				ok = true
-			}
-		}
-		if !ok {
-			s.rejected.Inc("unauthorized")
-			writeError(w, http.StatusUnauthorized, "invalid_admin_key", "this endpoint needs an admin key")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // clientKeyHeaders carry a caller's API key: OpenAI-style bearer tokens,
 // Anthropic's x-api-key and Azure OpenAI's api-key.
 var clientKeyHeaders = []string{"Authorization", "X-Api-Key", "Api-Key"}
@@ -440,17 +416,14 @@ func clientKey(h http.Header) string {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	if s.draining.Load() {
+	switch {
+	case s.draining.Load():
 		http.Error(w, "draining for shutdown", http.StatusServiceUnavailable)
-		return
+	case s.Ready():
+		io.WriteString(w, "ready\n")
+	default:
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 	}
-	for _, st := range s.pool.Snapshot() {
-		if st.Healthy && !st.Drained {
-			io.WriteString(w, "ready\n")
-			return
-		}
-	}
-	http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 }
 
 func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {
@@ -496,6 +469,13 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
+	// Models scaled to zero are available: a request starts a backend.
+	for _, m := range s.conf().Autoscaling.ScaleToZeroModels {
+		if !seen[m] {
+			seen[m] = true
+			data = append(data, model{ID: m, Object: "model", OwnedBy: "siliconrouter"})
+		}
+	}
 	for alias, target := range s.conf().Models.Aliases {
 		if seen[target] && !seen[alias] {
 			seen[alias] = true
@@ -529,7 +509,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	st := s.state.Load()
 	client := clientFrom(r.Context())
 	who := usageName(st, client)
-	release, rejected := s.limits.Admit(who)
+	release, rejected := s.admit(who, client)
 	if rejected != nil {
 		s.rejected.Inc(rejected.Reason)
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(rejected.RetryAfter.Seconds()))))
@@ -623,6 +603,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		Exclude:      map[string]bool{},
 		Priority:     priority,
 	}
+	adapter, _ := setAdapter(&req, st.cfg.Models)
 	// Near a backend's context limit, an estimate is not good enough: count
 	// exactly, so the prompt neither goes to a backend that must reject it
 	// nor skips one it would fit.
@@ -655,6 +636,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			fallbacks = append(fallbacks, m)
 		}
 	}
+	s.prepareHold(st, &req, wait, len(fallbacks), rl)
 	asked := info.Model
 	fallBack := func() {
 		m := fallbacks[0]
@@ -665,8 +647,10 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			path = prompt.ReplacePathModel(path, m)
 		}
 		info.Model, req.Model, rl.fallback = m, m, m
+		adapter, _ = setAdapter(&req, st.cfg.Models)
 		req.Exclude = map[string]bool{}
 		s.fallbacks.Inc(asked, m)
+		s.prepareHold(st, &req, wait, len(fallbacks), rl)
 	}
 
 	var lastErr string
@@ -690,6 +674,14 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 				tries = 0
 				continue
 			}
+			if rl.coldStart && errors.Is(err, context.DeadlineExceeded) && r.Context().Err() == nil {
+				s.rejected.Inc("cold_start_timeout")
+				w.Header().Set("Retry-After", "10")
+				writeError(w, http.StatusServiceUnavailable, "cold_start_timeout",
+					"no backend for this model started within autoscaling.cold_start_wait; retry shortly")
+				s.logRequest(rl, "", http.StatusServiceUnavailable, attempt, false, err)
+				return
+			}
 			status := s.rejectAcquire(w, r, err, tries, lastErr)
 			s.logRequest(rl, "", status, attempt, false, err)
 			return
@@ -701,6 +693,29 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 				Name: "queue wait", Start: now.Add(-lease.Waited), End: now})
 		}
 		b := lease.Backend
+		if lease.NeedsLoad {
+			if err := s.loadAdapter(r.Context(), b, adapter); err != nil {
+				lease.Release()
+				s.charge(rl, who, lease, 0, 0)
+				s.loraRouting.Inc("load_failed")
+				if r.Context().Err() != nil {
+					s.logRequest(rl, b.Name, 499, attempt, false, r.Context().Err())
+					return
+				}
+				lastErr = fmt.Sprintf("%s: load LoRA adapter %s: %v", b.Name, adapter.Name, err)
+				req.Exclude[b.Name] = true
+				if tries >= st.cfg.Retry.MaxAttempts {
+					if len(fallbacks) == 0 {
+						writeError(w, http.StatusBadGateway, "adapter_load_failed", lastErr)
+						s.logRequest(rl, b.Name, http.StatusBadGateway, attempt, false, err)
+						return
+					}
+					fallBack()
+					tries = 0
+				}
+				continue
+			}
+		}
 		final := tries >= st.cfg.Retry.MaxAttempts && len(fallbacks) == 0
 		if !final && !s.retryBudget.allows() {
 			// No retry would be allowed after this attempt, so it is the
@@ -722,6 +737,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			}
 			res.cancel()
 			lease.Release()
+			s.charge(rl, who, lease, 0, 0)
 			if r.Context().Err() != nil {
 				s.logRequest(rl, b.Name, 499, attempt, lease.Affinity, r.Context().Err())
 				return // client went away; nobody to answer
@@ -753,6 +769,19 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		resp := res.resp
 		if resp.StatusCode < 500 {
 			s.pool.Observe(b, true, true, "")
+		}
+		if req.Base != "" {
+			switch {
+			case lease.AdapterLoaded:
+				s.loraRouting.Inc("loaded")
+			case lease.NeedsLoad:
+				s.loraRouting.Inc("loaded_on_demand")
+			default:
+				s.loraRouting.Inc("unknown")
+			}
+			if resp.StatusCode < 400 {
+				s.pool.NoteAdapter(b, req.Model)
+			}
 		}
 		if resp.StatusCode < 400 && len(keys) > 0 {
 			s.affinity.Record(keys, b.Name)
@@ -786,9 +815,15 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		res.cancel()
 		lease.Release()
+		var in, out int64
 		if resp.StatusCode < 400 {
-			s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
+			in, out = s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
+			if client.user != "" {
+				s.limits.Record(userName(client.user), in, out, false)
+			}
+			rl.promptTokens, rl.completionTokens = in, out
 		}
+		s.charge(rl, who, lease, in, out)
 		if capture != nil && copyErr == nil && !capture.overflow {
 			st.cache.Put(cacheKey, &cache.Entry{Status: resp.StatusCode, Header: cacheableHeader(resp.Header), Body: capture.buf.Bytes(), Backend: b.Name})
 		}
@@ -906,6 +941,9 @@ func cacheable(st *state, r *http.Request, path string, info prompt.Info) bool {
 
 func cacheKeyFor(st *state, r *http.Request, path string, c clientInfo, body []byte) cache.Key {
 	who := c.key
+	if c.user != "" {
+		who = userName(c.user) // single sign-on users never share answers with each other
+	}
 	if st.cfg.Cache.ShareAcrossKeys {
 		who = ""
 	}
@@ -1071,10 +1109,10 @@ func (m *usageMeter) write(p []byte) {
 }
 
 // recordUsage counts a finished request's tokens: as the backend reported
-// them when it did, otherwise estimated.
-func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, charsPerToken float64) {
+// them when it did, otherwise estimated. It returns the counts.
+func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, charsPerToken float64) (in, out int64) {
 	u := prompt.ParseUsage(m.tail)
-	in, out := u.PromptTokens, u.CompletionTokens
+	in, out = u.PromptTokens, u.CompletionTokens
 	inSource, outSource := "reported", "reported"
 	if in < 0 {
 		in, inSource = int64(prompt.EstimateTokens(info.Text, charsPerToken)), "estimated"
@@ -1096,6 +1134,7 @@ func (s *Server) recordUsage(who, path string, info prompt.Info, m *usageMeter, 
 	s.limits.Record(who, in, out, inSource == "estimated" || outSource == "estimated")
 	s.clientTokens.Add(float64(in), who, "prompt", inSource)
 	s.clientTokens.Add(float64(out), who, "completion", outSource)
+	return in, out
 }
 
 // first holds body bytes already read from resp; capture, when non-nil,
@@ -1164,9 +1203,13 @@ type requestLog struct {
 	fallback    string // the model that served the request instead of the one asked for
 	cache       string
 	exactTokens int
-	kind        string // websocket or grpc for passthrough sessions
-	trace       tracing.Context
-	span        tracing.SpanID
+	cost        float64 // dollars charged, over every attempt
+	coldStart   bool    // waited for a backend to start
+	// Tokens the request used, when it succeeded.
+	promptTokens, completionTokens int64
+	kind                           string // websocket or grpc for passthrough sessions
+	trace                          tracing.Context
+	span                           tracing.SpanID
 }
 
 var priorityNames = [...]string{"low", "normal", "high"}
@@ -1174,6 +1217,7 @@ var priorityNames = [...]string{"low", "normal", "high"}
 func (s *Server) logRequest(l *requestLog, backend string, status, attempts int, cacheHit bool, err error) {
 	elapsed := time.Since(l.start)
 	s.recordRootSpan(l, backend, status, attempts, err, elapsed)
+	s.auditRequest(l, backend, status, attempts, elapsed, err)
 
 	lc := s.conf().Logging
 	routine := status < 400 && err == nil && (lc.SlowRequest == 0 || elapsed < lc.SlowRequest.D())
@@ -1189,6 +1233,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	if l.client.name != "" {
 		attrs = append(attrs, "client", l.client.name)
 	}
+	if l.client.user != "" {
+		attrs = append(attrs, "user", l.client.user)
+	}
 	if l.fallback != "" {
 		attrs = append(attrs, "fallback", l.fallback)
 	}
@@ -1203,6 +1250,12 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.exactTokens > 0 {
 		attrs = append(attrs, "prompt_tokens_exact", l.exactTokens)
+	}
+	if l.coldStart {
+		attrs = append(attrs, "cold_start", true)
+	}
+	if l.cost > 0 {
+		attrs = append(attrs, "cost_usd", math.Round(l.cost*1e6)/1e6)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())

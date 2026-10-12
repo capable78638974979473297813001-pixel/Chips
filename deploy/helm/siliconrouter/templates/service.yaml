@@ -8,6 +8,9 @@ spec:
   selector: {{- include "siliconrouter.selector" . | nindent 4 }}
   ports:
     - {name: http, port: {{ .Values.service.port }}, targetPort: http}
+    {{- if .Values.gateway.enabled }}
+    - {name: grpc-epp, port: {{ .Values.gateway.port }}, targetPort: grpc-epp, appProtocol: http2}
+    {{- end }}
 ---
 # Gives each router a stable DNS name for cluster mode.
 apiVersion: v1

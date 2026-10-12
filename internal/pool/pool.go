@@ -64,10 +64,16 @@ type Backend struct {
 	okStreak   int
 	failStreak int
 	discovered map[string]bool
-	lastErr    string
-	hw         *hardware.Report
-	hwErr      string
-	hwFault    bool // chipagent reports a failed accelerator: no new work
+	// discoveredAt is when discovered was last refreshed.
+	discoveredAt time.Time
+	// dynamicLoRA: the engine loads adapters at runtime. adapters records
+	// when this router last loaded or used each adapter here (see lora.go).
+	dynamicLoRA bool
+	adapters    map[string]time.Time
+	lastErr     string
+	hw          *hardware.Report
+	hwErr       string
+	hwFault     bool // chipagent reports a failed accelerator: no new work
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
@@ -78,6 +84,11 @@ type Backend struct {
 	// Recent generated-token counts while requests ran, for stall detection.
 	progress []progressSample
 	stalled  bool
+	// Cost accounting (see cost.go).
+	price     pricing
+	costClock float64 // dollars charged so far to one request running throughout
+	idleCost  float64 // dollars of running cost with nothing running
+	costAt    time.Time
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -94,6 +105,14 @@ type Request struct {
 	// Priority orders the wait queue: higher ranks are served first
 	// (see config.PriorityRank). Requests of equal priority stay FIFO.
 	Priority int
+	// Base is set when Model is a LoRA adapter: the model it adapts.
+	Base string
+	// Hold lets the request wait for a backend to start when none is up
+	// (see Options.ColdStart) instead of failing with ErrNoBackend.
+	Hold bool
+	// Only, when non-nil, restricts the request to these backends (a
+	// gateway's subset hint).
+	Only map[string]bool
 }
 
 // Lease is a held concurrency slot. Release must be called exactly once
@@ -104,15 +123,30 @@ type Lease struct {
 	Affinity bool
 	// Waited is how long the request queued for the slot.
 	Waited time.Duration
-	pool   *Pool
-	once   sync.Once
+	// For a request naming a LoRA adapter: AdapterLoaded says the backend
+	// was known to have it, and NeedsLoad that it must be loaded first
+	// (the backend has dynamic_lora and isn't known to have it).
+	AdapterLoaded bool
+	NeedsLoad     bool
+	pool          *Pool
+	once          sync.Once
+	// Cost accounting: the backend's cost clock at grant, its prices and
+	// cost-report name then, and the time cost charged at release.
+	model     string // demandModel of the request, for per-model in-flight counts
+	costStart float64
+	price     pricing
+	hardware  string
+	timeCost  float64
 }
 
 func (l *Lease) Release() {
 	l.once.Do(func() {
 		p := l.pool
 		p.mu.Lock()
+		l.Backend.advanceCostLocked(p.now())
+		l.timeCost = l.Backend.costClock - l.costStart
 		l.Backend.inflight--
+		p.inflightByModel[l.model]--
 		p.dispatchLocked(false)
 		p.mu.Unlock()
 	})
@@ -137,6 +171,10 @@ type Options struct {
 	// config.EngineMetrics); StallAfter <= 0 turns it off.
 	StallAfter   time.Duration
 	StallMinRate float64
+	// ColdStart holds Hold requests for a model with no backend up, when a
+	// backend could serve it once up or the model is in ColdModels.
+	ColdStart  bool
+	ColdModels map[string]bool
 }
 
 type Pool struct {
@@ -146,6 +184,9 @@ type Pool struct {
 	waiters  *list.List
 	opts     Options
 	log      *slog.Logger
+	now      func() time.Time // the cost clock's time source
+	// inflightByModel counts leases by demandModel, for autoscaling.
+	inflightByModel map[string]int
 }
 
 type waiter struct {
@@ -191,12 +232,22 @@ func OptionsFromConfig(cfg *config.Config) Options {
 		KVSaturated:  cfg.EngineMetrics.KVSaturated,
 		StallAfter:   cfg.EngineMetrics.StallAfter.D(),
 		StallMinRate: cfg.EngineMetrics.StallMinTokensPerSecond,
+		ColdStart:    cfg.Autoscaling.ColdStartWait > 0,
+		ColdModels:   coldModels(cfg.Autoscaling.ScaleToZeroModels),
 	}
+}
+
+func coldModels(models []string) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range models {
+		out[m] = true
+	}
+	return out
 }
 
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
 	opts = opts.withDefaults()
-	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log}
+	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log, now: time.Now, inflightByModel: map[string]int{}}
 	for i, cb := range backends {
 		b, err := newBackend(cb, i)
 		if err != nil {
@@ -253,8 +304,10 @@ func newBackend(cb config.Backend, index int) (*Backend, error) {
 // setCapacity applies the settings that may change in place (under Pool.mu
 // once the backend is in a pool).
 func (b *Backend) setCapacity(cb config.Backend) {
+	b.setPricingLocked(pricingOf(cb), time.Now())
 	b.MaxConcurrency = cb.MaxConcurrency
 	b.MaxContextTokens = cb.MaxContextTokens
+	b.dynamicLoRA = cb.DynamicLoRA
 	b.models = map[string]bool{}
 	for _, m := range cb.Models {
 		b.models[m] = true
@@ -315,10 +368,10 @@ func (p *Pool) Update(backends []config.Backend, opts Options) ([]string, error)
 			next = append(next, b)
 			changes = append(changes, "replaced backend "+cb.Name+" (endpoint or credentials changed)")
 		default:
-			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models))
+			before := fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price, old.dynamicLoRA)
 			old.setCapacity(cb)
 			old.index = i
-			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models)) != before {
+			if fmt.Sprint(old.Tier, old.AutoTier, old.MaxConcurrency, old.MaxContextTokens, sortedKeys(old.models), old.price, old.dynamicLoRA) != before {
 				changes = append(changes, "updated backend "+cb.Name)
 			}
 			next = append(next, old)
@@ -372,11 +425,11 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 			return nil, err
 		}
 		if b != nil {
-			l := p.grantLocked(b, aff, start)
+			l := p.grantLocked(b, req, aff, start)
 			p.mu.Unlock()
 			return l, nil
 		}
-	} else if !p.servableLocked(req) {
+	} else if !p.servableLocked(req) && !p.coldLocked(req) {
 		p.mu.Unlock()
 		return nil, ErrNoBackend
 	}
@@ -468,9 +521,18 @@ func (p *Pool) QueueDepth() int {
 	return p.waiters.Len()
 }
 
-func (p *Pool) grantLocked(b *Backend, affinity bool, start time.Time) *Lease {
+func (p *Pool) grantLocked(b *Backend, r Request, affinity bool, start time.Time) *Lease {
+	now := p.now()
+	b.advanceCostLocked(now)
 	b.inflight++
-	return &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p}
+	p.inflightByModel[demandModel(r)]++
+	l := &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p, model: demandModel(r),
+		costStart: b.costClock, price: b.price, hardware: b.hardwareNameLocked()}
+	if r.Base != "" {
+		l.AdapterLoaded = b.hasAdapterLocked(r.Model, now)
+		l.NeedsLoad = !l.AdapterLoaded && b.dynamicLoRA
+	}
+	return l
 }
 
 // dispatchLocked hands freed slots to waiters in arrival order. A waiter that
@@ -493,7 +555,7 @@ func (p *Pool) dispatchLocked(checkAll bool) {
 		case b != nil:
 			p.waiters.Remove(el)
 			w.el = nil
-			w.ch <- result{lease: p.grantLocked(b, aff, w.start)}
+			w.ch <- result{lease: p.grantLocked(b, w.req, aff, w.start)}
 		}
 		el = next
 	}
@@ -518,7 +580,7 @@ func (p *Pool) NearContextLimit(r Request, margin float64) (counter *Backend, ne
 	defer p.mu.Unlock()
 	need := float64(r.PromptTokens + r.MaxTokens)
 	for _, b := range p.backends {
-		if !b.healthy || b.drained || r.Exclude[b.Name] || !b.serves(r.Model) {
+		if !b.healthy || b.drained || r.Exclude[b.Name] || !b.servesRequest(r) {
 			continue
 		}
 		if b.Tokenize != "" && counter == nil {
@@ -572,7 +634,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && (r.Only == nil || r.Only[b.Name]) && b.servesRequest(r) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {
@@ -611,6 +673,9 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 		}
 	}
 	if !servable {
+		if p.coldLocked(r) {
+			return nil, false, nil // wait for a backend to come up
+		}
 		return nil, false, ErrNoBackend
 	}
 	if len(free) == 0 {
@@ -645,6 +710,9 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 				return b, true, nil
 			}
 		}
+	}
+	if r.Base != "" {
+		free = p.loraCandidatesLocked(free, r.Model, loads, minLoad, now)
 	}
 
 	order := smallOrder
@@ -765,7 +833,7 @@ func (p *Pool) SetDiscoveredModels(b *Backend, models []string) {
 		set[m] = true
 	}
 	p.mu.Lock()
-	b.discovered = set
+	b.discovered, b.discoveredAt = set, time.Now()
 	p.mu.Unlock()
 }
 
@@ -873,6 +941,9 @@ type Status struct {
 	TTFTMillis float64         `json:"ttft_ms"`
 	Hardware   *HardwareStatus `json:"hardware,omitempty"`
 	Engine     *EngineStatus   `json:"engine,omitempty"`
+	// LoRAAdapters are adapters known to be loaded here (see lora.go).
+	LoRAAdapters []string `json:"lora_adapters,omitempty"`
+	DynamicLoRA  bool     `json:"dynamic_lora,omitempty"`
 }
 
 func (p *Pool) Snapshot() []Status {
@@ -907,5 +978,8 @@ func (p *Pool) statusLocked(b *Backend) Status {
 		TTFTMillis: math.Round(b.ttft * 1000),
 		Hardware:   b.hardwareStatus(),
 		Engine:     p.engineStatusLocked(b, time.Now()),
+
+		LoRAAdapters: b.knownAdaptersLocked(time.Now()),
+		DynamicLoRA:  b.dynamicLoRA,
 	}
 }

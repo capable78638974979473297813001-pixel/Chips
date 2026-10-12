@@ -38,9 +38,100 @@ When admin keys are set, only they can use `/admin/*`: `GET /admin/backends`, `G
 inference. Without admin keys, any client key can use `/admin/*`, which is the old behavior. The router logs
 a warning about this at startup; set admin keys whenever clients aren't fully trusted.
 
-`/metrics`, `/healthz` and `/readyz` stay unauthenticated so Prometheus and load balancers can
-reach them. They expose backend names and counts, not prompts or keys. Restrict them at the
-network level if that matters.
+`/metrics`, `/healthz`, `/readyz` and `/autoscale` stay unauthenticated so Prometheus, load
+balancers and autoscalers can reach them. They expose backend and model names and counts, not
+prompts or keys. Restrict them at the network level if that matters.
+
+## Single sign-on (OIDC / JWT)
+
+People can call the router with their company login instead of a shared API key. Any OpenID
+Connect provider works (Okta, Microsoft Entra ID, Google, Keycloak, Auth0, Dex, Ping), and so
+does anything that issues signed JWTs with a published JWKS.
+
+```yaml
+auth:
+  oidc:
+    issuer: https://login.example.com/realms/acme   # tokens must carry this iss
+    audiences: [siliconrouter]     # ...and this aud (required, so tokens for other apps are refused)
+    user_claim: email              # who the user is (default sub)
+    groups_claim: groups           # their groups; dots reach nested claims (realm_access.roles)
+    admin_groups: [platform-admins]  # may use /admin/*
+    teams:                         # first group that matches wins
+      - group: ml-research
+        name: ml-research          # default: the group name
+        priority: high
+        tokens_per_day: 50000000
+      - group: support-eng
+        name: support
+        models: ["llama-3.1-8b", "support-bot-*"]
+        max_tokens: 2048
+    default_team: oidc             # team of users in none of the groups...
+    require_team: false            # ...or refuse them with 403 no_team
+    user_limits:                   # every user, on their own, on top of the team's limits
+      max_concurrent: 4
+      requests_per_minute: 60
+      tokens_per_day: 2000000
+```
+
+Clients send `Authorization: Bearer <access token>`, the same header OpenAI SDKs use for keys, so
+an app passes the user's token where it used to pass a key. Tokens and API keys work side by side:
+anything shaped like a JWT is checked as a token, and everything else as a key.
+
+What's checked:
+- **The signature**, against the issuer's keys from OIDC discovery (`jwks_url` or `jwks_file`
+  skip discovery). Only RS/PS256-512, ES256-512 and EdDSA are accepted. `none`, HMAC algorithms
+  and RSA keys under 2048 bits are refused.
+- **`iss`, `aud`, `exp` and `nbf`**, with `leeway` (default 60s) for clock skew.
+
+Keys are cached and re-fetched every `jwks_refresh` (default 1h), and also when a token names a
+key ID the router hasn't seen, which is how providers rotate keys. Fetches triggered by tokens are
+limited to one per 30 seconds, so forged tokens can't flood the provider. Verified tokens are
+cached until they expire, so a request costs a hash lookup, not an RSA check. If the provider is
+unreachable at startup, the router logs a warning and keeps trying.
+
+**Teams and users.** A user's team works like a named API key: priority, limits, model allow-list
+and token cap. Usage, cost and rate limits are counted under the team name, so chargeback reports
+stay per team. Each user is also counted and limited on their own as `user:<id>`, so one person
+can't use up their whole team's quota. `/admin/usage` lists both. Prometheus metrics are per team
+only, to keep the number of series bounded. Requests from different users never share
+response-cache entries.
+
+Errors: `401 token_expired`, `401 invalid_token` (with the reason), `403 no_team`, and
+`503 auth_unavailable` when the provider's keys can't be fetched at all.
+
+## Audit log
+
+```yaml
+audit:
+  file: /var/lib/siliconrouter/audit/audit.jsonl   # or "-" for stdout
+  requests: true                   # one entry per inference request (default)
+  max_size_mb: 100                 # rotate to audit.jsonl.1, .2, ...
+  max_files: 10
+```
+
+The audit log is append-only JSON lines. It records:
+- **request**: who (`client` team or key name, `actor` as `user:<id>` or a key fingerprint like
+  `key:3fa2c1d0`), method, path, model, backend, status, attempts, tokens, cost, duration, remote
+  address and trace ID. It never records prompt or response content.
+- **auth_failure**: bad or expired keys and tokens, with the reason and the remote address.
+- **admin**: every `/admin/*` call, including reads, with the actor and the result.
+- **config_applied**: every reload, with what changed.
+- **startup**.
+
+Each entry carries a sequence number and the SHA-256 of the previous entry, and its own hash covers
+both. Editing, deleting or reordering entries breaks the chain. The chain continues across
+rotations and restarts. Check it with:
+
+```bash
+siliconrouter -verify-audit audit.jsonl.2 audit.jsonl.1 audit.jsonl   # oldest first
+# audit log OK: 48211 entries, chain intact
+```
+
+The chain catches edits to some entries. It can't stop someone who can rewrite the whole file from
+writing a whole new chain. Ship the files to write-once storage or your SIEM (Splunk, Elastic,
+Datadog, or anything that tails JSON lines) for that. Write errors are logged and don't fail
+requests. API keys appear only as fingerprints. Admin keys are fingerprinted the same way, so you
+can tell which key did what without the log revealing any key.
 
 ## Maintenance: draining a backend
 
@@ -131,6 +222,112 @@ For exact numbers on OpenAI-style streams, have clients send
 
 Counters live in memory, and a config reload keeps them. To keep them across restarts, including
 today's quota, set `state_dir` (see below). Use the Prometheus counters for long-term reporting.
+
+## Cost in dollars
+
+Token counts don't answer the question finance asks: what did each team cost? Give each backend a
+price, and the router turns GPU time into dollars per team and per kind of hardware.
+
+```yaml
+backends:
+  - name: h100-node-1
+    url: http://10.0.0.11:8000
+    cost_per_hour: 31.20          # e.g. an 8x H100 instance; or amortized hardware + power
+    hardware_name: H100           # how it's grouped in reports (default: chipagent's GPU name)
+  - name: hosted-fallback
+    url: https://api.example.com
+    cost_per_million_prompt_tokens: 0.60
+    cost_per_million_completion_tokens: 2.40
+```
+
+**How time becomes dollars.** At each moment, a backend's hourly cost is split evenly between the
+requests running on it. A request that ran alone for 2 seconds on a $36/hour server cost 2 cents. If
+three other requests shared the server for that time, it cost half a cent. The router keeps a
+running "cost clock" per backend, so this costs nothing per request no matter how many share a
+server. Time with nothing running is booked as **idle**, so the bill for unused capacity is visible
+too. Token prices, when set, are added on top. Retries are charged to the client too: a failed
+attempt used the GPU as well.
+
+When a backend has `metrics_path`, the count of running requests is the larger of the router's own
+and what the engine reports. Requests from other routers (cluster mode) or from clients that call
+the engine directly then take their share, and this router's teams aren't billed for them. Without
+engine metrics in cluster mode, each router splits the cost among only its own requests, so the
+fleet-wide sum overcounts. Turn on `metrics_path` for cost reports across several routers.
+
+**Reports:**
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_KEY" 'localhost:8080/admin/costs?days=7'
+curl -H "Authorization: Bearer $ADMIN_KEY" 'localhost:8080/admin/costs?from=2026-10-01&to=2026-10-31'
+```
+
+```json
+{"from": "2026-10-06", "to": "2026-10-12", "currency": "USD",
+ "total_dollars": 1904.17, "idle_dollars": 377.40,
+ "clients": [{"client": "team-x", "dollars": 412.08,
+              "by_hardware": {"H100": 398.51, "MI300X": 13.57},
+              "by_day": {"2026-10-06": 61.20, "2026-10-07": 58.94}}],
+ "hardware": [{"hardware": "H100", "dollars": 1501.33, "idle_dollars": 290.10}]}
+```
+
+Days are UTC. The ledger keeps 400 days in memory, and `state_dir` keeps it across restarts. Each
+request's cost is also in its log line (`cost_usd`). For Prometheus, use
+`siliconrouter_client_cost_dollars_total{client,hardware}` and
+`siliconrouter_backend_idle_cost_dollars_total{backend,hardware}`. For example,
+`sum by (client) (increase(siliconrouter_client_cost_dollars_total[7d]))` gives spend per team per
+week across every router. The Grafana dashboard has these panels.
+
+## Scale-to-zero and autoscaling
+
+GPUs are expensive to leave idle. The router helps you turn them off: it holds requests while a
+server boots, wakes whatever starts servers, and publishes the demand an autoscaler needs.
+
+```yaml
+autoscaling:
+  cold_start_wait: 5m              # hold requests up to this long while a backend starts (0 = off)
+  scale_to_zero_models: [llama-3.1-70b]   # may have no backends at all; still listed in /v1/models
+  webhook:                         # optional: called when requests start waiting
+    url: https://ops.example.com/hooks/start-gpu
+    secret_env: SCALE_WEBHOOK_SECRET      # sent as Authorization: Bearer
+    interval: 30s                  # at most one call per model this often
+  target_utilization: 0.8          # desired_backends aims for this share of max_concurrency
+  backend_capacity: 16             # max_concurrency assumed while a model has no backends
+```
+
+**Cold starts.** When `cold_start_wait` is set and no backend for a request's model is up, the
+request waits in the queue for up to `cold_start_wait` instead of failing with `503` at once. This
+covers backends that are all down, booting, stalled or on a failed GPU, and models in
+`scale_to_zero_models` that have no backends at all. The request is answered as soon as a backend
+for the model passes its health checks, including one that DNS discovery or a config reload just
+added. If none comes up in time, the client gets `503 cold_start_timeout` with `Retry-After`.
+Drained backends don't count, because a drain is an operator's decision. A request with
+`models.fallbacks` left doesn't wait: it goes to the fallback model at once, while the webhook
+still asks for the big model to start.
+
+**The webhook** gets `POST {"event": "scale_up", "model": "...", "held_requests": 3, "router":
+"...", "time": "..."}`. Use it to start a stopped VM, call a cloud API, or scale a Deployment
+from a small function. Adapter requests ask for their base model.
+
+**Signals for autoscalers.** Per model, counting adapters toward their base model:
+
+| Metric | Meaning |
+|---|---|
+| `siliconrouter_model_inflight` | requests running |
+| `siliconrouter_model_queued` | requests waiting for a slot, including held ones |
+| `siliconrouter_model_held` | requests waiting because no backend for the model is up |
+| `siliconrouter_model_ready_backends` | backends in rotation serving it |
+| `siliconrouter_model_desired_backends` | `ceil((inflight + queued) / (max_concurrency x target_utilization))` |
+| `siliconrouter_cold_starts_total` | requests that arrived with no backend up |
+
+The same numbers are served as JSON at `GET /autoscale` and `GET /autoscale/<model>`, without
+auth, like `/metrics`. KEDA's `metrics-api` scaler can read `desired_backends` from there.
+[deploy/kubernetes/keda-scaledobject.yaml](../deploy/kubernetes/keda-scaledobject.yaml) scales a
+vLLM Deployment between 0 and 8 replicas this way, with a Prometheus variant for cluster mode,
+where each router only sees its own requests. An HPA can use the same metrics through
+prometheus-adapter.
+
+For scale to zero on Kubernetes, find the vLLM pods with DNS `discovery` on a headless Service.
+New pods join as their health checks pass, and held requests go to them right away.
 
 ## Changing config without downtime
 

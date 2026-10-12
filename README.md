@@ -51,6 +51,10 @@ endpoint.
    can run as one cluster, sharing conversation placement, quotas and limits. Traces go
    to any OpenTelemetry collector. A Helm chart, systemd units and release builds are included.
    See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+   It can also be the endpoint picker of a Kubernetes Gateway API Inference Extension
+   InferencePool, so Envoy Gateway, Istio, kgateway or GKE gateways route with its decisions; see
+   [docs/GATEWAY.md](docs/GATEWAY.md). Single sign-on (OIDC), per-user quotas, a tamper-evident
+   audit log, and cost reports in dollars per team are built in.
 7. **Survives failures.** If a server dies mid-request, the request is retried on another server
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover. When a model has no capacity left, requests can fall back to a smaller
@@ -81,6 +85,19 @@ Or with Docker:
 ```bash
 docker compose -f deploy/docker-compose.yaml up --build
 ```
+
+With real inference engines, plus Prometheus (with the alert rules) and Grafana (with the dashboard):
+
+```bash
+cd deploy/quickstart
+docker compose up -d --build                        # two vLLM servers on an NVIDIA GPU
+docker compose -f docker-compose.cpu.yaml up -d --build   # or: two llama.cpp servers, no GPU
+./smoke.sh                                          # one request, a load test, and the spend so far
+```
+
+Grafana is on http://localhost:3000. See the comments at the top of
+[deploy/quickstart/docker-compose.yaml](deploy/quickstart/docker-compose.yaml) to pick the vLLM
+image that matches your CUDA driver, and to change the model.
 
 Then talk to it like any OpenAI endpoint:
 
@@ -131,9 +148,11 @@ OpenAI-compatible servers return).
 | `GET /v1/models`          | Models served by healthy backends                             |
 | `GET /admin/backends`     | Live state: health, in-flight requests, models, hardware, last error |
 | `GET /admin/usage`        | Requests, rejections and tokens per client (API key name)     |
+| `GET /admin/costs`        | Dollars per client and hardware over a range of days (`?days=7`) |
 | `POST /admin/reload`      | Re-read the config file and apply it live (also `SIGHUP`)      |
 | `POST /admin/backends/{name}/drain`, `/undrain` | Take a backend out of rotation for maintenance, or put it back |
 | `GET /metrics`            | Prometheus metrics                                            |
+| `GET /autoscale[/{model}]` | Demand per model for autoscalers (KEDA, HPA): in flight, queued, held, desired backends |
 | `GET /healthz`, `/readyz` | Liveness, and readiness (at least one healthy backend)        |
 
 Request headers:
@@ -196,6 +215,10 @@ internal/discovery  backends from DNS A/AAAA and SRV records
 internal/engine     inference engines' Prometheus metrics (queue depth, KV usage, progress)
 internal/supervise  restarts background loops that panic
 internal/tracing    W3C trace context and OTLP/HTTP span export
+internal/extproc    Gateway API Inference Extension endpoint picker (Envoy ext_proc over gRPC)
+internal/oidc       single sign-on: JWT verification against an OIDC provider's keys
+internal/audit      tamper-evident audit log (hash-chained JSON lines)
+internal/costs      dollars per client, hardware and day
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload
 internal/prompt     single-pass request scanner, prefix hashing, size estimates, policy claims
@@ -216,6 +239,11 @@ results, including the three bugs the run found and fixed, are in
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's built, what's next, and how the open-source and
 commercial editions split.
+
+Releases are listed in [CHANGELOG.md](CHANGELOG.md). They are signed and come with SBOMs; see
+[SECURITY.md](SECURITY.md) for how to verify them and how to report a vulnerability. Ready-made
+monitoring is in [deploy/grafana](deploy/grafana) (dashboard) and
+[deploy/prometheus](deploy/prometheus) (alert rules).
 
 ## License
 

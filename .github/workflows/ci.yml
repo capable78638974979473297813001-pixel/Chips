@@ -60,6 +60,14 @@ jobs:
           helm lint deploy/helm/siliconrouter --set existingSecret=s
           helm template sr deploy/helm/siliconrouter --set existingSecret=s,agent.enabled=true,tls.secretName=t,persistence.enabled=true > /dev/null
           helm template sr deploy/helm/siliconrouter --set replicaCount=1 > /dev/null
+          helm template sr deploy/helm/siliconrouter --set prometheusRule.enabled=true,replicaCount=1 | grep -q SiliconRouterGPUFailed
+          helm template sr deploy/helm/siliconrouter --set existingSecret=s,gateway.enabled=true,gateway.inferencePool.create=true,gateway.inferencePool.selector.app=vllm > /dev/null
+      - name: alert rules and dashboard
+        run: |
+          curl -sSfL https://github.com/prometheus/prometheus/releases/download/v2.55.1/prometheus-2.55.1.linux-amd64.tar.gz | tar xz
+          export PATH=$PWD/prometheus-2.55.1.linux-amd64:$PATH
+          make alerts-test
+          python3 scripts/grafana-dashboard.py && git diff --exit-code deploy/grafana/siliconrouter.json
       - name: systemd units
         run: |
           sudo touch /usr/local/bin/siliconrouter /usr/local/bin/chipagent

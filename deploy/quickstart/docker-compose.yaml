@@ -1,0 +1,98 @@
+# Quickstart on a real GPU: two vLLM engines behind SiliconRouter, with
+# Prometheus (and the alert rules) and Grafana (and the dashboard).
+#
+#   cd deploy/quickstart
+#   docker compose up -d --build        # first start downloads the model; give vLLM a few minutes
+#   ./smoke.sh                          # a request through the router, then a short load test
+#   open http://localhost:3000          # Grafana: the SiliconRouter dashboard
+#
+# Needs an NVIDIA GPU with ~8 GB free, the NVIDIA Container Toolkit, and
+# Docker Compose v2. Both engines share GPU 0 by default. For a second GPU, set
+# VLLM_B_GPU=1. No GPU? Use docker-compose.cpu.yaml (llama.cpp) instead.
+#
+# The vLLM image must match the host's CUDA driver (docs/VALIDATION.md):
+#   VLLM_IMAGE=vllm/vllm-openai:v0.31.0          CUDA 13 drivers (580+), the default
+#   VLLM_IMAGE=vllm/vllm-openai:v0.31.0-cu129    CUDA 12.9 drivers
+# MODEL is any model vLLM serves (set HF_TOKEN for gated ones); keep it small,
+# because two copies share the GPU.
+
+x-vllm: &vllm
+  image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.31.0}
+  ipc: host
+  environment:
+    HF_TOKEN: ${HF_TOKEN:-}
+    VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+  volumes:
+    - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 10s
+    timeout: 5s
+    retries: 60
+    start_period: 60s
+  restart: unless-stopped
+
+services:
+  vllm-a:
+    <<: *vllm
+    command: &vllm-args
+      - --model=${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+      - --served-model-name=${MODEL_NAME:-qwen2.5-1.5b}
+      - --gpu-memory-utilization=${GPU_MEMORY_UTILIZATION:-0.4}
+      - --max-model-len=8192
+      - --max-num-seqs=32
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${VLLM_A_GPU:-0}"], capabilities: [gpu]}]
+
+  vllm-b:
+    <<: *vllm
+    command: *vllm-args
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${VLLM_B_GPU:-0}"], capabilities: [gpu]}]
+
+  router:
+    build: ../..
+    command: ["-config", "/etc/siliconrouter/siliconrouter.yaml", "-log-json"]
+    volumes:
+      - ./siliconrouter.yaml:/etc/siliconrouter/siliconrouter.yaml:ro
+      - router-state:/var/lib/siliconrouter
+    ports: ["8080:8080"]
+    depends_on: [vllm-a, vllm-b]   # the router health-checks them and waits for them itself
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yaml:/etc/prometheus/siliconrouter-alerts.yaml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/siliconrouter.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/siliconrouter.json:/var/lib/grafana/dashboards/siliconrouter.json:ro
+    ports: ["3000:3000"]
+
+  # docker compose run --rm bench    (multi-turn chat load through the router)
+  bench:
+    build: ../..
+    profiles: [bench]
+    entrypoint: ["/usr/local/bin/srbench", "-url", "http://router:8080/v1/chat/completions",
+                 "-model", "${MODEL_NAME:-qwen2.5-1.5b}", "-conversations", "24", "-turns", "6",
+                 "-concurrency", "8", "-system-chars", "2000", "-user-chars", "400", "-max-tokens", "64"]
+    depends_on: [router]
+
+volumes:
+  router-state:

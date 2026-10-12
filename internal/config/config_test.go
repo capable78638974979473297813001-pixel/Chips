@@ -203,3 +203,52 @@ func TestShutdownAndRetryDefaults(t *testing.T) {
 		t.Error("negative drain_delay accepted")
 	}
 }
+
+func TestAdaptersAndCostsValidation(t *testing.T) {
+	base := "backends:\n  - {name: a, url: \"http://x:1\", cost_per_hour: 2, dynamic_lora: true}\n"
+	c, err := Parse([]byte(base + "models:\n  adapters:\n    - {name: sup, base: llama, path: /l/sup}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, ok := c.Models.Adapter("sup"); !ok || a.Base != "llama" || !c.Backends[0].DynamicLoRA || !c.Backends[0].Costed() {
+		t.Errorf("parsed %+v %+v", c.Models, c.Backends[0])
+	}
+	for name, extra := range map[string]string{
+		"no base":     "models:\n  adapters:\n    - {name: sup}\n",
+		"own base":    "models:\n  adapters:\n    - {name: m, base: m}\n",
+		"duplicate":   "models:\n  adapters:\n    - {name: s, base: m}\n    - {name: s, base: m}\n",
+		"alias clash": "models:\n  aliases: {s: m}\n  adapters:\n    - {name: s, base: m}\n",
+	} {
+		if _, err := Parse([]byte(base + extra)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := Parse([]byte("backends:\n  - {name: a, url: \"http://x:1\", cost_per_hour: -1}\n")); err == nil {
+		t.Error("negative cost accepted")
+	}
+}
+
+func TestOIDCValidation(t *testing.T) {
+	base := "backends: [{name: a, url: \"http://x:1\"}]\n"
+	good := base + "auth:\n  oidc:\n    issuer: https://login.example.com\n    audiences: [router]\n    teams:\n      - {group: ml}\n"
+	c, err := Parse([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := c.Auth.OIDC
+	if !c.Auth.Enabled() || o.UserClaim != "sub" || o.Teams[0].Name != "ml" || o.DefaultTeam != "oidc" {
+		t.Errorf("defaults: %+v", o)
+	}
+	for name, cfg := range map[string]string{
+		"no audience":    base + "auth:\n  oidc: {issuer: https://login.example.com}\n",
+		"jwks only":      base + "auth:\n  oidc: {jwks_url: https://k.example.com/keys, audiences: [r]}\n",
+		"teams, no oidc": base + "auth:\n  oidc: {teams: [{group: ml}]}\n",
+		"team clash":     base + "auth:\n  keys: [{name: ml, key: k}]\n  oidc: {issuer: https://l.example.com, audiences: [r], teams: [{group: ml}]}\n",
+		"user: key name": base + "auth:\n  keys: [{name: \"user:x\", key: k}]\n  oidc: {issuer: https://l.example.com, audiences: [r]}\n",
+		"bad priority":   base + "auth:\n  oidc: {issuer: https://l.example.com, audiences: [r], teams: [{group: ml, priority: urgent}]}\n",
+	} {
+		if _, err := Parse([]byte(cfg)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

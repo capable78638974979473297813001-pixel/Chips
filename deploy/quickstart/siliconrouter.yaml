@@ -1,0 +1,39 @@
+# Router config for the quickstart (docker-compose.yaml): two vLLM engines.
+# Everything not set here uses the defaults in examples/siliconrouter.yaml.
+listen: ":8080"
+backends:
+  - name: vllm-a
+    url: http://vllm-a:8000
+    tier: standard
+    max_concurrency: 32          # matches vLLM's --max-num-seqs; more requests queue in the router
+    max_context_tokens: 8192     # matches --max-model-len
+    tokenize: vllm               # exact token counts near the context limit
+    metrics_path: /metrics       # route on vLLM's own queue and KV-cache use; stall detection
+    health_path: /health
+    dynamic_lora: true           # LoRA adapters in models.adapters load on demand
+    cost_per_hour: 1.20          # what this GPU costs you; /admin/costs reports spend per team
+    hardware_name: GPU
+  - name: vllm-b
+    url: http://vllm-b:8000
+    tier: standard
+    max_concurrency: 32
+    max_context_tokens: 8192
+    tokenize: vllm
+    metrics_path: /metrics
+    health_path: /health
+    dynamic_lora: true
+    cost_per_hour: 1.20
+    hardware_name: GPU
+models:
+  aliases:
+    gpt-4o-mini: qwen2.5-1.5b    # apps written for OpenAI work unchanged; change it if you set MODEL_NAME
+cache:
+  enabled: true
+state_dir: /var/lib/siliconrouter
+audit:
+  file: /var/lib/siliconrouter/audit.jsonl
+# Open, for trying it out. Before sharing it, add keys (docs/OPERATIONS.md):
+# auth:
+#   keys:
+#     - {name: my-team, key_env: MY_TEAM_KEY}
+#   admin_keys_env: SILICONROUTER_ADMIN_KEYS

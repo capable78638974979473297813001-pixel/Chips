@@ -1,0 +1,160 @@
+# Prometheus alert rules for SiliconRouter.
+#
+#   rule_files: [/etc/prometheus/siliconrouter-alerts.yaml]
+#
+# or, with the Prometheus Operator, set prometheusRule.enabled in the Helm
+# chart (it ships a copy of this file). Tested with `make alerts-test`.
+# Severities: critical pages someone, warning goes to a ticket queue, info
+# goes to a dashboard or chat.
+groups:
+  - name: siliconrouter.hardware
+    rules:
+      - alert: SiliconRouterGPUFailed
+        expr: max by (backend) (siliconrouter_backend_hardware_faults) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "A GPU on {{ $labels.backend }} has failed"
+          description: >-
+            chipagent reports {{ $value }} failing accelerator(s) on {{ $labels.backend }}
+            (for example fallen off the bus). The router has taken the backend out of
+            rotation; requests go elsewhere. Check `nvidia-smi` / `rocm-smi` and the kernel
+            log, and GET /admin/backends for the device and error.
+      - alert: SiliconRouterBackendStalled
+        expr: max by (backend) (siliconrouter_backend_engine_stalled) == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Inference engine on {{ $labels.backend }} is stalled"
+          description: >-
+            {{ $labels.backend }} has had requests running for longer than
+            engine_metrics.stall_after while generating almost no tokens: a hung GPU or a
+            deadlocked engine. It gets no new work, but the requests already on it are stuck.
+            Restart the engine.
+
+  - name: siliconrouter.availability
+    rules:
+      - alert: SiliconRouterDown
+        expr: up{job=~".*siliconrouter.*"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "SiliconRouter {{ $labels.instance }} is not answering scrapes"
+          description: "Prometheus cannot reach the router's /metrics at {{ $labels.instance }}."
+      - alert: SiliconRouterNoBackends
+        expr: sum by (instance) (siliconrouter_backend_healthy) == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "No backend is in rotation on {{ $labels.instance }}"
+          description: >-
+            Every backend is unhealthy or gone, so requests fail with 503 (or wait, with
+            autoscaling.cold_start_wait). Check the engines and GET /admin/backends.
+      - alert: SiliconRouterMostBackendsDown
+        expr: sum by (instance) (siliconrouter_backend_healthy) / count by (instance) (siliconrouter_backend_healthy) < 0.5
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Fewer than half the backends are in rotation on {{ $labels.instance }}"
+          description: "Only {{ $value | humanizePercentage }} of backends are healthy; the rest of the fleet is carrying all traffic."
+      - alert: SiliconRouterBackendDown
+        expr: max by (backend) (siliconrouter_backend_healthy) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Backend {{ $labels.backend }} is out of rotation"
+          description: "{{ $labels.backend }} has failed its health checks for 5 minutes. GET /admin/backends shows its last error."
+      - alert: SiliconRouterHighErrorRate
+        expr: |
+          sum by (instance) (rate(siliconrouter_requests_total{code=~"5.."}[5m]))
+            / clamp_min(sum by (instance) (rate(siliconrouter_requests_total[5m])), 1e-9) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests fail on {{ $labels.instance }}"
+          description: "More than 5% of proxied requests answered 5xx for 5 minutes. Check siliconrouter_upstream_errors_total by backend."
+      - alert: SiliconRouterColdStartStuck
+        expr: max by (model) (siliconrouter_model_held) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Requests for {{ $labels.model }} have waited 10m for a backend to start"
+          description: >-
+            Requests are held for {{ $labels.model }} but no backend for it has come up.
+            The autoscaler or the scale-up webhook may not be working, or new pods fail to start.
+
+  - name: siliconrouter.load
+    rules:
+      - alert: SiliconRouterRetryBudgetExhausted
+        expr: sum by (instance) (rate(siliconrouter_retry_budget_exhausted_total[5m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Retry budget exhausted on {{ $labels.instance }}"
+          description: >-
+            Failures are frequent enough that retries hit retry.budget_ratio, so failed
+            attempts go straight to clients. The fleet is overloaded or a backend keeps failing.
+      - alert: SiliconRouterShedding
+        expr: sum by (instance, reason) (rate(siliconrouter_rejected_total{reason=~"queue_full|shed|queue_timeout"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Requests turned away: {{ $labels.reason }} on {{ $labels.instance }}"
+          description: "The queue is full or requests time out waiting for a slot. Add capacity or raise max_concurrency where engines have headroom."
+      - alert: SiliconRouterQueueWaitHigh
+        expr: histogram_quantile(0.95, sum by (instance, le) (rate(siliconrouter_queue_wait_seconds_bucket[5m]))) > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 queue wait is {{ $value | humanizeDuration }} on {{ $labels.instance }}"
+          description: "Requests wait more than 10s for a backend slot. The fleet is near capacity."
+      - alert: SiliconRouterEnginesSaturated
+        expr: avg by (backend) (avg_over_time(siliconrouter_backend_engine_saturated[15m])) > 0.8
+        for: 15m
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $labels.backend }} has been saturated most of the last 15 minutes"
+          description: "Its engine reports queued requests or a nearly full KV cache. Consider more replicas for its model."
+
+  - name: siliconrouter.router
+    rules:
+      - alert: SiliconRouterPanics
+        expr: sum by (instance) (increase(siliconrouter_panics_total[15m])) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "SiliconRouter hit a bug on {{ $labels.instance }}"
+          description: "A request hit a panic (answered 500, logged with a stack). Please report it with the log line."
+      - alert: SiliconRouterGoroutineLeak
+        expr: max by (instance) (siliconrouter_goroutines) > 20000
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} goroutines on {{ $labels.instance }}"
+          description: "Far more goroutines than requests in flight would need; likely a leak. Capture /debug info and restart."
+      - alert: SiliconRouterLoRALoadFailures
+        expr: sum by (instance) (increase(siliconrouter_lora_routing_total{result="load_failed"}[15m])) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "LoRA adapter loads are failing on {{ $labels.instance }}"
+          description: "The router could not load an adapter on a dynamic_lora backend. Check models.adapters paths and VLLM_ALLOW_RUNTIME_LORA_UPDATING."
+      - alert: SiliconRouterAuthFailures
+        expr: sum by (instance) (rate(siliconrouter_rejected_total{reason="unauthorized"}[5m])) > 1
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "Many failed logins on {{ $labels.instance }}"
+          description: "More than one request a second with a bad key or token for 10 minutes: a misconfigured client, an expired credential, or someone guessing. The audit log has the source addresses."
+
+  - name: siliconrouter.cost
+    rules:
+      - alert: SiliconRouterMostlyIdle
+        expr: |
+          sum(increase(siliconrouter_backend_idle_cost_dollars_total[24h]))
+            / clamp_min(sum(increase(siliconrouter_backend_idle_cost_dollars_total[24h])) + sum(increase(siliconrouter_client_cost_dollars_total[24h])), 1e-9) > 0.7
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of GPU spend was idle over the last day"
+          description: "Most of the fleet's cost_per_hour paid for idle hardware. Scale down, or scale to zero (docs/OPERATIONS.md)."

@@ -1,6 +1,13 @@
 # Push a tag like v0.4.0 to publish a release: router and chipagent
 # binaries for Linux, macOS and Windows with checksums, and multi-arch
 # container images on GitHub Container Registry.
+#
+# Everything is signed without long-lived keys, through Sigstore and the
+# workflow's GitHub OIDC identity (SECURITY.md shows how to verify):
+# - SHA256SUMS is signed with cosign (SHA256SUMS.sigstore.json), and the
+#   archives get GitHub build provenance attestations;
+# - images are signed with cosign, and carry SBOM and provenance attestations;
+# - an SPDX SBOM of the source and its dependencies is attached.
 name: release
 on:
   push:
@@ -8,6 +15,8 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write      # Sigstore keyless signing
+  attestations: write  # GitHub artifact attestations
 jobs:
   router:
     runs-on: ubuntu-latest
@@ -80,35 +89,71 @@ jobs:
         id: names
         run: echo "repo=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
+        id: router
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           build-args: VERSION=${{ github.ref_name }}
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ steps.names.outputs.repo }}/siliconrouter:${{ github.ref_name }}
             ${{ steps.names.outputs.repo }}/siliconrouter:latest
       - uses: docker/build-push-action@v6
+        id: agent
         with:
           context: agent
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ steps.names.outputs.repo }}/chipagent:${{ github.ref_name }}
             ${{ steps.names.outputs.repo }}/chipagent:latest
+      - uses: sigstore/cosign-installer@v3
+      - name: sign images
+        env:
+          ROUTER: ${{ steps.names.outputs.repo }}/siliconrouter@${{ steps.router.outputs.digest }}
+          AGENT: ${{ steps.names.outputs.repo }}/chipagent@${{ steps.agent.outputs.digest }}
+        run: cosign sign --yes "$ROUTER" "$AGENT"
 
   publish:
     needs: [router, agent, images]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: SBOM (SPDX) of the source and its dependencies
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/siliconrouter-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
       - name: checksums
         working-directory: dist
-        run: rm -f SHA256SUMS && sha256sum -- *.tar.gz *.zip > SHA256SUMS
+        run: rm -f SHA256SUMS && sha256sum -- *.tar.gz *.zip *.spdx.json > SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: sign checksums
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## \[/ { on = index($0, "[" v "]") > 0; next } on && !/^\[[^]]*\]: http/' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --notes-file notes.md

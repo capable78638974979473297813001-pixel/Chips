@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,15 @@ type server struct {
 	cache    map[uint64]*list.Element
 	lru      *list.List
 	capacity int
+
+	// LoRA adapters, vLLM-style: loaded ones can be requested by name; the
+	// last maxLoRAs used are resident on the "GPU", and using any other
+	// costs swapDelay first.
+	maxLoRAs  int
+	swapDelay time.Duration
+	loaded    map[string]bool
+	resident  []string       // most recent last
+	active    map[string]int // requests running per adapter
 }
 
 func main() {
@@ -48,16 +58,32 @@ func main() {
 	slots := flag.Int("max-concurrency", 8, "requests processed at once; the rest queue (like a full GPU)")
 	cacheBlocks := flag.Int("cache-blocks", 20000, "prefix cache capacity in blocks of 256 chars")
 	failRate := flag.Float64("fail-rate", 0, "fraction of requests answered with 503")
+	maxLoRAs := flag.Int("max-loras", 0, "LoRA adapter slots, like vLLM's --max-loras; 0 disables adapters")
+	loras := flag.String("lora-modules", "", "comma-separated LoRA adapters loaded at start (more via POST /v1/load_lora_adapter)")
+	swap := flag.Duration("lora-swap-delay", 300*time.Millisecond, "delay before a request whose adapter is not in a GPU slot")
 	flag.Parse()
 
 	s := &server{
 		name: *name, model: *model, prefillTPS: *prefill, decodeTPS: *decode, failRate: *failRate,
 		slots: make(chan struct{}, *slots), cache: map[uint64]*list.Element{}, lru: list.New(), capacity: *cacheBlocks,
+		maxLoRAs: *maxLoRAs, swapDelay: *swap, loaded: map[string]bool{}, active: map[string]int{},
+	}
+	for _, a := range strings.Split(*loras, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			s.loaded[a] = true
+		}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]any{"object": "list", "data": []map[string]string{{"id": s.model, "object": "model"}}})
+		data := []map[string]string{{"id": s.model, "object": "model"}}
+		s.mu.Lock()
+		for a := range s.loaded {
+			data = append(data, map[string]string{"id": a, "object": "model", "parent": s.model})
+		}
+		s.mu.Unlock()
+		writeJSON(w, map[string]any{"object": "list", "data": data})
 	})
+	mux.HandleFunc("POST /v1/load_lora_adapter", s.handleLoadLoRA)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/completions", s.handleChat)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -74,6 +100,55 @@ func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{model_name=%q} %d\n", s.model, waiting)
 	fmt.Fprintf(w, "# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{model_name=%q} %g\n", s.model,
 		float64(running)/float64(cap(s.slots)))
+	if s.maxLoRAs > 0 {
+		s.mu.Lock()
+		var active []string
+		for a, n := range s.active {
+			if n > 0 {
+				active = append(active, a)
+			}
+		}
+		s.mu.Unlock()
+		fmt.Fprintf(w, "# TYPE vllm:lora_requests_info gauge\nvllm:lora_requests_info{max_lora=\"%d\",running_lora_adapters=%q,waiting_lora_adapters=\"\"} %d\n",
+			s.maxLoRAs, strings.Join(active, ","), time.Now().Unix())
+	}
+}
+
+// handleLoadLoRA is vLLM's runtime adapter loading API.
+func (s *server) handleLoadLoRA(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"lora_name"`
+		Path string `json:"lora_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Path == "" || s.maxLoRAs == 0 {
+		http.Error(w, "need lora_name and lora_path, and -max-loras > 0", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loaded[req.Name] {
+		http.Error(w, fmt.Sprintf("The lora adapter '%s' has already been loaded.", req.Name), http.StatusBadRequest)
+		return
+	}
+	s.loaded[req.Name] = true
+	fmt.Fprintf(w, "Success: LoRA adapter '%s' added successfully.", req.Name)
+}
+
+// useAdapter marks a request on adapter running and returns how long it
+// waits for the adapter to reach a GPU slot.
+func (s *server) useAdapter(adapter string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active[adapter]++
+	if i := slices.Index(s.resident, adapter); i >= 0 {
+		s.resident = append(slices.Delete(s.resident, i, i+1), adapter)
+		return 0
+	}
+	s.resident = append(s.resident, adapter)
+	if len(s.resident) > s.maxLoRAs {
+		s.resident = s.resident[1:]
+	}
+	return s.swapDelay
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -87,9 +162,16 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	adapter := ""
 	if info.Model != "" && info.Model != s.model {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"model %q not found"}}`, info.Model), http.StatusNotFound)
-		return
+		s.mu.Lock()
+		ok := s.loaded[info.Model]
+		s.mu.Unlock()
+		if !ok {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"model %q not found"}}`, info.Model), http.StatusNotFound)
+			return
+		}
+		adapter = info.Model
 	}
 	if s.failRate > 0 && rand.Float64() < s.failRate {
 		http.Error(w, "simulated failure", http.StatusServiceUnavailable)
@@ -106,6 +188,12 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.running.Add(1)
 	defer func() { s.running.Add(-1); <-s.slots }()
+	if adapter != "" {
+		defer func() { s.mu.Lock(); s.active[adapter]--; s.mu.Unlock() }()
+		if !sleep(r, s.useAdapter(adapter)) {
+			return
+		}
+	}
 
 	hashes := prompt.BlockHashes(info.Text, blockChars, 1<<20)
 	cachedBlocks := s.lookup(hashes)

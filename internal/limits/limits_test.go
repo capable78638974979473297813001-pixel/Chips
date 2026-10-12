@@ -233,3 +233,27 @@ func TestPeersIgnoredWithoutTTL(t *testing.T) {
 		r()
 	}
 }
+
+func TestDefaultsByPrefix(t *testing.T) {
+	tr := New()
+	tr.SetLimits(map[string]Limits{"user:vip": {MaxConcurrent: 5}})
+	tr.SetDefaults(map[string]Limits{"user:": {MaxConcurrent: 1}})
+	if _, rej := tr.Admit("user:ada"); rej != nil {
+		t.Fatal(rej)
+	}
+	if _, rej := tr.Admit("user:ada"); rej == nil || rej.Reason != "concurrency_limit" {
+		t.Errorf("second concurrent request for a user: %v", rej)
+	}
+	for range 3 {
+		if _, rej := tr.Admit("user:vip"); rej != nil {
+			t.Errorf("explicit limits beat the default: %v", rej)
+		}
+	}
+	if _, rej := tr.Admit("team"); rej != nil {
+		t.Error("other names get no default")
+	}
+	tr.SetDefaults(nil)
+	if _, rej := tr.Admit("user:ada"); rej != nil {
+		t.Error("removing the default lifts the limit")
+	}
+}

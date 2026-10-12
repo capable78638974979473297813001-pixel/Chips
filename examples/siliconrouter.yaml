@@ -33,6 +33,26 @@ auth:
   #     models: ["llama-3.1-8b", "qwen2.5-*"]  # only these models (exact, or prefix*)
   #     max_tokens: 1024             # completion budget cap per request
 
+  # Single sign-on: accept JWT access tokens from your identity provider (docs/OPERATIONS.md).
+  # oidc:
+  #   issuer: https://login.example.com/realms/acme
+  #   audiences: [siliconrouter]
+  #   user_claim: email
+  #   groups_claim: groups
+  #   admin_groups: [platform-admins]
+  #   teams:
+  #     - {group: ml-research, priority: high, tokens_per_day: 50000000}
+  #     - {group: support-eng, name: support, models: ["llama-3.1-8b"]}
+  #   require_team: false
+  #   user_limits: {max_concurrent: 4, requests_per_minute: 60, tokens_per_day: 2000000}
+
+# Tamper-evident log of requests, logins and admin actions (never prompt content).
+# audit:
+#   file: /var/lib/siliconrouter/audit/audit.jsonl   # "-" = stdout
+#   requests: true
+#   max_size_mb: 100
+#   max_files: 10
+
 # Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
 # llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.
 # See docs/COMPATIBILITY.md.
@@ -50,6 +70,11 @@ backends:
     # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)
     # tokenize: vllm                # exact token counts near context limits: vllm, llamacpp or tgi
     # grpc_url: http://10.0.0.11:8001  # gRPC endpoint, if it has one (Triton/KServe)
+    # dynamic_lora: false           # vLLM with VLLM_ALLOW_RUNTIME_LORA_UPDATING: load adapters on demand
+    # cost_per_hour: 31.20          # dollars per hour; charged to the teams whose requests run on it
+    # hardware_name: H100           # group in cost reports (default: chipagent's GPU name, else this name)
+    # cost_per_million_prompt_tokens: 0      # token prices, for backends billed per token
+    # cost_per_million_completion_tokens: 0
 
   - name: mac-studio-2
     url: http://10.0.0.12:11434     # Ollama
@@ -123,6 +148,11 @@ models:
   fallbacks: {}
   # fallbacks:
   #   llama-3.1-70b: [llama-3.1-8b]
+  # LoRA adapters: requests for one go to servers that already have it loaded,
+  # then to servers with a free adapter slot (docs/TUNING.md).
+  adapters: []
+  # adapters:
+  #   - {name: support-bot-v3, base: llama-3.1-8b, path: /models/loras/support-bot-v3}
 
 # Find backends in DNS instead of (or as well as) listing them above.
 # Each A/AAAA record or SRV target becomes a backend named <name>-<host>:<port>.
@@ -171,6 +201,22 @@ hardware:
   timeout: 2s
   heavy_min_memory_gib: 64          # tier auto: total accelerator memory for heavy...
   standard_min_memory_gib: 20       # ...and for standard; below this a node is light
+
+# Be the endpoint picker of a Kubernetes Gateway API Inference Extension
+# InferencePool: gateways ask over ext_proc gRPC which pod gets each request
+# (docs/GATEWAY.md).
+# gateway:
+#   listen: ":9002"
+#   secure_serving: true            # self-signed TLS unless cert_file/key_file
+
+# Hold requests while GPU servers start, and publish demand for autoscalers
+# (docs/OPERATIONS.md, deploy/kubernetes/keda-scaledobject.yaml).
+autoscaling:
+  cold_start_wait: 0s               # e.g. 5m: wait this long for a backend to start instead of a 503
+  scale_to_zero_models: []          # models that may have no backends at all
+  # webhook: {url: https://ops.example.com/start-gpu, secret_env: SCALE_WEBHOOK_SECRET, interval: 30s}
+  target_utilization: 0.8
+  backend_capacity: 16
 
 # Save the response cache and usage counters across restarts.
 # state_dir: /var/lib/siliconrouter
