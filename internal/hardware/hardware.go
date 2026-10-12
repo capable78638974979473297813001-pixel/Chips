@@ -44,6 +44,9 @@ type Device struct {
 	UtilizationPercent *float64 `json:"utilization_percent"`
 	TemperatureC       *float64 `json:"temperature_c"`
 	PowerWatts         *float64 `json:"power_watts"`
+	// Error says the device is present but failing, e.g. an NVIDIA GPU
+	// that fell off the bus (chipagent 0.3+).
+	Error string `json:"error,omitempty"`
 }
 
 // IsAccelerator reports whether the device can run AI work.
@@ -68,6 +71,22 @@ type Report struct {
 	Hostname string   `json:"hostname"`
 	Host     *Host    `json:"host"` // nil from chipagent 0.1
 	Devices  []Device `json:"devices"`
+	// Stale means chipagent could not collect fresh readings in time (a
+	// driver or sysfs read hung) and sent its last good ones; CollectError
+	// says why.
+	Stale        bool   `json:"stale,omitempty"`
+	CollectError string `json:"collect_error,omitempty"`
+}
+
+// Faults are the accelerators reported as failing.
+func (r *Report) Faults() []Device {
+	var out []Device
+	for _, d := range r.Accelerators() {
+		if d.Error != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // Accelerators are the devices that count as AI capacity.

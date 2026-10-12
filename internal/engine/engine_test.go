@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
@@ -23,6 +24,9 @@ vllm:num_requests_waiting{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruc
 vllm:kv_cache_usage_perc{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.82
 vllm:kv_cache_usage_perc{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.4
 vllm:prompt_tokens_total{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 123456.0
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{engine="0",model_name="meta-llama/Llama-3.1-8B-Instruct"} 5000.0
+vllm:generation_tokens_total{engine="1",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1200.0
 vllm:e2e_request_latency_seconds_bucket{engine="0",le="0.3",model_name="m"} 4.0
 `
 
@@ -32,6 +36,8 @@ sglang:num_running_reqs{model_name="Qwen/Qwen2.5-7B"} 31.0
 sglang:num_queue_reqs{model_name="Qwen/Qwen2.5-7B"} 0.0
 # TYPE sglang:token_usage gauge
 sglang:token_usage{model_name="Qwen/Qwen2.5-7B"} 0.27
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{model_name="Qwen/Qwen2.5-7B"} 777.0
 `
 
 const tgi = `# TYPE tgi_queue_size gauge
@@ -57,16 +63,16 @@ func TestParse(t *testing.T) {
 		body string
 		want Stats
 	}{
-		"vllm":     {vllm, Stats{Engine: "vllm", Running: 21, Waiting: 3, KVUsage: 0.82}},
-		"sglang":   {sglang, Stats{Engine: "sglang", Running: 31, Waiting: 0, KVUsage: 0.27}},
-		"tgi":      {tgi, Stats{Engine: "tgi", Running: 32, Waiting: 5, KVUsage: -1}},
-		"llamacpp": {llamacpp, Stats{Engine: "llamacpp", Running: 2, Waiting: 1, KVUsage: 0.125}},
-		"triton":   {triton, Stats{Engine: "triton", Running: -1, Waiting: 5, KVUsage: -1}},
+		"vllm":     {vllm, Stats{Engine: "vllm", Running: 21, Waiting: 3, KVUsage: 0.82, Generated: 6200}},
+		"sglang":   {sglang, Stats{Engine: "sglang", Running: 31, Waiting: 0, KVUsage: 0.27, Generated: 777}},
+		"tgi":      {tgi, Stats{Engine: "tgi", Running: 32, Waiting: 5, KVUsage: -1, Generated: -1}},
+		"llamacpp": {llamacpp, Stats{Engine: "llamacpp", Running: 2, Waiting: 1, KVUsage: 0.125, Generated: -1}},
+		"triton":   {triton, Stats{Engine: "triton", Running: -1, Waiting: 5, KVUsage: -1, Generated: -1}},
 		"vllm v0 name, timestamps and odd labels": {
 			"vllm:gpu_cache_usage_perc{model_name=\"a } b\",x=\"q\\\"}\"} 0.5 1712345678000\nvllm:num_requests_waiting 2\n",
-			Stats{Engine: "vllm", Running: -1, Waiting: 2, KVUsage: 0.5}},
+			Stats{Engine: "vllm", Running: -1, Waiting: 2, KVUsage: 0.5, Generated: -1}},
 		"bad values ignored": {"vllm:num_requests_waiting NaN\nvllm:num_requests_running -3\nvllm:num_requests_running 4\n",
-			Stats{Engine: "vllm", Running: 4, Waiting: 0, KVUsage: -1}},
+			Stats{Engine: "vllm", Running: 4, Waiting: 0, KVUsage: -1, Generated: -1}},
 	} {
 		got, err := Parse(strings.NewReader(tc.body))
 		if err != nil || got != tc.want {
@@ -75,6 +81,20 @@ func TestParse(t *testing.T) {
 	}
 	if _, err := Parse(strings.NewReader("go_goroutines 12\nprocess_cpu_seconds_total 3\n")); !errors.Is(err, ErrNoMetrics) {
 		t.Errorf("unknown metrics: err = %v", err)
+	}
+}
+
+// TestRealVLLM parses /metrics as vLLM 0.31 served it on an RTX 4090
+// (docs/VALIDATION.md): about 55 KB of counters, histograms and gauges.
+func TestRealVLLM(t *testing.T) {
+	f, err := os.Open("testdata/vllm-0.31-rtx4090-idle.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	got, err := Parse(f)
+	if want := (Stats{Engine: "vllm", Running: 0, Waiting: 0, KVUsage: 0, Generated: 0}); err != nil || got != want {
+		t.Errorf("got %+v, %v; want %+v", got, err, want)
 	}
 }
 

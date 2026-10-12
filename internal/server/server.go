@@ -15,6 +15,8 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +80,10 @@ type Server struct {
 	clientReqs    *metrics.CounterVec
 	clientTokens  *metrics.CounterVec
 	fallbacks     *metrics.CounterVec
+	budgetSpent   *metrics.CounterVec
+	panics        *metrics.CounterVec
+	draining      atomic.Bool
+	retryBudget   *retryBudget
 	duration      *metrics.Histogram
 	queueWait     *metrics.Histogram
 	firstByte     *metrics.Histogram
@@ -185,6 +191,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		responseCache: reg.NewCounterVec("siliconrouter_response_cache_total", "Response cache lookups: hit (answered from memory), coalesced (shared the answer of an identical request in flight), miss, or skip (not cacheable).", "result"),
 		ttftTimeouts:  reg.NewCounterVec("siliconrouter_first_token_timeouts_total", "Streaming requests moved to another backend because the first one produced no output within retry.first_token_timeout.", "backend"),
 		clientReqs:    reg.NewCounterVec("siliconrouter_client_requests_total", "Admitted requests per client (API key name).", "client"),
+		panics:        reg.NewCounterVec("siliconrouter_panics_total", "Requests that hit a bug in the router (answered 500 and logged with a stack)."),
+		budgetSpent:   reg.NewCounterVec("siliconrouter_retry_budget_exhausted_total", "Failed attempts answered to the client without a retry because the retry budget was spent."),
+		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
@@ -283,6 +292,28 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 			}
 		}
 	})
+	reg.NewGaugeFunc("siliconrouter_backend_engine_stalled", "1 while a backend's engine has requests running but generates almost no tokens; it gets no new work.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if e := st.Engine; e != nil && e.Engine != "" {
+				emit(map[bool]float64{true: 1}[e.Stalled], st.Name)
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_backend_hardware_faults", "Accelerators chipagent reports as failing per backend; while any are, the backend gets no new work.", []string{"backend"}, func(emit func(float64, ...string)) {
+		for _, st := range p.Snapshot() {
+			if st.Hardware != nil {
+				emit(float64(len(st.Hardware.Faults)), st.Name)
+			}
+		}
+	})
+	reg.NewGaugeFunc("siliconrouter_goroutines", "Goroutines in the router; steady growth means a leak.", nil, func(emit func(float64, ...string)) {
+		emit(float64(runtime.NumGoroutine()))
+	})
+	reg.NewGaugeFunc("siliconrouter_heap_bytes", "Heap memory in use by the router.", nil, func(emit func(float64, ...string)) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		emit(float64(m.HeapAlloc))
+	})
 	reg.NewGaugeFunc("siliconrouter_queue_depth", "Requests waiting for a backend slot.", nil, func(emit func(float64, ...string)) {
 		emit(float64(p.QueueDepth()))
 	})
@@ -308,7 +339,27 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+// ServeHTTP serves r. A panic in a handler is logged with its stack and
+// answered with a 500; slots and limits a request held are released by
+// their deferred calls, so a bug in one request leaks nothing.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if v := recover(); v != nil {
+			if v == http.ErrAbortHandler { // net/http's own way to abort a response: let it through
+				panic(v)
+			}
+			s.panics.Inc()
+			s.log.Error("panic serving request", "method", r.Method, "path", r.URL.Path, "panic", fmt.Sprint(v),
+				"stack", string(debug.Stack()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "the router hit an internal error; see its log")
+		}
+	}()
+	s.mux.ServeHTTP(w, r)
+}
+
+// SetDraining makes /readyz fail, so load balancers stop sending new
+// requests while the ones in flight finish (see shutdown.drain_delay).
+func (s *Server) SetDraining(draining bool) { s.draining.Store(draining) }
 
 // RunTracing exports spans until ctx is done (no-op without an endpoint).
 func (s *Server) RunTracing(ctx context.Context) { s.tracer.Run(ctx, 2*time.Second) }
@@ -389,6 +440,10 @@ func clientKey(h http.Header) string {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if s.draining.Load() {
+		http.Error(w, "draining for shutdown", http.StatusServiceUnavailable)
+		return
+	}
 	for _, st := range s.pool.Snapshot() {
 		if st.Healthy && !st.Drained {
 			io.WriteString(w, "ready\n")
@@ -616,9 +671,15 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 
 	var lastErr string
 	tries := 0
+	s.retryBudget.request()
 	for attempt := 1; ; attempt++ {
 		tries++
 		lease, err := s.pool.Acquire(wait.ctx, req)
+		if err == nil {
+			// The paths below release the slot as soon as they are done with
+			// it; this catches any that does not, panics included.
+			defer lease.Release()
+		}
 		if err != nil {
 			if len(fallbacks) > 0 && r.Context().Err() == nil && (errors.Is(err, pool.ErrNoBackend) ||
 				errors.Is(err, pool.ErrQueueFull) || errors.Is(err, pool.ErrShed) || errors.Is(err, context.DeadlineExceeded)) {
@@ -641,8 +702,19 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		b := lease.Backend
 		final := tries >= st.cfg.Retry.MaxAttempts && len(fallbacks) == 0
+		if !final && !s.retryBudget.allows() {
+			// No retry would be allowed after this attempt, so it is the
+			// last: it waits for its first token, and its answer is relayed.
+			final = true
+		}
 
 		res := s.attempt(r, path, body, b, info.Stream, final, rl)
+		if failed := res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode)); failed && !final && !s.retryBudget.spend() {
+			final = true // the budget ran out during the attempt
+		}
+		if final && tries < st.cfg.Retry.MaxAttempts && (res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode))) {
+			s.budgetSpent.Inc()
+		}
 		if res.err != nil || (res.resp != nil && retryable(res.resp.StatusCode) && !final) {
 			if res.resp != nil {
 				io.Copy(io.Discard, io.LimitReader(res.resp.Body, 64<<10))

@@ -22,6 +22,7 @@ spec:
         # restart, edit the ConfigMap and POST /admin/reload instead.
         checksum/config: {{ include "siliconrouter.config" . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -40,6 +41,7 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: http, scheme: {{ include "siliconrouter.scheme" . | upper }}}
             periodSeconds: 5
+            failureThreshold: 1  # drop out of the Service within one period of draining
           livenessProbe:
             httpGet: {path: /healthz, port: http, scheme: {{ include "siliconrouter.scheme" . | upper }}}
             periodSeconds: 10

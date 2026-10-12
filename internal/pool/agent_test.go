@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,58 @@ func TestAgentPoller(t *testing.T) {
 	}
 	if st[1].Hardware != nil {
 		t.Errorf("backend without agent_url has hardware status %+v", st[1].Hardware)
+	}
+}
+
+func TestFailedAcceleratorTakesBackendOut(t *testing.T) {
+	p := newPool(t, Options{}, withAgent(be("a", config.TierStandard, 2)), withAgent(be("b", config.TierStandard, 2)))
+	a := p.byName["a"]
+	lost := report("nvidia", 24, nil)
+	lost.Devices = append(lost.Devices, hardware.Device{Vendor: "nvidia", Kind: "gpu", Name: "NVIDIA GPU 1", Error: "GPU is lost"})
+	p.SetHardware(a, lost, nil)
+	for range 3 {
+		l := acquire(t, p, Request{})
+		if l.Backend.Name != "b" {
+			t.Error("backend with a lost GPU got new work")
+		}
+		l.Release()
+	}
+	onlyA := Request{Exclude: map[string]bool{"b": true}}
+	if _, err := p.Acquire(context.Background(), onlyA); !errors.Is(err, ErrNoBackend) {
+		t.Errorf("request only a could serve: err = %v, want ErrNoBackend", err)
+	}
+	if hs := p.Snapshot()[0].Hardware; len(hs.Faults) != 1 || hs.Faults[0] != "NVIDIA GPU 1: GPU is lost" {
+		t.Errorf("faults = %v", hs.Faults)
+	}
+	// An unreachable agent keeps the fault; a healthy report clears it.
+	p.SetHardware(a, nil, errors.New("connection refused"))
+	if _, err := p.Acquire(context.Background(), onlyA); !errors.Is(err, ErrNoBackend) {
+		t.Error("fault forgotten when the agent became unreachable")
+	}
+	p.SetHardware(a, report("nvidia", 24, nil), nil)
+	if acquire(t, p, onlyA).Backend.Name != "a" {
+		t.Error("backend not back after its GPUs recovered")
+	}
+}
+
+func TestStaleAgentReadings(t *testing.T) {
+	p := newPool(t, Options{}, auto("a", 2))
+	a := p.byName["a"]
+	p.SetHardware(a, report("amd", 192, nil), nil)
+	if p.Snapshot()[0].Tier != config.TierHeavy {
+		t.Fatal("setup: not heavy")
+	}
+	// A hung collection with nothing to fall back on: keep what we had.
+	p.SetHardware(a, &hardware.Report{Schema: 1, Stale: true, CollectError: "collection did not finish"}, nil)
+	st := p.Snapshot()[0]
+	if st.Tier != config.TierHeavy || st.Hardware.Accelerators != 1 || !strings.Contains(st.Hardware.AgentError, "no readings yet") {
+		t.Errorf("after an empty stale report: %+v %+v", st.Tier, st.Hardware)
+	}
+	// Stale but with readings: used, and flagged.
+	stale := report("amd", 192, nil)
+	stale.Stale, stale.CollectError = true, "readings are 12 s old"
+	p.SetHardware(a, stale, nil)
+	if hs := p.Snapshot()[0].Hardware; !strings.Contains(hs.AgentError, "stale readings") || hs.Accelerators != 1 {
+		t.Errorf("stale report: %+v", hs)
 	}
 }

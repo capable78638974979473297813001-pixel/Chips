@@ -32,6 +32,9 @@ Serves GET /v1/telemetry (JSON) and GET /healthz.
   --plugin COMMAND      also report the devices COMMAND prints as JSON; repeatable.
                         Use it for chips without built-in support (see agent/plugins/)
   --plugin-timeout MS   how long a plugin may run per collection (default 5000)
+  --collect-timeout MS  how long a request waits for fresh readings before it gets
+                        the last good ones, marked stale (default 1500; keep it
+                        below the router's hardware.timeout)
   --nvml-library PATH   NVML library to load (default libnvidia-ml.so.1 / nvml.dll)
   --sysfs-root PATH     Linux: root containing sys/ and proc/ (default "/")
   --version             print the version and exit
@@ -43,6 +46,7 @@ int main(int argc, char** argv) {
   std::string listen = ":9400", nvml_lib, sysfs_root = "/";
   std::vector<std::string> simulate, plugins;
   int plugin_timeout = 5000;
+  int collect_timeout = 1500;
   bool once = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -58,6 +62,7 @@ int main(int argc, char** argv) {
     else if (arg == "--simulate") simulate.push_back(value("--simulate"));
     else if (arg == "--plugin") plugins.push_back(value("--plugin"));
     else if (arg == "--plugin-timeout") plugin_timeout = std::atoi(value("--plugin-timeout").c_str());
+    else if (arg == "--collect-timeout") collect_timeout = std::atoi(value("--collect-timeout").c_str());
     else if (arg == "--nvml-library") nvml_lib = value("--nvml-library");
     else if (arg == "--sysfs-root") sysfs_root = value("--sysfs-root");
     else if (arg == "--version") {
@@ -133,6 +138,9 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 #endif
 
+  chipagent::Collector collector(
+      [&] { return chipagent::Collector::Snapshot{chipagent::Collect(providers), chipagent::ReadHost(sysfs_root)}; },
+      std::chrono::milliseconds(collect_timeout > 0 ? collect_timeout : 1500));
   chipagent::HttpServer server;
   std::string err;
   if (!server.Listen(listen, &err)) {
@@ -144,7 +152,7 @@ int main(int argc, char** argv) {
       [&](const std::string& method, const std::string& path) -> chipagent::HttpServer::Response {
         if (method != "GET") return {405, "text/plain", "method not allowed\n"};
         if (path == "/healthz") return {200, "text/plain", "ok\n"};
-        if (path == "/v1/telemetry") return {200, "application/json", telemetry()};
+        if (path == "/v1/telemetry") return {200, "application/json", collector.Telemetry(CHIPAGENT_VERSION)};
         return {404, "text/plain", "not found\n"};
       },
       g_stop);

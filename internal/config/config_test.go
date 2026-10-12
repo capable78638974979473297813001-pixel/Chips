@@ -148,6 +148,7 @@ func TestValidation(t *testing.T) {
 		"discovery auto tier":  "discovery: [{name: v, dns: v.svc, port: 80, backend: {tier: auto}}]",
 		"discovery clash":      "backends: [{name: v-static, url: \"http://h:1\"}]\ndiscovery: [{name: v, dns: v.svc, port: 80}]",
 		"discovery fast":       "discovery: [{name: v, dns: v.svc, port: 80, interval: 10ms}]",
+		"stall window short":   "backends: [{name: a, url: \"http://h:1\"}]\nengine_metrics: {interval: 10s, stall_after: 20s}",
 		"bad thresholds":       "backends: [{name: a, url: \"http://h:1\"}]\nhardware: {heavy_min_memory_gib: 10, standard_min_memory_gib: 40}",
 	}
 	for name, raw := range cases {
@@ -181,5 +182,24 @@ func TestModelPatterns(t *testing.T) {
 	}
 	if !MatchModel([]string{"*"}, "anything") {
 		t.Error("* should match every model")
+	}
+}
+
+func TestShutdownAndRetryDefaults(t *testing.T) {
+	c, err := Parse([]byte(`backends: [{name: a, url: "http://h:1"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Shutdown.Timeout.D() != 60*time.Second || c.Shutdown.DrainDelay != 0 {
+		t.Errorf("shutdown = %+v", c.Shutdown)
+	}
+	if c.Retry.BudgetRatio != 0.2 || c.Retry.BudgetMinPerSecond != 10 {
+		t.Errorf("retry budget = %v, %v", c.Retry.BudgetRatio, c.Retry.BudgetMinPerSecond)
+	}
+	if c.EngineMetrics.StallAfter.D() != time.Minute || c.EngineMetrics.StallMinTokensPerSecond != 1 {
+		t.Errorf("stall = %v, %v", c.EngineMetrics.StallAfter, c.EngineMetrics.StallMinTokensPerSecond)
+	}
+	if _, err := Parse([]byte("backends: [{name: a, url: \"http://h:1\"}]\nshutdown: {drain_delay: -1s}")); err == nil {
+		t.Error("negative drain_delay accepted")
 	}
 }

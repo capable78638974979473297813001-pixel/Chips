@@ -55,6 +55,10 @@ endpoint.
    before the user sees anything. Health checks take dead servers out of rotation and bring them
    back when they recover. When a model has no capacity left, requests can fall back to a smaller
    model instead of failing, and under overload high-priority traffic displaces queued batch work.
+   Engines that hang with requests running, and GPUs that fall off the bus, are taken out of
+   rotation automatically. A retry budget keeps failures from turning into retry storms. Chaos and
+   soak tests check that nothing leaks; see the reliability table in
+   [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 Your apps don't change: point any OpenAI client at SiliconRouter instead of a single server.
 Other AI APIs work too, including Anthropic-style, Ollama, TGI, Triton/KServe, Gemini-style, and any custom
@@ -180,7 +184,7 @@ cmd/siliconrouter   the router
 cmd/mockllm         simulated GPU inference server for demos and tests
 cmd/srbench         multi-turn chat load generator
 agent/              chipagent (C++17): per-node CPU, GPU and accelerator telemetry, any vendor
-scripts/            cross-architecture test runner for chipagent (QEMU)
+scripts/            chipagent cross-architecture tests (QEMU), soak test, real-hardware validation
 deploy/             Helm chart, systemd units, Grafana dashboard, Docker Compose demo
 internal/hardware   chipagent client, telemetry schema, automatic tiering
 internal/server     HTTP proxy, retries, streaming, auth, metrics endpoints
@@ -189,7 +193,8 @@ internal/affinity   prefix → backend LRU table
 internal/cache      response cache (LRU, byte budget, TTL, request coalescing, persistence)
 internal/cluster    multi-router sync of prefix affinity, usage and in-flight counts
 internal/discovery  backends from DNS A/AAAA and SRV records
-internal/engine     inference engines' Prometheus metrics (queue depth, KV usage)
+internal/engine     inference engines' Prometheus metrics (queue depth, KV usage, progress)
+internal/supervise  restarts background loops that panic
 internal/tracing    W3C trace context and OTLP/HTTP span export
 internal/limits     per-client limits and usage counters
 internal/tlsconf    HTTPS with certificate hot reload

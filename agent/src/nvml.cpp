@@ -24,6 +24,9 @@ struct nvmlUtilization {
   unsigned int gpu, memory;
 };
 constexpr int kTemperatureGpu = 0;  // NVML_TEMPERATURE_GPU
+constexpr nvmlReturn kGpuIsLost = 15;  // NVML_ERROR_GPU_IS_LOST
+constexpr const char* kLostMessage =
+    "GPU is lost: it stopped responding to the driver (NVIDIA Xid 79, fallen off the bus); reset the GPU or reboot";
 
 class NvmlProvider : public Provider {
  public:
@@ -58,24 +61,35 @@ class NvmlProvider : public Provider {
     if (count_(&n) != 0) return out;
     for (unsigned int i = 0; i < n; ++i) {
       nvmlDevice h = nullptr;
-      if (handle_(i, &h) != 0) continue;
       Device d;
       d.vendor = "nvidia";
       d.kind = "gpu";
       d.source = "nvml";
+      if (nvmlReturn rc = handle_(i, &h); rc != 0) {
+        if (rc != kGpuIsLost) continue;
+        // Still counted, so the machine shows a failed GPU instead of
+        // quietly having one fewer.
+        d.name = "NVIDIA GPU " + std::to_string(i);
+        d.id = "nvml:" + std::to_string(i);
+        d.error = kLostMessage;
+        out.push_back(std::move(d));
+        continue;
+      }
       char buf[96] = {};
       d.name = name_(h, buf, sizeof buf) == 0 ? buf : "NVIDIA GPU";
       if (uuid_ && uuid_(h, buf, sizeof buf) == 0) d.id = buf;
       nvmlMemoryV2 mem2{};
       mem2.version = kMemoryV2;
       nvmlMemory mem{};
-      if (memory2_ && memory2_(h, &mem2) == 0) {
+      nvmlReturn rc = memory2_ ? memory2_(h, &mem2) : -1;
+      if (rc == 0) {
         d.memory_total_bytes = mem2.total;
         d.memory_used_bytes = mem2.used;
-      } else if (memory_(h, &mem) == 0) {
+      } else if (rc != kGpuIsLost && (rc = memory_(h, &mem)) == 0) {
         d.memory_total_bytes = mem.total;
         d.memory_used_bytes = mem.used;
       }
+      if (rc == kGpuIsLost) d.error = kLostMessage;
       nvmlUtilization util{};
       if (util_ && util_(h, &util) == 0) d.utilization_percent = util.gpu;
       unsigned int v = 0;

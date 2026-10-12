@@ -81,6 +81,17 @@ Please report anything that reads wrong on your machines.
 whole machine's. Run it with the host's `/dev` (or with no `/dev/dri` at all) to inventory the
 whole machine.
 
+### When hardware misbehaves
+
+- **Hung reads.** A wedged GPU can make driver or sysfs reads block indefinitely. chipagent
+  collects on a worker thread. If fresh readings don't arrive within `--collect-timeout` (default
+  1500 ms, keep it below the router's `hardware.timeout`), it answers with its last good readings,
+  marked `"stale": true` with a `collect_error`. It doesn't start more reads while one is stuck.
+- **Lost GPUs.** An NVIDIA GPU that falls off the bus (NVML reports it lost, Xid 79) is listed
+  with an `error` instead of vanishing. The router takes that machine out of rotation until a
+  healthy report arrives, and lists the fault in `/admin/backends` and
+  `siliconrouter_backend_hardware_faults`.
+
 ### Plugins: any other chip
 
 For hardware without built-in readings, chipagent runs a plugin: any command that prints the

@@ -67,6 +67,7 @@ type Backend struct {
 	lastErr    string
 	hw         *hardware.Report
 	hwErr      string
+	hwFault    bool // chipagent reports a failed accelerator: no new work
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
@@ -74,6 +75,9 @@ type Backend struct {
 	eng      *engine.Stats
 	engUntil time.Time // eng is stale after this
 	engErr   string
+	// Recent generated-token counts while requests ran, for stall detection.
+	progress []progressSample
+	stalled  bool
 }
 
 // Request is what the scheduler needs to know to place a request.
@@ -129,6 +133,10 @@ type Options struct {
 	// KVSaturated the KV-cache usage at which an engine counts as full.
 	EngineMaxAge time.Duration
 	KVSaturated  float64
+	// StallAfter and StallMinRate configure stall detection (see
+	// config.EngineMetrics); StallAfter <= 0 turns it off.
+	StallAfter   time.Duration
+	StallMinRate float64
 }
 
 type Pool struct {
@@ -181,6 +189,8 @@ func OptionsFromConfig(cfg *config.Config) Options {
 		// Three missed scrapes and the stats no longer steer routing.
 		EngineMaxAge: 3*cfg.EngineMetrics.Interval.D() + cfg.EngineMetrics.Timeout.D(),
 		KVSaturated:  cfg.EngineMetrics.KVSaturated,
+		StallAfter:   cfg.EngineMetrics.StallAfter.D(),
+		StallMinRate: cfg.EngineMetrics.StallMinTokensPerSecond,
 	}
 }
 
@@ -562,7 +572,7 @@ func (b *Backend) utilization() float64 {
 }
 
 func (p *Pool) eligible(b *Backend, r Request) bool {
-	return b.healthy && !b.drained && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
+	return b.healthy && !b.drained && !b.hwFault && !b.stalledNow(time.Now()) && !r.Exclude[b.Name] && b.serves(r.Model) && b.fits(r) && (!r.GRPC || b.GRPCURL != nil)
 }
 
 func (p *Pool) servableLocked(r Request) bool {
@@ -772,7 +782,24 @@ func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
 		b.hwErr = err.Error()
 		return
 	}
+	if r.Stale && len(r.Devices) == 0 {
+		b.hwErr = "chipagent has no readings yet: " + r.CollectError
+		return // keep what we had
+	}
 	b.hw, b.hwErr = r, ""
+	if r.Stale {
+		b.hwErr = "stale readings: " + r.CollectError
+	}
+	if faults := r.Faults(); (len(faults) > 0) != b.hwFault {
+		b.hwFault = len(faults) > 0
+		if b.hwFault {
+			p.log.Warn("chipagent reports a failed accelerator; out of rotation until it recovers",
+				"backend", b.Name, "device", faults[0].Name, "error", faults[0].Error, "failed", len(faults))
+		} else {
+			p.log.Info("accelerators healthy again; back in rotation", "backend", b.Name)
+		}
+		p.dispatchLocked(true)
+	}
 	if !b.AutoTier {
 		return
 	}
@@ -794,6 +821,8 @@ type HardwareStatus struct {
 	UtilizationPercent *float64          `json:"utilization_percent,omitempty"`
 	Devices            []hardware.Device `json:"devices"`
 	AgentError         string            `json:"agent_error,omitempty"`
+	// Faults lists failing accelerators; while any are, the backend gets no new work.
+	Faults []string `json:"faults,omitempty"`
 }
 
 func (b *Backend) hardwareStatus() *HardwareStatus {
@@ -819,6 +848,9 @@ func (b *Backend) hardwareStatus() *HardwareStatus {
 		hs.UtilizationPercent = &u
 	}
 	hs.Devices = append(hs.Devices, b.hw.Devices...)
+	for _, d := range b.hw.Faults() {
+		hs.Faults = append(hs.Faults, d.Name+": "+d.Error)
+	}
 	return hs
 }
 

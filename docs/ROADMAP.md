@@ -28,6 +28,8 @@
   concurrency and rate limits
 - Engine-aware routing from vLLM, SGLang, TGI, llama.cpp and Triton metrics (queue depth and KV
   usage), and demand-weighted cluster rate limits
+- Reliability: stall detection from engine token counters, lost-GPU detection, retry budget,
+  panic containment, graceful draining, a chaos test with leak checks, and `make soak`
 - chipagent plugins for Gaudi, Inferentia/Trainium, Intel data center GPUs and Google TPUs, merged
   with chipagent's own PCI listing
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,

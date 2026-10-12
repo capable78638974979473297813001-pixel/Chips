@@ -26,6 +26,7 @@ func (s *Server) Apply(cfg *config.Config) ([]string, error) {
 	}
 	s.state.Store(newState(cfg, old))
 	s.limits.SetLimits(limitsFrom(cfg))
+	s.retryBudget.set(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond)
 	return append(changes, settingChanges(old.cfg, cfg)...), nil
 }
 
@@ -102,7 +103,8 @@ func settingChanges(old, cfg *config.Config) []string {
 	changed(old.Queue, cfg.Queue, "updated queue settings")
 	changed(old.Retry, cfg.Retry, "updated retry settings")
 	changed(old.MaxBodyBytes, cfg.MaxBodyBytes, "updated max_body_bytes")
-	changed(old.EngineMetrics.KVSaturated, cfg.EngineMetrics.KVSaturated, "updated engine_metrics.kv_saturated")
+	changed([]any{old.EngineMetrics.KVSaturated, old.EngineMetrics.StallAfter, old.EngineMetrics.StallMinTokensPerSecond},
+		[]any{cfg.EngineMetrics.KVSaturated, cfg.EngineMetrics.StallAfter, cfg.EngineMetrics.StallMinTokensPerSecond}, "updated engine_metrics saturation or stall settings")
 	changed([]any{old.Hardware.HeavyMinMemoryGiB, old.Hardware.StandardMinMemoryGiB},
 		[]any{cfg.Hardware.HeavyMinMemoryGiB, cfg.Hardware.StandardMinMemoryGiB}, "updated hardware tier thresholds")
 	r1, r2 := old.Routing, cfg.Routing

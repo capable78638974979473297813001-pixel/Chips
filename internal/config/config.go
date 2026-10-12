@@ -58,6 +58,8 @@ type Config struct {
 	Health    Health      `yaml:"health"`
 	Upstream  Upstream    `yaml:"upstream"`
 	Hardware  Hardware    `yaml:"hardware"`
+	// Shutdown controls how the router stops on SIGTERM or Ctrl-C.
+	Shutdown Shutdown `yaml:"shutdown"`
 	// EngineMetrics controls scraping of backends' own load metrics (see
 	// Backend.MetricsPath).
 	EngineMetrics EngineMetrics `yaml:"engine_metrics"`
@@ -326,6 +328,12 @@ type Retry struct {
 	// bytes by then, the request moves to another backend before anything
 	// reaches the client. 0 disables it. The last attempt always waits.
 	FirstTokenTimeout Duration `yaml:"first_token_timeout"`
+	// The retry budget caps retries at BudgetRatio of recent requests plus
+	// BudgetMinPerSecond, over a 10-second window, so failures from an
+	// overloaded fleet do not multiply into more load. Past it, a failed
+	// attempt's answer goes to the client. A negative ratio removes the cap.
+	BudgetRatio        float64 `yaml:"budget_ratio"`
+	BudgetMinPerSecond float64 `yaml:"budget_min_per_second"`
 }
 
 type Health struct {
@@ -344,6 +352,15 @@ type Upstream struct {
 	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
 }
 
+// Shutdown: on a stop signal the router first fails /readyz for
+// DrainDelay while still serving, so load balancers (a Kubernetes Service,
+// an L4 balancer's health check) stop sending it requests; then it stops
+// accepting connections and gives in-flight requests up to Timeout.
+type Shutdown struct {
+	DrainDelay Duration `yaml:"drain_delay"`
+	Timeout    Duration `yaml:"timeout"`
+}
+
 // EngineMetrics controls how often backends' /metrics are scraped and when
 // an engine counts as saturated.
 type EngineMetrics struct {
@@ -354,6 +371,13 @@ type EngineMetrics struct {
 	// with requests queued inside them, get new work only when no other
 	// backend has room.
 	KVSaturated float64 `yaml:"kv_saturated"`
+	// StallAfter is how long an engine may have requests running while
+	// generating fewer than StallMinTokensPerSecond tokens per running
+	// request before it is taken out of rotation as stalled (hung GPU,
+	// deadlocked engine). It returns as soon as tokens flow again. Engines
+	// that report generated tokens (vLLM, SGLang) only; negative disables.
+	StallAfter              Duration `yaml:"stall_after"`
+	StallMinTokensPerSecond float64  `yaml:"stall_min_tokens_per_second"`
 }
 
 // Hardware controls polling of chipagent telemetry and how `tier: auto`
@@ -455,6 +479,12 @@ func (c *Config) applyDefaults() {
 	if c.Retry.MaxAttempts == 0 {
 		c.Retry.MaxAttempts = 3
 	}
+	if c.Retry.BudgetRatio == 0 {
+		c.Retry.BudgetRatio = 0.2
+	}
+	if c.Retry.BudgetMinPerSecond == 0 {
+		c.Retry.BudgetMinPerSecond = 10
+	}
 	if c.Retry.FirstTokenTimeout == 0 {
 		// Generous enough for a very long prompt's prefill; catches a backend
 		// that accepted the request and stalled. Chat deployments can go lower.
@@ -507,6 +537,9 @@ func (c *Config) applyDefaults() {
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
 	}
+	if c.Shutdown.Timeout == 0 {
+		c.Shutdown.Timeout = Duration(60 * time.Second)
+	}
 	em := &c.EngineMetrics
 	if em.Interval == 0 {
 		em.Interval = Duration(2 * time.Second)
@@ -516,6 +549,12 @@ func (c *Config) applyDefaults() {
 	}
 	if em.KVSaturated == 0 {
 		em.KVSaturated = 0.95
+	}
+	if em.StallAfter == 0 {
+		em.StallAfter = Duration(60 * time.Second)
+	}
+	if em.StallMinTokensPerSecond == 0 {
+		em.StallMinTokensPerSecond = 1
 	}
 	hw := &c.Hardware
 	if hw.PollInterval == 0 {
@@ -699,6 +738,12 @@ func (c *Config) validate() error {
 	if c.Retry.MaxAttempts < 1 {
 		errs = append(errs, errors.New("retry.max_attempts must be at least 1"))
 	}
+	if c.Shutdown.DrainDelay < 0 || c.Shutdown.Timeout < 0 {
+		errs = append(errs, errors.New("shutdown: drain_delay and timeout must not be negative"))
+	}
+	if c.Retry.BudgetMinPerSecond < 0 {
+		errs = append(errs, errors.New("retry.budget_min_per_second must not be negative"))
+	}
 	if c.Retry.FirstTokenTimeout < 0 {
 		errs = append(errs, errors.New("retry.first_token_timeout must not be negative"))
 	}
@@ -792,6 +837,8 @@ func (c *Config) validate() error {
 	}
 	if em := c.EngineMetrics; em.Interval.D() < 100*time.Millisecond || em.Timeout <= 0 || em.KVSaturated <= 0 || em.KVSaturated > 1 {
 		errs = append(errs, errors.New("engine_metrics: need interval >= 100ms, a positive timeout, and 0 < kv_saturated <= 1"))
+	} else if em.StallAfter > 0 && (em.StallAfter.D() < 3*em.Interval.D() || em.StallMinTokensPerSecond < 0) {
+		errs = append(errs, errors.New("engine_metrics: stall_after must span at least three intervals, and stall_min_tokens_per_second must not be negative"))
 	}
 	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
 		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))

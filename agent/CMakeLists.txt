@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(chipagent VERSION 0.2.0 LANGUAGES C CXX)
+project(chipagent VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,7 +37,7 @@ add_library(chipagent_core STATIC
   src/windows.cpp
 )
 target_include_directories(chipagent_core PUBLIC src)
-target_link_libraries(chipagent_core PUBLIC ${CMAKE_DL_LIBS})
+target_link_libraries(chipagent_core PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 if(WIN32)
   target_link_libraries(chipagent_core PUBLIC ws2_32 dxgi dxguid advapi32)
 elseif(APPLE)

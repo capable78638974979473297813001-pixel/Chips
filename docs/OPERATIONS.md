@@ -241,6 +241,30 @@ pod. A config can consist of `discovery` alone. Static `backends` and discovered
 Discovered backends survive config reloads, and changes to `discovery` itself apply within a
 second. SRV priority and weight are ignored: capacity comes from `max_concurrency`.
 
+## Reliability: what the router does when things break
+
+| Failure | What happens | Settings |
+|---|---|---|
+| A backend refuses connections, resets, or answers 429/502/503/504 | The request is retried on another backend before the client sees anything | `retry.max_attempts` |
+| A streaming backend accepts a request and goes silent | Moved to another backend after `first_token_timeout` | `retry.first_token_timeout` |
+| A backend keeps failing | Passive health takes it out after `unhealthy_threshold` failures; active checks bring it back | `health.*` |
+| An engine hangs with requests "running" (hung GPU, deadlocked engine) | Detected from its token counters: no new work until tokens flow again. Queued requests only it could serve fail at once | `engine_metrics.stall_after`, `stall_min_tokens_per_second` |
+| A GPU falls off the bus (NVIDIA Xid 79) | chipagent reports it; the backend gets no new work until a healthy report | chipagent on the machine |
+| A GPU wedges the driver, so hardware reads hang | chipagent answers with its last good readings, marked stale, instead of hanging | `chipagent --collect-timeout` |
+| The whole fleet is overloaded and failing | Retries are capped at 20% of recent traffic, so failures don't multiply into more load | `retry.budget_ratio`, `budget_min_per_second` |
+| Non-streaming requests to a hung engine | They wait as long as the client does, unless you set a cap | `upstream.response_header_timeout` |
+| A bug in the router | The request gets a 500 and the stack is logged; its slots are released. A background task that panics is restarted | `siliconrouter_panics_total` |
+| Rolling update or scale-down | `/readyz` fails for `drain_delay` while the router still serves, then in-flight requests get up to `timeout` | `shutdown.*` |
+
+**How this is tested:**
+- `TestChaos` sends 300 concurrent requests to backends that misbehave in every way above, with
+  clients hanging up at random. It then checks that every backend slot, queue place and per-client
+  count is returned and no goroutines leak. A deliberately leaked slot makes it fail.
+- `make soak` runs steady load for `DURATION` seconds (default 120). During the run one backend
+  fails 10% of its requests, another is killed and restarted, and the config is reloaded twice. It
+  fails on client errors, slots still held, panics, or goroutines or heap that keep growing.
+  `siliconrouter_goroutines` and `siliconrouter_heap_bytes` show the same thing in production.
+
 ## Keeping state across restarts
 
 ```yaml

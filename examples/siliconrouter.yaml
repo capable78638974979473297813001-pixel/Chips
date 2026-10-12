@@ -95,6 +95,10 @@ retry:
   # backend before the client sees a byte (the last attempt always waits).
   # 60s tolerates very long prompts; 10-20s suits chat.
   first_token_timeout: 60s
+  # Retry budget: retries may reach this share of the last 10 seconds' requests
+  # (plus a floor per second), so an overloaded fleet is not hit by retry storms.
+  budget_ratio: 0.2                 # negative: no cap
+  budget_min_per_second: 10
 
 # Answer repeated requests from memory. Only answers that cannot change are
 # cached: embeddings, and generations with temperature 0 (mode: all caches
@@ -149,6 +153,17 @@ engine_metrics:
   interval: 2s
   timeout: 1s
   kv_saturated: 0.95                # KV-cache usage at which an engine gets new work only as a last resort
+  # An engine with requests running for this long while generating fewer tokens than
+  # this per running request is stalled (hung GPU, deadlocked engine): no new work
+  # until tokens flow again. vLLM and SGLang only; negative stall_after disables.
+  stall_after: 60s
+  stall_min_tokens_per_second: 1
+
+# On SIGTERM: fail /readyz for drain_delay while still serving (so load balancers
+# stop sending traffic), then give in-flight requests up to timeout.
+shutdown:
+  drain_delay: 0s                   # 10s or so behind Kubernetes Services and L4 balancers
+  timeout: 60s
 
 # chipagent telemetry (only used by backends with agent_url).
 hardware:
