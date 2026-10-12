@@ -333,6 +333,15 @@ func TestFullDuplexPicksAfterBody(t *testing.T) {
 	if rb := e.recv(); rb.field != outRespBody || string(rb.body) != `{"usage":{"prompt_tokens":5}}` || !rb.bodyEOS {
 		t.Fatalf("response body answer: %+v", rb)
 	}
+	// The exchange is closed right after the last answer is sent.
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+		x.mu.Lock()
+		closed := x.closed
+		x.mu.Unlock()
+		if closed > 0 || time.Now().After(deadline) {
+			break
+		}
+	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if x.status != 200 || !strings.Contains(x.body.String(), "prompt_tokens") || x.closed != 1 {
@@ -355,9 +364,11 @@ func TestRejectAndSubset(t *testing.T) {
 	if got := p.seen[0].Subset; len(got) != 2 || got[1] != "10.0.0.2:8000" {
 		t.Errorf("subset %v", got)
 	}
-	if x.closed != 1 {
+	x.mu.Lock()
+	if x.closed != 1 { // closed before the immediate response is sent
 		t.Error("a rejected request's exchange must be closed")
 	}
+	x.mu.Unlock()
 
 	// No endpoint and no rejection is a 503.
 	p.decision = func(*Request) Decision { return Decision{} }
