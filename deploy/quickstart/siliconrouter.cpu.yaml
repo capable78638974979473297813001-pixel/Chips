@@ -1,0 +1,16 @@
+# Router config for docker-compose.cpu.yaml: two llama.cpp servers, each
+# with 4 slots of 4096 tokens (--parallel 4, --ctx-size 16384).
+listen: ":8080"
+backends:
+  - {name: llama-a, url: "http://llama-a:8000", max_concurrency: 4, max_context_tokens: 4096,
+     tokenize: llamacpp, metrics_path: /metrics, health_path: /health, cost_per_hour: 0.10, hardware_name: CPU}
+  - {name: llama-b, url: "http://llama-b:8000", max_concurrency: 4, max_context_tokens: 4096,
+     tokenize: llamacpp, metrics_path: /metrics, health_path: /health, cost_per_hour: 0.10, hardware_name: CPU}
+models:
+  aliases:
+    gpt-4o-mini: qwen2.5-0.5b
+cache:
+  enabled: true
+state_dir: /var/lib/siliconrouter
+audit:
+  file: /var/lib/siliconrouter/audit.jsonl

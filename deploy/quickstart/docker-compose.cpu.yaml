@@ -1,0 +1,63 @@
+# Quickstart without a GPU: two llama.cpp servers running a small quantized
+# model on the CPU, behind SiliconRouter, with Prometheus and Grafana. Slower
+# than vLLM on a GPU, but a real inference engine end to end.
+#
+#   cd deploy/quickstart
+#   docker compose -f docker-compose.cpu.yaml up -d --build
+#   MODEL_NAME=qwen2.5-0.5b ./smoke.sh
+#
+# The first start downloads the model (~400 MB) from Hugging Face.
+
+x-llamacpp: &llamacpp
+  image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+  command:
+    - --hf-repo=${GGUF_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}
+    - --hf-file=${GGUF_FILE:-qwen2.5-0.5b-instruct-q4_k_m.gguf}
+    - --alias=qwen2.5-0.5b
+    - --host=0.0.0.0
+    - --port=8000
+    - --ctx-size=16384   # split between the 4 slots: 4096 tokens per request
+    - --parallel=4
+    - --metrics
+  environment:
+    HF_TOKEN: ${HF_TOKEN:-}
+  volumes:
+    - llamacpp-models:/root/.cache/llama.cpp
+  restart: unless-stopped
+
+services:
+  llama-a: *llamacpp
+  llama-b: *llamacpp
+
+  router:
+    build: ../..
+    command: ["-config", "/etc/siliconrouter/siliconrouter.yaml", "-log-json"]
+    volumes:
+      - ./siliconrouter.cpu.yaml:/etc/siliconrouter/siliconrouter.yaml:ro
+      - router-state:/var/lib/siliconrouter
+    ports: ["8080:8080"]
+    depends_on: [llama-a, llama-b]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.cpu.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yaml:/etc/prometheus/siliconrouter-alerts.yaml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/siliconrouter.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/siliconrouter.json:/var/lib/grafana/dashboards/siliconrouter.json:ro
+    ports: ["3000:3000"]
+
+volumes:
+  router-state:
+  llamacpp-models:

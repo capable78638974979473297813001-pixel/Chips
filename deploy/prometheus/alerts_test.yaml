@@ -1,0 +1,89 @@
+# promtool test rules deploy/prometheus/alerts_test.yaml
+rule_files: [alerts.yaml]
+evaluation_interval: 30s
+tests:
+  - interval: 30s
+    input_series:
+      - series: 'siliconrouter_backend_hardware_faults{instance="r0", backend="h100-1"}'
+        values: '0 0 1 1 1 1 1 1'
+      - series: 'siliconrouter_backend_engine_stalled{instance="r0", backend="h100-2"}'
+        values: '0 1 1 1 1 1 1 1 1 1'
+      - series: 'siliconrouter_backend_healthy{instance="r0", backend="h100-1", tier="heavy"}'
+        values: '1x20'
+      - series: 'siliconrouter_backend_healthy{instance="r0", backend="h100-2", tier="heavy"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: SiliconRouterGPUFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SiliconRouterGPUFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, backend: h100-1}
+            exp_annotations:
+              summary: "A GPU on h100-1 has failed"
+              description: >-
+                chipagent reports 1 failing accelerator(s) on h100-1
+                (for example fallen off the bus). The router has taken the backend out of
+                rotation; requests go elsewhere. Check `nvidia-smi` / `rocm-smi` and the kernel
+                log, and GET /admin/backends for the device and error.
+      - eval_time: 2m
+        alertname: SiliconRouterBackendStalled
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SiliconRouterBackendStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, backend: h100-2}
+            exp_annotations:
+              summary: "Inference engine on h100-2 is stalled"
+              description: >-
+                h100-2 has had requests running for longer than
+                engine_metrics.stall_after while generating almost no tokens: a hung GPU or a
+                deadlocked engine. It gets no new work, but the requests already on it are stuck.
+                Restart the engine.
+      - eval_time: 5m
+        alertname: SiliconRouterNoBackends
+        exp_alerts: []
+
+  - interval: 30s
+    input_series:
+      - series: 'siliconrouter_backend_healthy{instance="r0", backend="a", tier="heavy"}'
+        values: '1 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'siliconrouter_backend_healthy{instance="r0", backend="b", tier="light"}'
+        values: '1 1 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiliconRouterNoBackends
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: r0}
+            exp_annotations:
+              summary: "No backend is in rotation on r0"
+              description: >-
+                Every backend is unhealthy or gone, so requests fail with 503 (or wait, with
+                autoscaling.cold_start_wait). Check the engines and GET /admin/backends.
+
+  - interval: 1m
+    input_series:
+      - series: 'siliconrouter_requests_total{instance="r0", backend="a", code="200"}'
+        values: '0+60x15'
+      - series: 'siliconrouter_requests_total{instance="r0", backend="a", code="502"}'
+        values: '0+10x15'
+      - series: 'siliconrouter_retry_budget_exhausted_total{instance="r0"}'
+        values: '0+5x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SiliconRouterHighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: r0}
+            exp_annotations:
+              summary: "14.29% of requests fail on r0"
+              description: "More than 5% of proxied requests answered 5xx for 5 minutes. Check siliconrouter_upstream_errors_total by backend."
+      - eval_time: 16m
+        alertname: SiliconRouterRetryBudgetExhausted
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: r0}
+            exp_annotations:
+              summary: "Retry budget exhausted on r0"
+              description: >-
+                Failures are frequent enough that retries hit retry.budget_ratio, so failed
+                attempts go straight to clients. The fleet is overloaded or a backend keeps failing.

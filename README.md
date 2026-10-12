@@ -86,6 +86,19 @@ Or with Docker:
 docker compose -f deploy/docker-compose.yaml up --build
 ```
 
+With real inference engines, plus Prometheus (with the alert rules) and Grafana (with the dashboard):
+
+```bash
+cd deploy/quickstart
+docker compose up -d --build                        # two vLLM servers on an NVIDIA GPU
+docker compose -f docker-compose.cpu.yaml up -d --build   # or: two llama.cpp servers, no GPU
+./smoke.sh                                          # one request, a load test, and the spend so far
+```
+
+Grafana is on http://localhost:3000. See the comments at the top of
+[deploy/quickstart/docker-compose.yaml](deploy/quickstart/docker-compose.yaml) to pick the vLLM
+image that matches your CUDA driver, and to change the model.
+
 Then talk to it like any OpenAI endpoint:
 
 ```bash
@@ -226,6 +239,11 @@ results, including the three bugs the run found and fixed, are in
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's built, what's next, and how the open-source and
 commercial editions split.
+
+Releases are listed in [CHANGELOG.md](CHANGELOG.md). They are signed and come with SBOMs; see
+[SECURITY.md](SECURITY.md) for how to verify them and how to report a vulnerability. Ready-made
+monitoring is in [deploy/grafana](deploy/grafana) (dashboard) and
+[deploy/prometheus](deploy/prometheus) (alert rules).
 
 ## License
 

@@ -34,6 +34,15 @@
   with chipagent's own PCI listing
 - chipagent 0.2: host CPU on any architecture, every PCI GPU/accelerator by vendor and kind,
   Windows (DXGI), Intel Macs (IOKit), Jetson. Verified on 9 CPU architectures and 3 OSes
+- Gateway API Inference Extension endpoint picker (ext_proc), tested with Envoy 1.35, and an
+  InferencePool in the Helm chart
+- LoRA-aware routing with on-demand adapter loading
+- Scale-to-zero (requests held while backends boot, scale-up webhook) and per-model demand signals
+  for KEDA and HPAs
+- Single sign-on (OIDC/JWT) with teams and per-user quotas, and a hash-chained audit log
+- Cost accounting in dollars per team and hardware
+- Release hygiene: changelog, security policy, signed releases with SBOMs and provenance, Grafana
+  dashboard for every metric, Prometheus alert rules with tests, and a quickstart with real vLLM
 
 ## Next
 

@@ -94,6 +94,13 @@ serviceMonitor:
   enabled: false
   interval: 30s
 
+# Alert rules for the Prometheus Operator: failed GPUs, stalled engines,
+# backends down, error rate, retry budget, shedding, cold starts, ...
+# (deploy/prometheus/alerts.yaml).
+prometheusRule:
+  enabled: false
+  labels: {}          # e.g. {release: kube-prometheus-stack}, to match your Prometheus's ruleSelector
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

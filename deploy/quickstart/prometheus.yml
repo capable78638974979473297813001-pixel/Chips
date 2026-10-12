@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+rule_files: [/etc/prometheus/siliconrouter-alerts.yaml]
+scrape_configs:
+  - job_name: siliconrouter
+    static_configs: [{targets: ["router:8080"]}]
+  - job_name: vllm
+    static_configs: [{targets: ["vllm-a:8000", "vllm-b:8000"]}]
