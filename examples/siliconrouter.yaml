@@ -65,6 +65,7 @@ backends:
     models: [llama-3.1-70b]         # omit to auto-discover from GET /v1/models
     api_key_env: H100_API_KEY       # optional bearer token sent to this backend
     agent_url: http://10.0.0.11:9400  # optional chipagent on this machine (see docs/HARDWARE.md)
+    # agent_devices: ["0"]          # one engine per GPU: the GPUs this backend uses, by index or UUID
     metrics_path: /metrics          # optional: route on the engine's own queue and KV-cache use (docs/TUNING.md)
     # api_key_header: x-api-key     # send the key in this header instead of "Authorization: Bearer"
     # health_path: /health          # per-backend override of health.path (TGI /health, Triton /v2/health/ready)

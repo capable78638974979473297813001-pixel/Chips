@@ -185,8 +185,10 @@ For each request, the router:
    engines use for their own caches.
 2. Filters to backends that are healthy, serve that model, have room for the context, and haven't
    already failed this request.
-3. **Cache first:** if a backend recently served the longest matching prefix and has a free slot,
-   it gets the request, unless it is much busier than the alternatives (`affinity_max_imbalance`).
+3. **Cache first:** if backends recently served the longest matching prefix and have a free slot,
+   the least busy of them gets the request, unless it is much busier than the alternatives
+   (`affinity_max_imbalance`). A prefix remembers up to four backends, so a system prompt every
+   conversation shares doesn't pin all new conversations to one server.
 4. **Then hardware fit:** large prompts try `heavy → standard → light → reserve`; small prompts try
    `light → standard → heavy → reserve`. Within a tier, the least utilized backend wins; on a tie,
    the node whose accelerators chipagent reports as less busy wins.
@@ -233,9 +235,12 @@ the C++ standard library and POSIX; it needs no CUDA, ROCm or vendor SDK to buil
 
 ## Status and roadmap
 
-Tested on real hardware so far: an NVIDIA RTX 4090 and an AMD MI300X, behind one router. The
-results, including the three bugs the run found and fixed, are in
-[docs/VALIDATION.md](docs/VALIDATION.md).
+Tested on real hardware so far: an NVIDIA RTX 4090 and an AMD MI300X behind one router, then two
+RTX 4090s with a 7B model and two A100s with a 32B model, one engine per GPU. On those, routing on
+the prefix cache gave 41–57% more throughput than routing on load alone, which was no faster than
+one GPU. A killed engine cost only the streams it was generating, a hung one was taken out of
+rotation, and LoRA-aware routing gave 33–41% more throughput. The results, and the seven bugs the
+runs found and fixed, are in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's built, what's next, and how the open-source and
 commercial editions split.

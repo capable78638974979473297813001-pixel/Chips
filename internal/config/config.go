@@ -417,6 +417,10 @@ type Backend struct {
 	// AgentURL points at the chipagent on this backend's machine, which
 	// reports its accelerators (NVIDIA, AMD, Intel, Apple) in one schema.
 	AgentURL string `yaml:"agent_url"`
+	// AgentDevices limits this backend to some of the accelerators chipagent
+	// reports, by index or id (an NVIDIA GPU's UUID), for a machine with one
+	// engine per GPU. Empty means all of them.
+	AgentDevices []string `yaml:"agent_devices"`
 	// MetricsPath turns on scraping of the engine's Prometheus metrics
 	// (vLLM, SGLang, TGI, llama.cpp with --metrics, Triton) at this path,
 	// usually /metrics, to route on the engine's real queue and KV-cache
@@ -941,6 +945,9 @@ func validateBackend(where string, b Backend) []error {
 		if u, err := url.Parse(b.AgentURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			errs = append(errs, fmt.Errorf("%s: agent_url must be an absolute http(s) URL, got %q", where, b.AgentURL))
 		}
+	}
+	if len(b.AgentDevices) > 0 && b.AgentURL == "" {
+		errs = append(errs, fmt.Errorf("%s: agent_devices needs agent_url", where))
 	}
 	if b.MaxConcurrency < 0 {
 		errs = append(errs, fmt.Errorf("%s: max_concurrency must be positive", where))

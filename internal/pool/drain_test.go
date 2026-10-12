@@ -11,7 +11,7 @@ import (
 
 func TestDrainStopsNewTrafficAndLetsInflightFinish(t *testing.T) {
 	p := newPool(t, Options{}, be("a", config.TierStandard, 2), be("b", config.TierStandard, 2))
-	first := acquire(t, p, Request{Preferred: "a"})
+	first := acquire(t, p, Request{Preferred: []string{"a"}})
 	if first.Backend.Name != "a" {
 		t.Fatalf("setup: got %s", first.Backend.Name)
 	}
@@ -20,7 +20,7 @@ func TestDrainStopsNewTrafficAndLetsInflightFinish(t *testing.T) {
 		t.Fatalf("SetDrained = %+v, %v", st, ok)
 	}
 	for range 2 {
-		if l := acquire(t, p, Request{Preferred: "a"}); l.Backend.Name != "b" {
+		if l := acquire(t, p, Request{Preferred: []string{"a"}}); l.Backend.Name != "b" {
 			t.Errorf("drained backend got new work")
 		}
 	}

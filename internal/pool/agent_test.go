@@ -182,3 +182,42 @@ func TestStaleAgentReadings(t *testing.T) {
 		t.Errorf("stale report: %+v", hs)
 	}
 }
+
+// On a machine running one engine per GPU, each backend counts only its
+// own GPU: for its tier, and for faults, so one lost GPU takes out only the
+// engine on it.
+func TestAgentDevicesNarrowTheReport(t *testing.T) {
+	gpu0, gpu1 := auto("gpu0", 2), auto("gpu1", 2)
+	gpu0.AgentDevices = []string{"0"}
+	gpu1.AgentDevices = []string{"gpu-BBBB"} // by id, any case
+	p := newPool(t, Options{}, gpu0, gpu1)
+	host := &hardware.Report{Schema: 1, Devices: []hardware.Device{
+		{Index: 0, ID: "GPU-AAAA", Vendor: "nvidia", Kind: "gpu", Name: "RTX 4090", MemoryTotalBytes: 24 * gib},
+		{Index: 1, ID: "GPU-BBBB", Vendor: "nvidia", Kind: "gpu", Name: "RTX 4090", MemoryTotalBytes: 24 * gib, Error: "GPU is lost"},
+	}}
+	p.SetHardware(p.byName["gpu0"], host, nil)
+	p.SetHardware(p.byName["gpu1"], host, nil)
+	st := p.Snapshot()
+	if hw := st[0].Hardware; hw.Accelerators != 1 || hw.MemoryTotalBytes != 24*gib || len(hw.Faults) != 0 {
+		t.Errorf("gpu0 sees %+v, want only GPU 0", hw)
+	}
+	if st[0].Tier != config.TierStandard { // 24 GiB, not the host's 48
+		t.Errorf("gpu0 tier = %s", st[0].Tier)
+	}
+	if hw := st[1].Hardware; hw.Accelerators != 1 || len(hw.Faults) != 1 {
+		t.Errorf("gpu1 sees %+v, want only its lost GPU", hw)
+	}
+	for range 3 {
+		l := acquire(t, p, Request{})
+		if l.Backend.Name != "gpu0" {
+			t.Error("the engine on the lost GPU got new work")
+		}
+		l.Release()
+	}
+	// A selector that matches nothing is an error, not an empty machine.
+	p.byName["gpu0"].agentDevices = []string{"7"}
+	p.SetHardware(p.byName["gpu0"], host, nil)
+	if e := p.Snapshot()[0].Hardware.AgentError; !strings.Contains(e, "match agent_devices") {
+		t.Errorf("agent error = %q", e)
+	}
+}

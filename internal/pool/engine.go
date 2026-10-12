@@ -71,7 +71,7 @@ func (p *Pool) SetEngine(b *Backend, st engine.Stats, err error) {
 	}
 	now := p.now()
 	b.advanceCostLocked(now) // the engine's running count splits the cost
-	b.eng, b.engErr = &st, ""
+	b.eng, b.engErr, b.engOurs = &st, "", b.inflight
 	b.engUntil = now.Add(p.opts.EngineMaxAge)
 	p.trackProgressLocked(b, st, now)
 }

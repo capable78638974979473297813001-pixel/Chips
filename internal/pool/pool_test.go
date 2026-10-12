@@ -115,15 +115,37 @@ func TestDiscoveredModels(t *testing.T) {
 
 func TestAffinityRespectsImbalance(t *testing.T) {
 	p := newPool(t, Options{AffinityMaxImbalance: 0.5}, be("a", config.TierStandard, 4), be("b", config.TierStandard, 4))
-	l := acquire(t, p, Request{Preferred: "b"})
+	l := acquire(t, p, Request{Preferred: []string{"b"}})
 	if l.Backend.Name != "b" || !l.Affinity {
 		t.Fatalf("preferred backend not chosen: %s", l.Backend.Name)
 	}
-	acquire(t, p, Request{Preferred: "b"}) // b at 1/4 vs a at 0/4
-	acquire(t, p, Request{Preferred: "b"}) // b at 2/4 vs a at 0/4: still within 0.5
-	l = acquire(t, p, Request{Preferred: "b"})
+	acquire(t, p, Request{Preferred: []string{"b"}}) // b at 1/4 vs a at 0/4
+	acquire(t, p, Request{Preferred: []string{"b"}}) // b at 2/4 vs a at 0/4: still within 0.5
+	l = acquire(t, p, Request{Preferred: []string{"b"}})
 	if l.Backend.Name != "a" || l.Affinity {
 		t.Errorf("b at 3/4 vs a at 0/4 should rebalance to a, got %s", l.Backend.Name)
+	}
+}
+
+// A prefix cached on several backends, like a system prompt every
+// conversation starts with, goes to the least busy of them, so new
+// conversations spread out instead of piling onto the one that served the
+// prefix last. On real GPUs the old rule put 95% of a soak on one of two.
+func TestAffinityPicksLeastBusyHolder(t *testing.T) {
+	p := newPool(t, Options{AffinityMaxImbalance: 0.5}, be("a", config.TierStandard, 4), be("b", config.TierStandard, 4), be("c", config.TierStandard, 4))
+	both := []string{"a", "b"} // a served it last
+	if l := acquire(t, p, Request{Preferred: both}); l.Backend.Name != "a" || !l.Affinity {
+		t.Fatalf("tie: got %s, want a, the latest holder", l.Backend.Name)
+	}
+	if l := acquire(t, p, Request{Preferred: both}); l.Backend.Name != "b" || !l.Affinity {
+		t.Errorf("a at 1/4, b at 0/4: got %s, want b", l.Backend.Name)
+	}
+	if l := acquire(t, p, Request{Preferred: both}); l.Backend.Name != "a" || !l.Affinity {
+		t.Errorf("a and b at 1/4: got %s, want a", l.Backend.Name)
+	}
+	// c, holding nothing, stays out while the holders are within the imbalance.
+	if l := acquire(t, p, Request{Preferred: both}); l.Backend.Name == "c" {
+		t.Error("prefix moved to a backend without it")
 	}
 }
 

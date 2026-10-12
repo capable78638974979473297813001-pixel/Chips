@@ -87,6 +87,7 @@ func main() {
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/completions", s.handleChat)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("GET /health", func(http.ResponseWriter, *http.Request) {}) // as vLLM's
 	log.Printf("mockllm %q serving %s on %s", s.name, s.model, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

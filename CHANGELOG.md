@@ -9,6 +9,24 @@ The release workflow publishes the section for a tag as that release's notes.
 
 ## [Unreleased]
 
+Found by the second round of real-hardware tests (2× RTX 4090, 2× A100; see docs/VALIDATION.md).
+
+### Fixed
+- Prefix-cache routing no longer sends every conversation that shares a system prompt to one
+  backend. A prefix remembers up to four backends holding it, and a request goes to the least busy.
+  On two GPUs this moved a soak from a 10,560 / 544 split to 2,964 / 2,988.
+- A burst of first requests for a LoRA adapter loads it on one backend, not on every backend.
+- Cost reports no longer undercount: requests that had finished since the last engine scrape
+  kept a share of the backend's cost that was charged to no one.
+
+### Added
+- `agent_devices` backend setting: on a machine running one engine per GPU, each backend counts
+  only its own GPU for tiering and faults.
+- `srbench -stream` (reports time to first token), `-models` (one model or adapter per
+  conversation) and `-timeout`.
+- `scripts/hw-validate.sh` suites: repeated runs, a killed engine, a hung engine, a soak with a
+  cost check, and LoRA adapters. mockllm answers `/health`.
+
 ## [0.4.0] - first tagged release
 
 The first release with binaries, signed container images and a Helm chart. Everything below is

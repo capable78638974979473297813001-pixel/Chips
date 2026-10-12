@@ -694,7 +694,9 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		}
 		b := lease.Backend
 		if lease.NeedsLoad {
-			if err := s.loadAdapter(r.Context(), b, adapter); err != nil {
+			err := s.loadAdapter(r.Context(), b, adapter)
+			s.pool.AdapterLoadDone(b, adapter.Name)
+			if err != nil {
 				lease.Release()
 				s.charge(rl, who, lease, 0, 0)
 				s.loraRouting.Inc("load_failed")
@@ -793,7 +795,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case lease.Affinity:
 				s.cacheLookups.Inc("hit")
-			case req.Preferred != "":
+			case len(req.Preferred) > 0:
 				s.cacheLookups.Inc("rebalanced")
 			default:
 				s.cacheLookups.Inc("miss")

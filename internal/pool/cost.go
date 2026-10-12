@@ -14,10 +14,14 @@ import (
 // backend started. A request's share is the clock's advance between its
 // start and its end. Time with nothing running is idle cost.
 //
-// n is the larger of the router's own in-flight count and the requests the
-// engine reports running, so traffic from other routers (cluster mode) or
-// clients calling the engine directly takes its share instead of the cost
-// being pinned on this router's requests.
+// n is the router's own in-flight count plus other clients' requests on
+// the engine, so traffic from other routers (cluster mode) or clients
+// calling the engine directly takes its share instead of the cost being
+// pinned on this router's requests. Other clients' requests are what the
+// engine last reported (running and queued) beyond this router's in-flight
+// count at that scrape. Comparing with the in-flight count now instead
+// would undercharge: the scrape is up to an interval old, so after requests
+// finish it still counts them, and their share would go to no one.
 
 // pricing is what a backend charges.
 type pricing struct {
@@ -55,8 +59,8 @@ func (b *Backend) advanceCostLocked(now time.Time) {
 		return
 	}
 	n := float64(b.inflight)
-	if st, ok := b.engineStats(now); ok && st.Running > n {
-		n = st.Running
+	if st, ok := b.engineStats(now); ok && st.Running >= 0 {
+		n += max(0, st.Running+st.Waiting-float64(b.engOurs))
 	}
 	if n > 0 {
 		b.costClock += b.price.perSecond * dt / n

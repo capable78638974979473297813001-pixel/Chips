@@ -48,7 +48,7 @@
 
 | Feature | Why it matters |
 |---|---|
-| Real-hardware validation beyond NVIDIA and AMD: Intel GPUs, Gaudi, Inferentia/Trainium, TPU, multi-GPU servers | The RTX 4090 and MI300X runs ([VALIDATION.md](VALIDATION.md)) found three bugs the fakes missed |
+| Real-hardware validation beyond NVIDIA and AMD: Intel GPUs, Gaudi, Inferentia/Trainium, TPU; multi-GPU AMD; tensor-parallel engines | Two rounds on RTX 4090, MI300X and A100 ([VALIDATION.md](VALIDATION.md)) found seven bugs the fakes missed |
 
 ## Research track (hard, and not promised)
 

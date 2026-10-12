@@ -66,21 +66,28 @@ type Backend struct {
 	discovered map[string]bool
 	// discoveredAt is when discovered was last refreshed.
 	discoveredAt time.Time
+	// agentDevices narrows chipagent's report to this backend's accelerators.
+	agentDevices []string
 	// dynamicLoRA: the engine loads adapters at runtime. adapters records
 	// when this router last loaded or used each adapter here (see lora.go).
 	dynamicLoRA bool
 	adapters    map[string]time.Time
-	lastErr     string
-	hw          *hardware.Report
-	hwErr       string
-	hwFault     bool // chipagent reports a failed accelerator: no new work
+	// loading counts this router's loads of each adapter in progress here.
+	loading map[string]int
+	lastErr string
+	hw      *hardware.Report
+	hwErr   string
+	hwFault bool // chipagent reports a failed accelerator: no new work
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
 	// The engine's own load, from its metrics (see EngineScraper).
 	eng      *engine.Stats
 	engUntil time.Time // eng is stale after this
-	engErr   string
+	// engOurs is how many of this router's requests were in flight when
+	// eng was scraped: the engine's count beyond it is other clients' traffic.
+	engOurs int
+	engErr  string
 	// Recent generated-token counts while requests ran, for stall detection.
 	progress []progressSample
 	stalled  bool
@@ -96,8 +103,9 @@ type Request struct {
 	Model        string
 	PromptTokens int
 	MaxTokens    int
-	// Preferred names the backend believed to hold this prompt's prefix in cache.
-	Preferred string
+	// Preferred names the backends believed to hold this prompt's longest
+	// cached prefix.
+	Preferred []string
 	// Exclude lists backends that already failed this request.
 	Exclude map[string]bool
 	// GRPC requires a backend with a gRPC endpoint.
@@ -119,7 +127,7 @@ type Request struct {
 // when the upstream response is finished; extra calls are ignored.
 type Lease struct {
 	Backend *Backend
-	// Affinity is true when the request went to its Preferred backend.
+	// Affinity is true when the request went to one of its Preferred backends.
 	Affinity bool
 	// Waited is how long the request queued for the slot.
 	Waited time.Duration
@@ -308,6 +316,7 @@ func (b *Backend) setCapacity(cb config.Backend) {
 	b.MaxConcurrency = cb.MaxConcurrency
 	b.MaxContextTokens = cb.MaxContextTokens
 	b.dynamicLoRA = cb.DynamicLoRA
+	b.agentDevices = cb.AgentDevices
 	b.models = map[string]bool{}
 	for _, m := range cb.Models {
 		b.models[m] = true
@@ -531,6 +540,12 @@ func (p *Pool) grantLocked(b *Backend, r Request, affinity bool, start time.Time
 	if r.Base != "" {
 		l.AdapterLoaded = b.hasAdapterLocked(r.Model, now)
 		l.NeedsLoad = !l.AdapterLoaded && b.dynamicLoRA
+		if l.NeedsLoad { // until it finishes, more requests for it come here too
+			if b.loading == nil {
+				b.loading = map[string]int{}
+			}
+			b.loading[r.Model]++
+		}
 	}
 	return l
 }
@@ -704,12 +719,19 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 		loads[b] = b.load(now)
 		minLoad = min(minLoad, loads[b])
 	}
-	if r.Preferred != "" {
+	// The least busy backend holding the prefix, since a prefix many requests
+	// share, like a system prompt, is cached on several; on a tie, the one
+	// that served it last, as the likeliest to still have it.
+	var holder *Backend
+	for _, name := range r.Preferred {
 		for _, b := range free {
-			if b.Name == r.Preferred && loads[b] <= minLoad+p.opts.AffinityMaxImbalance {
-				return b, true, nil
+			if b.Name == name && (holder == nil || loads[b] < loads[holder]) {
+				holder = b
 			}
 		}
+	}
+	if holder != nil && loads[holder] <= minLoad+p.opts.AffinityMaxImbalance {
+		return holder, true, nil
 	}
 	if r.Base != "" {
 		free = p.loraCandidatesLocked(free, r.Model, loads, minLoad, now)
@@ -853,6 +875,13 @@ func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
 	if r.Stale && len(r.Devices) == 0 {
 		b.hwErr = "chipagent has no readings yet: " + r.CollectError
 		return // keep what we had
+	}
+	if len(b.agentDevices) > 0 {
+		all := len(r.Devices)
+		if r = r.Only(b.agentDevices); len(r.Devices) == 0 {
+			b.hwErr = fmt.Sprintf("none of the %d devices chipagent reports match agent_devices %v", all, b.agentDevices)
+			return
+		}
 	}
 	b.hw, b.hwErr = r, ""
 	if r.Stale {
