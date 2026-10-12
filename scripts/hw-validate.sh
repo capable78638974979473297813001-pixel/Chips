@@ -17,7 +17,7 @@
 #   failover  engine B killed (SIGKILL) under streaming load, then restarted.
 #   stall     engine B's engine core frozen (SIGSTOP) under streaming load:
 #             its API server still answers health checks, so only stall
-#             detection can see it. Resumed after 45 s.
+#             detection (here with a 15 s window) can see it. Resumed after 45 s.
 #   soak      SOAK_MIN minutes of load from two teams, sampling the router's
 #             goroutines and heap, then the cost report checked against
 #             the clock (POD_PRICE_PER_HOUR).
@@ -176,7 +176,7 @@ EOF
      agent_url: "http://127.0.0.1:9400", $dev_b tier: auto, max_concurrency: 32, ${BACKEND_EXTRA:-}}
 EOF
   echo "routing: {prefix_affinity: $affinity}"
-  echo "engine_metrics: {interval: 1s}"
+  [[ " $* " == *" engine_metrics:"* ]] || echo "engine_metrics: {interval: 1s}"
   echo "health: {interval: 1s}"
   for extra in "$@"; do echo "$extra"; done
 }
@@ -305,7 +305,9 @@ if has failover; then
 fi
 
 if has stall; then
-  run_router false stall "" "retry: {first_token_timeout: 10s}" "upstream: {response_header_timeout: 60s}"
+  # A 15 s window (the default is 60 s) so the 45 s freeze is judged.
+  run_router false stall "" "retry: {first_token_timeout: 10s}" "upstream: {response_header_timeout: 60s}" \
+    "engine_metrics: {interval: 1s, stall_after: 15s}"
   timeline stall & TL=$!
   (
     sleep 15
