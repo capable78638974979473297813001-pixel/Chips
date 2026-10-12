@@ -86,6 +86,8 @@ type Server struct {
 	budgetSpent   *metrics.CounterVec
 	panics        *metrics.CounterVec
 	loraRouting   *metrics.CounterVec
+	coldStarts    *metrics.CounterVec
+	scaled        scaleUps
 	loads         adapterLoads
 	draining      atomic.Bool
 	// idleBooked is each backend's idle cost already in the ledger.
@@ -205,6 +207,7 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		retryBudget:   newRetryBudget(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond),
 		fallbacks:     reg.NewCounterVec("siliconrouter_model_fallbacks_total", "Requests served by a fallback model because their model could not take them.", "model", "fallback"),
 		loraRouting:   reg.NewCounterVec("siliconrouter_lora_routing_total", "Requests for LoRA adapters by placement: loaded (backend had the adapter), loaded_on_demand (the router loaded it first), load_failed, or unknown (backend not known to have it).", "result"),
+		coldStarts:    reg.NewCounterVec("siliconrouter_cold_starts_total", "Requests that arrived for a model with no backend up (each may trigger the scale-up webhook).", "model"),
 		clientCost:    reg.NewCounterVec("siliconrouter_client_cost_dollars_total", "Dollars charged per client and hardware: each request's share of its backend's cost_per_hour while it ran, plus token prices.", "client", "hardware"),
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
@@ -337,6 +340,9 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		emit(float64(s.affinity.Len()))
 	})
 
+	s.registerDemandMetrics()
+	s.mux.HandleFunc("GET /autoscale", s.handleAutoscale)
+	s.mux.HandleFunc("GET /autoscale/{model...}", s.handleAutoscale)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok\n") })
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
@@ -513,6 +519,13 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
+	// Models scaled to zero are available: a request starts a backend.
+	for _, m := range s.conf().Autoscaling.ScaleToZeroModels {
+		if !seen[m] {
+			seen[m] = true
+			data = append(data, model{ID: m, Object: "model", OwnedBy: "siliconrouter"})
+		}
+	}
 	for alias, target := range s.conf().Models.Aliases {
 		if seen[target] && !seen[alias] {
 			seen[alias] = true
@@ -673,6 +686,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 			fallbacks = append(fallbacks, m)
 		}
 	}
+	s.prepareHold(st, &req, wait, len(fallbacks), rl)
 	asked := info.Model
 	fallBack := func() {
 		m := fallbacks[0]
@@ -686,6 +700,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		adapter, _ = setAdapter(&req, st.cfg.Models)
 		req.Exclude = map[string]bool{}
 		s.fallbacks.Inc(asked, m)
+		s.prepareHold(st, &req, wait, len(fallbacks), rl)
 	}
 
 	var lastErr string
@@ -708,6 +723,14 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 				fallBack()
 				tries = 0
 				continue
+			}
+			if rl.coldStart && errors.Is(err, context.DeadlineExceeded) && r.Context().Err() == nil {
+				s.rejected.Inc("cold_start_timeout")
+				w.Header().Set("Retry-After", "10")
+				writeError(w, http.StatusServiceUnavailable, "cold_start_timeout",
+					"no backend for this model started within autoscaling.cold_start_wait; retry shortly")
+				s.logRequest(rl, "", http.StatusServiceUnavailable, attempt, false, err)
+				return
 			}
 			status := s.rejectAcquire(w, r, err, tries, lastErr)
 			s.logRequest(rl, "", status, attempt, false, err)
@@ -1224,6 +1247,7 @@ type requestLog struct {
 	cache       string
 	exactTokens int
 	cost        float64 // dollars charged, over every attempt
+	coldStart   bool    // waited for a backend to start
 	kind        string  // websocket or grpc for passthrough sessions
 	trace       tracing.Context
 	span        tracing.SpanID
@@ -1263,6 +1287,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.exactTokens > 0 {
 		attrs = append(attrs, "prompt_tokens_exact", l.exactTokens)
+	}
+	if l.coldStart {
+		attrs = append(attrs, "cold_start", true)
 	}
 	if l.cost > 0 {
 		attrs = append(attrs, "cost_usd", math.Round(l.cost*1e6)/1e6)

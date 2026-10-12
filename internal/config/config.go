@@ -73,6 +73,35 @@ type Config struct {
 	StateDir string  `yaml:"state_dir"`
 	Tracing  Tracing `yaml:"tracing"`
 	Logging  Logging `yaml:"logging"`
+	// Autoscaling holds requests while GPU servers start and publishes the
+	// demand autoscalers scale on.
+	Autoscaling Autoscaling `yaml:"autoscaling"`
+}
+
+// Autoscaling: with ColdStartWait set, a request whose model has no
+// backend up (all down, starting, or scaled to zero) waits for one instead
+// of failing at once, and the router calls Webhook so something can start one.
+type Autoscaling struct {
+	ColdStartWait Duration `yaml:"cold_start_wait"` // 0 = off
+	// ScaleToZeroModels may have no backends at all; requests for them are
+	// held too, and /v1/models keeps listing them.
+	ScaleToZeroModels []string `yaml:"scale_to_zero_models"`
+	Webhook           Webhook  `yaml:"webhook"`
+	// TargetUtilization is the share of a backend's max_concurrency the
+	// desired backend count aims to keep busy (default 0.8).
+	TargetUtilization float64 `yaml:"target_utilization"`
+	// BackendCapacity is the max_concurrency assumed for a model's
+	// backends when none is known, e.g. while scaled to zero (default 16).
+	BackendCapacity int `yaml:"backend_capacity"`
+}
+
+// Webhook is called (POST, JSON) when requests start waiting for a model
+// with no backend up, at most once per Interval per model.
+type Webhook struct {
+	URL       string   `yaml:"url"`
+	SecretEnv string   `yaml:"secret_env"` // sent as Authorization: Bearer
+	Interval  Duration `yaml:"interval"`   // default 30s
+	Secret    string   `yaml:"-"`
 }
 
 // Tracing exports a span per request (plus queue wait and each backend
@@ -584,6 +613,16 @@ func (c *Config) applyDefaults() {
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
 	}
+	as := &c.Autoscaling
+	if as.TargetUtilization == 0 {
+		as.TargetUtilization = 0.8
+	}
+	if as.BackendCapacity == 0 {
+		as.BackendCapacity = 16
+	}
+	if as.Webhook.Interval == 0 {
+		as.Webhook.Interval = Duration(30 * time.Second)
+	}
 	if c.Shutdown.Timeout == 0 {
 		c.Shutdown.Timeout = Duration(60 * time.Second)
 	}
@@ -634,6 +673,9 @@ func (c *Config) resolveEnv() {
 	}
 	if c.Auth.AdminKeysEnv != "" {
 		c.Auth.AdminKeys = append(c.Auth.AdminKeys, splitEnv(c.Auth.AdminKeysEnv)...)
+	}
+	if env := c.Autoscaling.Webhook.SecretEnv; env != "" {
+		c.Autoscaling.Webhook.Secret = os.Getenv(env)
 	}
 	if c.Cluster.SecretEnv != "" {
 		c.Cluster.Secret = os.Getenv(c.Cluster.SecretEnv)
@@ -908,6 +950,19 @@ func (c *Config) validate() error {
 	}
 	if hw := c.Hardware; hw.StandardMinMemoryGiB < 0 || hw.HeavyMinMemoryGiB < hw.StandardMinMemoryGiB {
 		errs = append(errs, errors.New("hardware: need 0 <= standard_min_memory_gib <= heavy_min_memory_gib"))
+	}
+	if as := c.Autoscaling; as.ColdStartWait < 0 || as.TargetUtilization <= 0 || as.TargetUtilization > 1 || as.BackendCapacity < 1 || as.Webhook.Interval.D() < time.Second {
+		errs = append(errs, errors.New("autoscaling: need cold_start_wait >= 0, 0 < target_utilization <= 1, backend_capacity >= 1 and webhook.interval >= 1s"))
+	} else if len(as.ScaleToZeroModels) > 0 && as.ColdStartWait == 0 {
+		errs = append(errs, errors.New("autoscaling: scale_to_zero_models needs cold_start_wait, so their requests wait for a backend to start"))
+	}
+	if u := c.Autoscaling.Webhook.URL; u != "" {
+		if pu, err := url.Parse(u); err != nil || (pu.Scheme != "http" && pu.Scheme != "https") || pu.Host == "" {
+			errs = append(errs, fmt.Errorf("autoscaling.webhook.url must be an absolute http(s) URL, got %q", u))
+		}
+	}
+	if env := c.Autoscaling.Webhook.SecretEnv; env != "" && c.Autoscaling.Webhook.Secret == "" {
+		errs = append(errs, fmt.Errorf("autoscaling.webhook.secret_env %q is not set", env))
 	}
 	if c.MaxBodyBytes < 0 {
 		errs = append(errs, errors.New("max_body_bytes must not be negative"))

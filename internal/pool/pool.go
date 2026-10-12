@@ -107,6 +107,9 @@ type Request struct {
 	Priority int
 	// Base is set when Model is a LoRA adapter: the model it adapts.
 	Base string
+	// Hold lets the request wait for a backend to start when none is up
+	// (see Options.ColdStart) instead of failing with ErrNoBackend.
+	Hold bool
 }
 
 // Lease is a held concurrency slot. Release must be called exactly once
@@ -126,6 +129,7 @@ type Lease struct {
 	once          sync.Once
 	// Cost accounting: the backend's cost clock at grant, its prices and
 	// cost-report name then, and the time cost charged at release.
+	model     string // demandModel of the request, for per-model in-flight counts
 	costStart float64
 	price     pricing
 	hardware  string
@@ -139,6 +143,7 @@ func (l *Lease) Release() {
 		l.Backend.advanceCostLocked(p.now())
 		l.timeCost = l.Backend.costClock - l.costStart
 		l.Backend.inflight--
+		p.inflightByModel[l.model]--
 		p.dispatchLocked(false)
 		p.mu.Unlock()
 	})
@@ -163,6 +168,10 @@ type Options struct {
 	// config.EngineMetrics); StallAfter <= 0 turns it off.
 	StallAfter   time.Duration
 	StallMinRate float64
+	// ColdStart holds Hold requests for a model with no backend up, when a
+	// backend could serve it once up or the model is in ColdModels.
+	ColdStart  bool
+	ColdModels map[string]bool
 }
 
 type Pool struct {
@@ -173,6 +182,8 @@ type Pool struct {
 	opts     Options
 	log      *slog.Logger
 	now      func() time.Time // the cost clock's time source
+	// inflightByModel counts leases by demandModel, for autoscaling.
+	inflightByModel map[string]int
 }
 
 type waiter struct {
@@ -218,12 +229,22 @@ func OptionsFromConfig(cfg *config.Config) Options {
 		KVSaturated:  cfg.EngineMetrics.KVSaturated,
 		StallAfter:   cfg.EngineMetrics.StallAfter.D(),
 		StallMinRate: cfg.EngineMetrics.StallMinTokensPerSecond,
+		ColdStart:    cfg.Autoscaling.ColdStartWait > 0,
+		ColdModels:   coldModels(cfg.Autoscaling.ScaleToZeroModels),
 	}
+}
+
+func coldModels(models []string) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range models {
+		out[m] = true
+	}
+	return out
 }
 
 func New(backends []config.Backend, opts Options, log *slog.Logger) (*Pool, error) {
 	opts = opts.withDefaults()
-	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log, now: time.Now}
+	p := &Pool{byName: map[string]*Backend{}, waiters: list.New(), opts: opts, log: log, now: time.Now, inflightByModel: map[string]int{}}
 	for i, cb := range backends {
 		b, err := newBackend(cb, i)
 		if err != nil {
@@ -405,7 +426,7 @@ func (p *Pool) Acquire(ctx context.Context, req Request) (*Lease, error) {
 			p.mu.Unlock()
 			return l, nil
 		}
-	} else if !p.servableLocked(req) {
+	} else if !p.servableLocked(req) && !p.coldLocked(req) {
 		p.mu.Unlock()
 		return nil, ErrNoBackend
 	}
@@ -501,7 +522,8 @@ func (p *Pool) grantLocked(b *Backend, r Request, affinity bool, start time.Time
 	now := p.now()
 	b.advanceCostLocked(now)
 	b.inflight++
-	l := &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p,
+	p.inflightByModel[demandModel(r)]++
+	l := &Lease{Backend: b, Affinity: affinity, Waited: time.Since(start), pool: p, model: demandModel(r),
 		costStart: b.costClock, price: b.price, hardware: b.hardwareNameLocked()}
 	if r.Base != "" {
 		l.AdapterLoaded = b.hasAdapterLocked(r.Model, now)
@@ -648,6 +670,9 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 		}
 	}
 	if !servable {
+		if p.coldLocked(r) {
+			return nil, false, nil // wait for a backend to come up
+		}
 		return nil, false, ErrNoBackend
 	}
 	if len(free) == 0 {

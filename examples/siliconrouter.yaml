@@ -182,6 +182,15 @@ hardware:
   heavy_min_memory_gib: 64          # tier auto: total accelerator memory for heavy...
   standard_min_memory_gib: 20       # ...and for standard; below this a node is light
 
+# Hold requests while GPU servers start, and publish demand for autoscalers
+# (docs/OPERATIONS.md, deploy/kubernetes/keda-scaledobject.yaml).
+autoscaling:
+  cold_start_wait: 0s               # e.g. 5m: wait this long for a backend to start instead of a 503
+  scale_to_zero_models: []          # models that may have no backends at all
+  # webhook: {url: https://ops.example.com/start-gpu, secret_env: SCALE_WEBHOOK_SECRET, interval: 30s}
+  target_utilization: 0.8
+  backend_capacity: 16
+
 # Save the response cache and usage counters across restarts.
 # state_dir: /var/lib/siliconrouter
 

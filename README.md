@@ -135,6 +135,7 @@ OpenAI-compatible servers return).
 | `POST /admin/reload`      | Re-read the config file and apply it live (also `SIGHUP`)      |
 | `POST /admin/backends/{name}/drain`, `/undrain` | Take a backend out of rotation for maintenance, or put it back |
 | `GET /metrics`            | Prometheus metrics                                            |
+| `GET /autoscale[/{model}]` | Demand per model for autoscalers (KEDA, HPA): in flight, queued, held, desired backends |
 | `GET /healthz`, `/readyz` | Liveness, and readiness (at least one healthy backend)        |
 
 Request headers:

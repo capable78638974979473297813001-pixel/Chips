@@ -186,6 +186,58 @@ request's cost is also in its log line (`cost_usd`). For Prometheus, use
 `sum by (client) (increase(siliconrouter_client_cost_dollars_total[7d]))` gives spend per team per
 week across every router. The Grafana dashboard has these panels.
 
+## Scale-to-zero and autoscaling
+
+GPUs are expensive to leave idle. The router helps you turn them off: it holds requests while a
+server boots, wakes whatever starts servers, and publishes the demand an autoscaler needs.
+
+```yaml
+autoscaling:
+  cold_start_wait: 5m              # hold requests up to this long while a backend starts (0 = off)
+  scale_to_zero_models: [llama-3.1-70b]   # may have no backends at all; still listed in /v1/models
+  webhook:                         # optional: called when requests start waiting
+    url: https://ops.example.com/hooks/start-gpu
+    secret_env: SCALE_WEBHOOK_SECRET      # sent as Authorization: Bearer
+    interval: 30s                  # at most one call per model this often
+  target_utilization: 0.8          # desired_backends aims for this share of max_concurrency
+  backend_capacity: 16             # max_concurrency assumed while a model has no backends
+```
+
+**Cold starts.** When `cold_start_wait` is set and no backend for a request's model is up, the
+request waits in the queue for up to `cold_start_wait` instead of failing with `503` at once. This
+covers backends that are all down, booting, stalled or on a failed GPU, and models in
+`scale_to_zero_models` that have no backends at all. The request is answered as soon as a backend
+for the model passes its health checks, including one that DNS discovery or a config reload just
+added. If none comes up in time, the client gets `503 cold_start_timeout` with `Retry-After`.
+Drained backends don't count, because a drain is an operator's decision. A request with
+`models.fallbacks` left doesn't wait: it goes to the fallback model at once, while the webhook
+still asks for the big model to start.
+
+**The webhook** gets `POST {"event": "scale_up", "model": "...", "held_requests": 3, "router":
+"...", "time": "..."}`. Use it to start a stopped VM, call a cloud API, or scale a Deployment
+from a small function. Adapter requests ask for their base model.
+
+**Signals for autoscalers.** Per model, counting adapters toward their base model:
+
+| Metric | Meaning |
+|---|---|
+| `siliconrouter_model_inflight` | requests running |
+| `siliconrouter_model_queued` | requests waiting for a slot, including held ones |
+| `siliconrouter_model_held` | requests waiting because no backend for the model is up |
+| `siliconrouter_model_ready_backends` | backends in rotation serving it |
+| `siliconrouter_model_desired_backends` | `ceil((inflight + queued) / (max_concurrency x target_utilization))` |
+| `siliconrouter_cold_starts_total` | requests that arrived with no backend up |
+
+The same numbers are served as JSON at `GET /autoscale` and `GET /autoscale/<model>`, without
+auth, like `/metrics`. KEDA's `metrics-api` scaler can read `desired_backends` from there.
+[deploy/kubernetes/keda-scaledobject.yaml](../deploy/kubernetes/keda-scaledobject.yaml) scales a
+vLLM Deployment between 0 and 8 replicas this way, with a Prometheus variant for cluster mode,
+where each router only sees its own requests. An HPA can use the same metrics through
+prometheus-adapter.
+
+For scale to zero on Kubernetes, find the vLLM pods with DNS `discovery` on a headless Service.
+New pods join as their health checks pass, and held requests go to them right away.
+
 ## Changing config without downtime
 
 Edit the config file, then either:

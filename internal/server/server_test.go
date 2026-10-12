@@ -67,6 +67,7 @@ func setup(t testing.TB, mutate func(*config.Config), urls ...string) (*httptest
 		MaxWaiting: cfg.Queue.MaxWaiting, AffinityMaxImbalance: cfg.Routing.AffinityMaxImbalance,
 		LargeRequestTokens: cfg.Routing.LargeRequestTokens, UnhealthyThreshold: cfg.Health.UnhealthyThreshold,
 		HealthyThreshold: cfg.Health.HealthyThreshold, PassiveHealth: true,
+		ColdStart: cfg.Autoscaling.ColdStartWait > 0, ColdModels: pool.OptionsFromConfig(cfg).ColdModels,
 	}, log)
 	if err != nil {
 		t.Fatal(err)
