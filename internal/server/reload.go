@@ -24,10 +24,13 @@ func (s *Server) Apply(cfg *config.Config) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.state.Store(newState(cfg, old))
+	defer func() { s.audit.Log("config_applied", map[string]any{"changes": changes}) }()
+	s.state.Store(newState(cfg, old, s.client))
 	s.limits.SetLimits(limitsFrom(cfg))
+	s.limits.SetDefaults(userDefaults(cfg))
 	s.retryBudget.set(cfg.Retry.BudgetRatio, cfg.Retry.BudgetMinPerSecond)
-	return append(changes, settingChanges(old.cfg, cfg)...), nil
+	changes = append(changes, settingChanges(old.cfg, cfg)...)
+	return changes, nil
 }
 
 // SetDiscovered replaces the backends found by DNS discovery.
@@ -125,6 +128,7 @@ func settingChanges(old, cfg *config.Config) []string {
 	restart(old.Cluster, cfg.Cluster, "cluster settings")
 	restart(old.Tracing, cfg.Tracing, "tracing settings")
 	restart(old.StateDir, cfg.StateDir, "state_dir")
+	restart(old.Audit, cfg.Audit, "audit settings")
 	changed(old.Logging, cfg.Logging, "updated logging settings")
 	restart([]any{r1.AffinityTTL, r1.AffinityCapacity}, []any{r2.AffinityTTL, r2.AffinityCapacity}, "prefix table size")
 	return out

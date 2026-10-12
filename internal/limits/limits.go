@@ -107,7 +107,11 @@ type Tracker struct {
 	remote  map[string]map[string]Daily // peer -> client -> usage
 	seen    map[string]time.Time        // peer -> when its last report arrived
 	peerTTL time.Duration               // how long a report keeps a peer live
-	now     func() time.Time
+	// defaults are the limits of clients without their own, by name prefix
+	// (e.g. "user:" for every single sign-on user).
+	defaults map[string]Limits
+	explicit map[string]Limits // from SetLimits
+	now      func() time.Time
 }
 
 func New() *Tracker {
@@ -221,19 +225,43 @@ const dayFormat = "2006-01-02"
 func (t *Tracker) SetLimits(byClient map[string]Limits) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.explicit = byClient
 	for name, c := range t.clients {
-		c.limits = byClient[name]
+		c.limits = t.limitsForLocked(name)
 	}
 	for name, l := range byClient {
 		t.clientLocked(name).limits = l
 	}
 }
 
+// SetDefaults sets the limits of clients that have none of their own, by
+// name prefix. Counters are kept.
+func (t *Tracker) SetDefaults(byPrefix map[string]Limits) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.defaults = byPrefix
+	for name, c := range t.clients {
+		c.limits = t.limitsForLocked(name)
+	}
+}
+
+func (t *Tracker) limitsForLocked(name string) Limits {
+	if l, ok := t.explicit[name]; ok {
+		return l
+	}
+	for prefix, l := range t.defaults {
+		if strings.HasPrefix(name, prefix) {
+			return l
+		}
+	}
+	return Limits{}
+}
+
 func (t *Tracker) clientLocked(name string) *client {
 	c, ok := t.clients[name]
 	if !ok {
 		now := t.now()
-		c = &client{refilled: now, day: midnight(now), usage: Usage{Client: name}}
+		c = &client{refilled: now, day: midnight(now), usage: Usage{Client: name}, limits: t.limitsForLocked(name)}
 		c.bucket = math.Inf(1) // full; clamped on first use
 		t.clients[name] = c
 	}

@@ -38,9 +38,100 @@ When admin keys are set, only they can use `/admin/*`: `GET /admin/backends`, `G
 inference. Without admin keys, any client key can use `/admin/*`, which is the old behavior. The router logs
 a warning about this at startup; set admin keys whenever clients aren't fully trusted.
 
-`/metrics`, `/healthz` and `/readyz` stay unauthenticated so Prometheus and load balancers can
-reach them. They expose backend names and counts, not prompts or keys. Restrict them at the
-network level if that matters.
+`/metrics`, `/healthz`, `/readyz` and `/autoscale` stay unauthenticated so Prometheus, load
+balancers and autoscalers can reach them. They expose backend and model names and counts, not
+prompts or keys. Restrict them at the network level if that matters.
+
+## Single sign-on (OIDC / JWT)
+
+People can call the router with their company login instead of a shared API key. Any OpenID
+Connect provider works (Okta, Microsoft Entra ID, Google, Keycloak, Auth0, Dex, Ping), and so
+does anything that issues signed JWTs with a published JWKS.
+
+```yaml
+auth:
+  oidc:
+    issuer: https://login.example.com/realms/acme   # tokens must carry this iss
+    audiences: [siliconrouter]     # ...and this aud (required, so tokens for other apps are refused)
+    user_claim: email              # who the user is (default sub)
+    groups_claim: groups           # their groups; dots reach nested claims (realm_access.roles)
+    admin_groups: [platform-admins]  # may use /admin/*
+    teams:                         # first group that matches wins
+      - group: ml-research
+        name: ml-research          # default: the group name
+        priority: high
+        tokens_per_day: 50000000
+      - group: support-eng
+        name: support
+        models: ["llama-3.1-8b", "support-bot-*"]
+        max_tokens: 2048
+    default_team: oidc             # team of users in none of the groups...
+    require_team: false            # ...or refuse them with 403 no_team
+    user_limits:                   # every user, on their own, on top of the team's limits
+      max_concurrent: 4
+      requests_per_minute: 60
+      tokens_per_day: 2000000
+```
+
+Clients send `Authorization: Bearer <access token>`, the same header OpenAI SDKs use for keys, so
+an app passes the user's token where it used to pass a key. Tokens and API keys work side by side:
+anything shaped like a JWT is checked as a token, and everything else as a key.
+
+What's checked:
+- **The signature**, against the issuer's keys from OIDC discovery (`jwks_url` or `jwks_file`
+  skip discovery). Only RS/PS256-512, ES256-512 and EdDSA are accepted. `none`, HMAC algorithms
+  and RSA keys under 2048 bits are refused.
+- **`iss`, `aud`, `exp` and `nbf`**, with `leeway` (default 60s) for clock skew.
+
+Keys are cached and re-fetched every `jwks_refresh` (default 1h), and also when a token names a
+key ID the router hasn't seen, which is how providers rotate keys. Fetches triggered by tokens are
+limited to one per 30 seconds, so forged tokens can't flood the provider. Verified tokens are
+cached until they expire, so a request costs a hash lookup, not an RSA check. If the provider is
+unreachable at startup, the router logs a warning and keeps trying.
+
+**Teams and users.** A user's team works like a named API key: priority, limits, model allow-list
+and token cap. Usage, cost and rate limits are counted under the team name, so chargeback reports
+stay per team. Each user is also counted and limited on their own as `user:<id>`, so one person
+can't use up their whole team's quota. `/admin/usage` lists both. Prometheus metrics are per team
+only, to keep the number of series bounded. Requests from different users never share
+response-cache entries.
+
+Errors: `401 token_expired`, `401 invalid_token` (with the reason), `403 no_team`, and
+`503 auth_unavailable` when the provider's keys can't be fetched at all.
+
+## Audit log
+
+```yaml
+audit:
+  file: /var/lib/siliconrouter/audit/audit.jsonl   # or "-" for stdout
+  requests: true                   # one entry per inference request (default)
+  max_size_mb: 100                 # rotate to audit.jsonl.1, .2, ...
+  max_files: 10
+```
+
+The audit log is append-only JSON lines. It records:
+- **request**: who (`client` team or key name, `actor` as `user:<id>` or a key fingerprint like
+  `key:3fa2c1d0`), method, path, model, backend, status, attempts, tokens, cost, duration, remote
+  address and trace ID. It never records prompt or response content.
+- **auth_failure**: bad or expired keys and tokens, with the reason and the remote address.
+- **admin**: every `/admin/*` call, including reads, with the actor and the result.
+- **config_applied**: every reload, with what changed.
+- **startup**.
+
+Each entry carries a sequence number and the SHA-256 of the previous entry, and its own hash covers
+both. Editing, deleting or reordering entries breaks the chain. The chain continues across
+rotations and restarts. Check it with:
+
+```bash
+siliconrouter -verify-audit audit.jsonl.2 audit.jsonl.1 audit.jsonl   # oldest first
+# audit log OK: 48211 entries, chain intact
+```
+
+The chain catches edits to some entries. It can't stop someone who can rewrite the whole file from
+writing a whole new chain. Ship the files to write-once storage or your SIEM (Splunk, Elastic,
+Datadog, or anything that tails JSON lines) for that. Write errors are logged and don't fail
+requests. API keys appear only as fingerprints. Admin keys are fingerprinted the same way, so you
+can tell which key did what without the log revealing any key.
 
 ## Maintenance: draining a backend
 

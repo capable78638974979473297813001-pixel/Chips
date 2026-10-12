@@ -33,6 +33,26 @@ auth:
   #     models: ["llama-3.1-8b", "qwen2.5-*"]  # only these models (exact, or prefix*)
   #     max_tokens: 1024             # completion budget cap per request
 
+  # Single sign-on: accept JWT access tokens from your identity provider (docs/OPERATIONS.md).
+  # oidc:
+  #   issuer: https://login.example.com/realms/acme
+  #   audiences: [siliconrouter]
+  #   user_claim: email
+  #   groups_claim: groups
+  #   admin_groups: [platform-admins]
+  #   teams:
+  #     - {group: ml-research, priority: high, tokens_per_day: 50000000}
+  #     - {group: support-eng, name: support, models: ["llama-3.1-8b"]}
+  #   require_team: false
+  #   user_limits: {max_concurrent: 4, requests_per_minute: 60, tokens_per_day: 2000000}
+
+# Tamper-evident log of requests, logins and admin actions (never prompt content).
+# audit:
+#   file: /var/lib/siliconrouter/audit/audit.jsonl   # "-" = stdout
+#   requests: true
+#   max_size_mb: 100
+#   max_files: 10
+
 # Your inference servers. Any HTTP inference API works: OpenAI-style (vLLM, SGLang,
 # llama.cpp, Ollama, LM Studio), Ollama/TGI native, Triton/KServe, and custom services.
 # See docs/COMPATIBILITY.md.

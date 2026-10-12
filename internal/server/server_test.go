@@ -49,6 +49,11 @@ func newFake(t testing.TB, h http.HandlerFunc) *fakeBackend {
 
 func setup(t testing.TB, mutate func(*config.Config), urls ...string) (*httptest.Server, *pool.Pool) {
 	t.Helper()
+	return setupWith(t, mutate, nil, urls...)
+}
+
+func setupWith(t testing.TB, mutate func(*config.Config), out **Server, urls ...string) (*httptest.Server, *pool.Pool) {
+	t.Helper()
 	var sb strings.Builder
 	sb.WriteString("backends:\n")
 	for i, u := range urls {
@@ -73,9 +78,20 @@ func setup(t testing.TB, mutate func(*config.Config), urls ...string) (*httptest
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 256}}
-	ts := httptest.NewServer(New(cfg, p, client, log))
+	srv := New(cfg, p, client, log)
+	if out != nil {
+		*out = srv
+	}
+	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	return ts, p
+}
+
+// setupServer is setup that also returns the Server, and the base URL.
+func setupServer(t testing.TB, mutate func(*config.Config), out **Server, urls ...string) (string, *pool.Pool) {
+	t.Helper()
+	ts, p := setupWith(t, mutate, out, urls...)
+	return ts.URL, p
 }
 
 func chat(t *testing.T, base string, body string, headers ...string) *http.Response {

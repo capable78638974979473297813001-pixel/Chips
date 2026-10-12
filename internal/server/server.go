@@ -5,7 +5,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +24,7 @@ import (
 	"time"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/affinity"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/audit"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cache"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/cluster"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
@@ -32,6 +32,7 @@ import (
 	"github.com/capable78638974979473297813001-pixel/chips/internal/discovery"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/limits"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/metrics"
+	"github.com/capable78638974979473297813001-pixel/chips/internal/oidc"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/prompt"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/tracing"
@@ -65,6 +66,7 @@ type Server struct {
 	costs      *costs.Ledger
 	cluster    *cluster.Node // nil when this router runs alone
 	tracer     *tracing.Tracer
+	audit      *audit.Logger // nil when off
 	client     *http.Client
 	// grpcTransport speaks HTTP/2 (h2c for plaintext) to gRPC backends.
 	grpcTransport *http.Transport
@@ -104,11 +106,12 @@ type state struct {
 	cfg       *config.Config
 	keys      map[string]clientInfo
 	adminKeys []string
-	cache     *cache.Cache // nil when disabled
+	cache     *cache.Cache   // nil when disabled
+	verifier  *oidc.Verifier // nil without auth.oidc
 }
 
-func newState(cfg *config.Config, prev *state) *state {
-	st := &state{cfg: cfg, keys: map[string]clientInfo{}, adminKeys: cfg.Auth.AdminKeys}
+func newState(cfg *config.Config, prev *state, client *http.Client) *state {
+	st := &state{cfg: cfg, keys: map[string]clientInfo{}, adminKeys: cfg.Auth.AdminKeys, verifier: newVerifier(cfg, prev, client)}
 	for _, k := range cfg.Auth.APIKeys {
 		st.keys[k] = clientInfo{key: k, priority: 1}
 	}
@@ -156,10 +159,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"clients": s.limits.Snapshot()})
 }
 
-// clientInfo is who sent a request, from the API key it used.
+// clientInfo is who sent a request, from the API key or token it used.
 type clientInfo struct {
-	name     string
+	name     string // team or key name: limits, usage and costs are counted under it
 	key      string
+	user     string // the single sign-on user, for tokens
+	admin    bool   // the user is in auth.oidc.admin_groups
 	priority int
 	// Policy from the key: the models it may use (all when empty) and its
 	// cap on each request's completion budget (none when 0).
@@ -212,7 +217,8 @@ func New(cfg *config.Config, p *pool.Pool, client *http.Client, log *slog.Logger
 		clientTokens:  reg.NewCounterVec("siliconrouter_client_tokens_total", "Tokens used per client: type is prompt or completion; source is reported (by the backend) or estimated (by the router).", "client", "type", "source"),
 	}
 	s.limits.SetLimits(limitsFrom(cfg))
-	s.state.Store(newState(cfg, nil))
+	s.limits.SetDefaults(userDefaults(cfg))
+	s.state.Store(newState(cfg, nil, client))
 	s.watcher = &discovery.Watcher{
 		Resolver: net.DefaultResolver,
 		Log:      log,
@@ -395,59 +401,6 @@ func (s *Server) RunCluster(ctx context.Context) {
 	}
 }
 
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		st := s.state.Load()
-		if !st.cfg.Auth.Enabled() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if got := clientKey(r.Header); got != "" {
-			// Compare against every key in constant time, so timing does not
-			// reveal how much of a guess was right.
-			var match clientInfo
-			found := false
-			for k, c := range st.keys {
-				if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
-					match, found = c, true
-				}
-			}
-			if found {
-				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientKeyCtx{}, match)))
-				return
-			}
-		}
-		s.rejected.Inc("unauthorized")
-		writeError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-	})
-}
-
-// requireAdmin guards /admin/*: only admin keys when any are configured,
-// otherwise any client key (or nothing, when auth is off).
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	clientAuth := s.requireAuth(next)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		st := s.state.Load()
-		if len(st.adminKeys) == 0 {
-			clientAuth.ServeHTTP(w, r)
-			return
-		}
-		got := clientKey(r.Header)
-		ok := false
-		for _, k := range st.adminKeys {
-			if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
-				ok = true
-			}
-		}
-		if !ok {
-			s.rejected.Inc("unauthorized")
-			writeError(w, http.StatusUnauthorized, "invalid_admin_key", "this endpoint needs an admin key")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // clientKeyHeaders carry a caller's API key: OpenAI-style bearer tokens,
 // Anthropic's x-api-key and Azure OpenAI's api-key.
 var clientKeyHeaders = []string{"Authorization", "X-Api-Key", "Api-Key"}
@@ -559,7 +512,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 	st := s.state.Load()
 	client := clientFrom(r.Context())
 	who := usageName(st, client)
-	release, rejected := s.limits.Admit(who)
+	release, rejected := s.admit(who, client)
 	if rejected != nil {
 		s.rejected.Inc(rejected.Reason)
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(rejected.RetryAfter.Seconds()))))
@@ -868,6 +821,10 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		var in, out int64
 		if resp.StatusCode < 400 {
 			in, out = s.recordUsage(who, path, info, meter, st.cfg.Routing.CharsPerToken)
+			if client.user != "" {
+				s.limits.Record(userName(client.user), in, out, false)
+			}
+			rl.promptTokens, rl.completionTokens = in, out
 		}
 		s.charge(rl, who, lease, in, out)
 		if capture != nil && copyErr == nil && !capture.overflow {
@@ -987,6 +944,9 @@ func cacheable(st *state, r *http.Request, path string, info prompt.Info) bool {
 
 func cacheKeyFor(st *state, r *http.Request, path string, c clientInfo, body []byte) cache.Key {
 	who := c.key
+	if c.user != "" {
+		who = userName(c.user) // single sign-on users never share answers with each other
+	}
 	if st.cfg.Cache.ShareAcrossKeys {
 		who = ""
 	}
@@ -1248,9 +1208,11 @@ type requestLog struct {
 	exactTokens int
 	cost        float64 // dollars charged, over every attempt
 	coldStart   bool    // waited for a backend to start
-	kind        string  // websocket or grpc for passthrough sessions
-	trace       tracing.Context
-	span        tracing.SpanID
+	// Tokens the request used, when it succeeded.
+	promptTokens, completionTokens int64
+	kind                           string // websocket or grpc for passthrough sessions
+	trace                          tracing.Context
+	span                           tracing.SpanID
 }
 
 var priorityNames = [...]string{"low", "normal", "high"}
@@ -1258,6 +1220,7 @@ var priorityNames = [...]string{"low", "normal", "high"}
 func (s *Server) logRequest(l *requestLog, backend string, status, attempts int, cacheHit bool, err error) {
 	elapsed := time.Since(l.start)
 	s.recordRootSpan(l, backend, status, attempts, err, elapsed)
+	s.auditRequest(l, backend, status, attempts, elapsed, err)
 
 	lc := s.conf().Logging
 	routine := status < 400 && err == nil && (lc.SlowRequest == 0 || elapsed < lc.SlowRequest.D())
@@ -1272,6 +1235,9 @@ func (s *Server) logRequest(l *requestLog, backend string, status, attempts int,
 	}
 	if l.client.name != "" {
 		attrs = append(attrs, "client", l.client.name)
+	}
+	if l.client.user != "" {
+		attrs = append(attrs, "user", l.client.user)
 	}
 	if l.fallback != "" {
 		attrs = append(attrs, "fallback", l.fallback)

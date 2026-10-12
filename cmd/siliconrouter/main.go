@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/capable78638974979473297813001-pixel/chips/internal/audit"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/pool"
 	"github.com/capable78638974979473297813001-pixel/chips/internal/server"
@@ -54,9 +55,21 @@ func run() error {
 	logJSON := flag.Bool("log-json", false, "emit JSON logs")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	checkConfig := flag.Bool("check-config", false, "validate the config file (and its environment variables) and exit")
+	verifyAudit := flag.Bool("verify-audit", false, "check the hash chain of the audit log files given as arguments (oldest first) and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
+		return nil
+	}
+	if *verifyAudit {
+		if flag.NArg() == 0 {
+			return errors.New("-verify-audit needs the audit log files, oldest first (e.g. audit.jsonl.2 audit.jsonl.1 audit.jsonl)")
+		}
+		n, err := audit.Verify(flag.Args()...)
+		if err != nil {
+			return fmt.Errorf("audit log check failed after %d good entries: %w", n, err)
+		}
+		fmt.Printf("audit log OK: %d entries, chain intact\n", n)
 		return nil
 	}
 	if *checkConfig {
@@ -115,10 +128,29 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if cfg.Auth.Enabled() && len(cfg.Auth.AdminKeys) == 0 {
-		log.Warn("no admin keys configured: every client key can use /admin/* (see auth.admin_keys)")
+	if cfg.Auth.Enabled() && len(cfg.Auth.AdminKeys) == 0 && len(cfg.Auth.OIDC.AdminGroups) == 0 {
+		log.Warn("no admin keys or admin groups configured: every client can use /admin/* (see auth.admin_keys)")
 	}
 	router := server.New(cfg, p, client, log)
+	if a := cfg.Audit; a.File != "" {
+		al, err := audit.Open(audit.Config{Path: a.File, MaxBytes: int64(a.MaxSizeMB) << 20, MaxFiles: a.MaxFiles})
+		if err != nil {
+			return err
+		}
+		al.OnError = func(err error) { log.Error("audit log write failed", "file", a.File, "error", err) }
+		defer al.Close()
+		router.SetAudit(al)
+		al.Log("startup", map[string]any{"version": version, "config": *configPath})
+		log.Info("audit log", "file", a.File, "requests", a.LogRequests())
+	}
+	if cfg.Auth.OIDC.Enabled() {
+		if err := router.RefreshIdentityKeys(ctx); err != nil {
+			log.Warn("could not fetch the identity provider's signing keys yet; tokens are refused until it answers",
+				"issuer", cfg.Auth.OIDC.Issuer, "error", err)
+		} else {
+			log.Info("single sign-on enabled", "issuer", cfg.Auth.OIDC.Issuer, "teams", len(cfg.Auth.OIDC.Teams))
+		}
+	}
 	router.DiscoverNow(ctx) // discovered backends join the first health checks
 	supervise.Go(ctx, log, "discovery", router.RunDiscovery)
 

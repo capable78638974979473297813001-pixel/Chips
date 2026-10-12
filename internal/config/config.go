@@ -76,6 +76,7 @@ type Config struct {
 	// Autoscaling holds requests while GPU servers start and publishes the
 	// demand autoscalers scale on.
 	Autoscaling Autoscaling `yaml:"autoscaling"`
+	Audit       Audit       `yaml:"audit"`
 }
 
 // Autoscaling: with ColdStartWait set, a request whose model has no
@@ -264,10 +265,76 @@ type Auth struct {
 	// AdminKeys alone may use /admin/*. Without any, every client key can.
 	AdminKeys    []string `yaml:"admin_keys"`
 	AdminKeysEnv string   `yaml:"admin_keys_env"` // comma-separated keys read from this env var
+	// OIDC accepts JWT access tokens from the company's identity provider
+	// (single sign-on) alongside, or instead of, API keys.
+	OIDC OIDC `yaml:"oidc"`
 }
 
-// Enabled reports whether the router requires a key.
-func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 }
+// Enabled reports whether the router requires a key or token.
+func (a Auth) Enabled() bool { return len(a.APIKeys) > 0 || len(a.Keys) > 0 || a.OIDC.Enabled() }
+
+// OIDC: a request with "Authorization: Bearer <JWT>" is let in when the
+// token is signed by Issuer's keys, is for one of Audiences, and is
+// current. The user is the UserClaim; their groups (GroupsClaim) pick the
+// team whose limits and policy apply, and the team is what usage and cost
+// are reported under.
+type OIDC struct {
+	Issuer    string   `yaml:"issuer"`
+	Audiences []string `yaml:"audiences"`
+	JWKSURL   string   `yaml:"jwks_url"`  // instead of OIDC discovery
+	JWKSFile  string   `yaml:"jwks_file"` // keys from a file (air-gapped)
+	// UserClaim names the user (default sub; email or preferred_username
+	// read better in reports). GroupsClaim lists their groups (default
+	// groups; dots reach nested claims, e.g. realm_access.roles).
+	UserClaim   string   `yaml:"user_claim"`
+	GroupsClaim string   `yaml:"groups_claim"`
+	Leeway      Duration `yaml:"leeway"`       // clock skew on exp/nbf; default 60s
+	JWKSRefresh Duration `yaml:"jwks_refresh"` // default 1h
+	// AdminGroups may use /admin/* (as admin keys can).
+	AdminGroups []string `yaml:"admin_groups"`
+	// Teams map groups to a team, checked in order; the first group the
+	// user is in wins.
+	Teams []Team `yaml:"teams"`
+	// DefaultTeam is the team of users in none of Teams (default "oidc"),
+	// unless RequireTeam refuses them.
+	DefaultTeam string `yaml:"default_team"`
+	RequireTeam bool   `yaml:"require_team"`
+	// UserLimits apply to each user on their own, on top of their team's.
+	UserLimits UserLimits `yaml:"user_limits"`
+}
+
+func (o OIDC) Enabled() bool { return o.Issuer != "" || o.JWKSURL != "" || o.JWKSFile != "" }
+
+// Team is the policy for users in Group, like a named API key's.
+type Team struct {
+	Group             string   `yaml:"group"`
+	Name              string   `yaml:"name"` // default: the group
+	Priority          string   `yaml:"priority"`
+	MaxConcurrent     int      `yaml:"max_concurrent"`
+	RequestsPerMinute int      `yaml:"requests_per_minute"`
+	TokensPerDay      int64    `yaml:"tokens_per_day"`
+	Models            []string `yaml:"models"`
+	MaxTokens         int      `yaml:"max_tokens"`
+}
+
+// UserLimits cap each single-sign-on user. Zero means unlimited.
+type UserLimits struct {
+	MaxConcurrent     int   `yaml:"max_concurrent"`
+	RequestsPerMinute int   `yaml:"requests_per_minute"`
+	TokensPerDay      int64 `yaml:"tokens_per_day"`
+}
+
+// Audit writes a tamper-evident log of requests, logins and admin actions.
+type Audit struct {
+	File string `yaml:"file"` // path, or "-" for stdout; empty = off
+	// Requests logs every inference request (who, model, backend, status,
+	// tokens, cost; never content). Default true.
+	Requests  *bool `yaml:"requests"`
+	MaxSizeMB int   `yaml:"max_size_mb"` // rotate past this (default 100)
+	MaxFiles  int   `yaml:"max_files"`   // rotated files kept (default 10)
+}
+
+func (a Audit) LogRequests() bool { return a.Requests == nil || *a.Requests }
 
 // Discovery is a DNS name whose records are backends. Every address (for
 // dns) or target (for srv) becomes a backend named <name>-<host>:<port>,
@@ -613,6 +680,33 @@ func (c *Config) applyDefaults() {
 	if c.Cluster.NodeName == "" {
 		c.Cluster.NodeName, _ = os.Hostname()
 	}
+	o := &c.Auth.OIDC
+	if o.UserClaim == "" {
+		o.UserClaim = "sub"
+	}
+	if o.GroupsClaim == "" {
+		o.GroupsClaim = "groups"
+	}
+	if o.Leeway == 0 {
+		o.Leeway = Duration(time.Minute)
+	}
+	if o.JWKSRefresh == 0 {
+		o.JWKSRefresh = Duration(time.Hour)
+	}
+	if o.DefaultTeam == "" {
+		o.DefaultTeam = "oidc"
+	}
+	for i := range o.Teams {
+		if o.Teams[i].Name == "" {
+			o.Teams[i].Name = o.Teams[i].Group
+		}
+	}
+	if c.Audit.MaxSizeMB == 0 {
+		c.Audit.MaxSizeMB = 100
+	}
+	if c.Audit.MaxFiles == 0 {
+		c.Audit.MaxFiles = 10
+	}
 	as := &c.Autoscaling
 	if as.TargetUtilization == 0 {
 		as.TargetUtilization = 0.8
@@ -738,6 +832,73 @@ func (c *Config) validateDiscovery(backendNames map[string]bool) []error {
 			errs = append(errs, fmt.Errorf("%s: backend.name and the backend urls come from DNS; set name, agent_port and grpc_port instead", where))
 		}
 		errs = append(errs, validateBackend(where+".backend", d.Expand("192.0.2.1", max(d.Port, 1)))...)
+	}
+	return errs
+}
+
+// validateOIDC checks single sign-on settings; keyNames are the named API
+// keys, which share the namespace usage is reported in.
+func (c *Config) validateOIDC(keyNames map[string]bool) []error {
+	o := c.Auth.OIDC
+	if !o.Enabled() {
+		if len(o.Teams) > 0 || len(o.AdminGroups) > 0 {
+			return []error{errors.New("auth.oidc: teams and admin_groups need issuer (or jwks_url/jwks_file)")}
+		}
+		return nil
+	}
+	var errs []error
+	for _, u := range []struct{ name, v string }{{"issuer", o.Issuer}, {"jwks_url", o.JWKSURL}} {
+		if u.v == "" {
+			continue
+		}
+		if pu, err := url.Parse(u.v); err != nil || (pu.Scheme != "https" && pu.Scheme != "http") || pu.Host == "" {
+			errs = append(errs, fmt.Errorf("auth.oidc.%s must be an absolute https URL, got %q", u.name, u.v))
+		}
+	}
+	for n := range keyNames {
+		if strings.HasPrefix(n, "user:") {
+			errs = append(errs, fmt.Errorf("auth.keys: name %q: names starting with user: are reserved for single sign-on users", n))
+		}
+	}
+	if o.Issuer == "" {
+		errs = append(errs, errors.New("auth.oidc.issuer is required: tokens are checked against it"))
+	}
+	if len(o.Audiences) == 0 {
+		errs = append(errs, errors.New("auth.oidc.audiences is required, so tokens issued for other applications are refused"))
+	}
+	if o.Leeway < 0 || o.JWKSRefresh.D() < time.Minute {
+		errs = append(errs, errors.New("auth.oidc: leeway must not be negative and jwks_refresh must be at least 1m"))
+	}
+	if u := o.UserLimits; u.MaxConcurrent < 0 || u.RequestsPerMinute < 0 || u.TokensPerDay < 0 {
+		errs = append(errs, errors.New("auth.oidc.user_limits must not be negative"))
+	}
+	teams := map[string]bool{o.DefaultTeam: true}
+	if keyNames[o.DefaultTeam] {
+		errs = append(errs, fmt.Errorf("auth.oidc.default_team %q is also an API key name", o.DefaultTeam))
+	}
+	for i, t := range o.Teams {
+		where := fmt.Sprintf("auth.oidc.teams[%d]", i)
+		if t.Group == "" {
+			errs = append(errs, fmt.Errorf("%s: group is required", where))
+		}
+		if teams[t.Name] && t.Name != o.DefaultTeam || keyNames[t.Name] {
+			errs = append(errs, fmt.Errorf("%s: name %q is already used by another team or API key", where, t.Name))
+		}
+		teams[t.Name] = true
+		if strings.HasPrefix(t.Name, "user:") {
+			errs = append(errs, fmt.Errorf("%s: names starting with user: are reserved for users", where))
+		}
+		if _, ok := PriorityRank(t.Priority); !ok {
+			errs = append(errs, fmt.Errorf("%s: priority must be high, normal or low, got %q", where, t.Priority))
+		}
+		if t.MaxConcurrent < 0 || t.RequestsPerMinute < 0 || t.TokensPerDay < 0 || t.MaxTokens < 0 {
+			errs = append(errs, fmt.Errorf("%s: limits must not be negative", where))
+		}
+		for _, m := range t.Models {
+			if m == "" || strings.Contains(strings.TrimSuffix(m, "*"), "*") {
+				errs = append(errs, fmt.Errorf("%s: models entry %q must be a model name or a prefix ending in *", where, m))
+			}
+		}
 	}
 	return errs
 }
@@ -868,6 +1029,10 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("%s: models entry %q must be a model name or a prefix ending in *", where, m))
 			}
 		}
+	}
+	errs = append(errs, c.validateOIDC(names)...)
+	if c.Audit.MaxSizeMB < 0 || c.Audit.MaxFiles < 0 {
+		errs = append(errs, errors.New("audit: max_size_mb and max_files must not be negative"))
 	}
 	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
 		errs = append(errs, errors.New("tls: cert_file and key_file must be set together"))
