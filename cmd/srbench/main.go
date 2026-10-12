@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -27,6 +28,7 @@ type message struct {
 
 type result struct {
 	latency      time.Duration
+	ttft         time.Duration // streaming only: time to the first content
 	status       int
 	backend      string
 	promptTokens int
@@ -44,10 +46,17 @@ func main() {
 	systemChars := flag.Int("system-chars", 3000, "length of the shared system prompt")
 	userChars := flag.Int("user-chars", 600, "length of each user message")
 	maxTokens := flag.Int("max-tokens", 48, "completion tokens per turn")
+	models := flag.String("models", "", "comma-separated models (e.g. LoRA adapters) given to conversations in turn; overrides -model")
+	stream := flag.Bool("stream", false, "stream responses and report time to first token")
+	timeout := flag.Duration("timeout", 5*time.Minute, "per-request timeout")
 	flag.Parse()
 
+	names := []string{*model}
+	if *models != "" {
+		names = strings.Split(*models, ",")
+	}
 	system := filler("You are a helpful assistant for ACME Corp. ", *systemChars)
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{Timeout: *timeout}
 	results := make(chan result, *conversations**turns)
 	sem := make(chan struct{}, *concurrency)
 	var wg sync.WaitGroup
@@ -63,7 +72,7 @@ func main() {
 			for t := range *turns {
 				q := fmt.Sprintf("Conversation %d, question %d (%x): ", c, t, rand.Uint32())
 				history = append(history, message{Role: "user", Content: filler(q, *userChars)})
-				res, reply := send(client, *url, *apiKey, *model, history, *maxTokens)
+				res, reply := send(client, *url, *apiKey, names[c%len(names)], history, *maxTokens, *stream)
 				results <- res
 				if res.err != nil {
 					return
@@ -77,21 +86,32 @@ func main() {
 	report(results, time.Since(start))
 }
 
-func send(client *http.Client, url, apiKey, model string, history []message, maxTokens int) (result, string) {
-	body, _ := json.Marshal(map[string]any{"model": model, "messages": history, "max_tokens": maxTokens})
-	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+func send(client *http.Client, url, apiKey, model string, history []message, maxTokens int, stream bool) (result, string) {
+	req := map[string]any{"model": model, "messages": history, "max_tokens": maxTokens}
+	if stream {
+		req["stream"] = true
+		req["stream_options"] = map[string]any{"include_usage": true}
+	}
+	body, _ := json.Marshal(req)
+	hreq, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	hreq.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		hreq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := client.Do(hreq)
 	if err != nil {
 		return result{err: err, latency: time.Since(start)}, ""
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	res := result{latency: time.Since(start), status: resp.StatusCode, backend: resp.Header.Get("X-SiliconRouter-Backend")}
+	res := result{status: resp.StatusCode, backend: resp.Header.Get("X-SiliconRouter-Backend")}
+	var raw []byte
+	if stream && resp.StatusCode == http.StatusOK {
+		raw, res.ttft, err = readEvents(resp.Body, start)
+	} else {
+		raw, err = io.ReadAll(resp.Body)
+	}
+	res.latency = time.Since(start)
 	if res.backend == "" {
 		res.backend = resp.Header.Get("X-Mock-Server")
 	}
@@ -102,6 +122,9 @@ func send(client *http.Client, url, apiKey, model string, history []message, max
 	if resp.StatusCode != http.StatusOK {
 		res.err = fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
 		return res, ""
+	}
+	if stream {
+		return readStream(res, start, raw)
 	}
 	var out struct {
 		Choices []struct {
@@ -123,8 +146,68 @@ func send(client *http.Client, url, apiKey, model string, history []message, max
 	return res, out.Choices[0].Message.Content
 }
 
+// readEvents reads a server-sent event stream to its end, noting when the
+// first content arrived.
+func readEvents(body io.Reader, start time.Time) ([]byte, time.Duration, error) {
+	var raw bytes.Buffer
+	var ttft time.Duration
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if ttft == 0 && bytes.Contains(line, []byte(`"content":"`)) && !bytes.Contains(line, []byte(`"content":""`)) {
+			ttft = time.Since(start)
+		}
+		raw.Write(line)
+		raw.WriteByte('\n')
+	}
+	return raw.Bytes(), ttft, sc.Err()
+}
+
+// readStream assembles a streamed reply and its usage.
+func readStream(res result, start time.Time, raw []byte) (result, string) {
+	var reply strings.Builder
+	done := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			done = true
+			continue
+		}
+		var ev struct {
+			Choices []struct {
+				Delta message `json:"delta"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens        int `json:"prompt_tokens"`
+				PromptTokensDetails struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(data), &ev) != nil {
+			continue
+		}
+		for _, c := range ev.Choices {
+			reply.WriteString(c.Delta.Content)
+		}
+		if ev.Usage != nil {
+			res.promptTokens = ev.Usage.PromptTokens
+			res.cachedTokens = ev.Usage.PromptTokensDetails.CachedTokens
+		}
+	}
+	if !done {
+		res.err = fmt.Errorf("stream ended without [DONE] after %s", time.Since(start).Round(time.Millisecond))
+		return res, ""
+	}
+	return res, reply.String()
+}
+
 func report(results <-chan result, elapsed time.Duration) {
-	var lat []time.Duration
+	var lat, ttfts []time.Duration
 	var ok, failed, promptTok, cachedTok int
 	perBackend := map[string]int{}
 	var firstErr error
@@ -138,19 +221,26 @@ func report(results <-chan result, elapsed time.Duration) {
 		}
 		ok++
 		lat = append(lat, r.latency)
+		if r.ttft > 0 {
+			ttfts = append(ttfts, r.ttft)
+		}
 		promptTok += r.promptTokens
 		cachedTok += r.cachedTokens
 		perBackend[r.backend]++
 	}
-	slices.Sort(lat)
-	pct := func(p float64) time.Duration {
-		if len(lat) == 0 {
+	pct := func(d []time.Duration, p float64) time.Duration {
+		if len(d) == 0 {
 			return 0
 		}
-		return lat[min(len(lat)-1, int(p*float64(len(lat))))]
+		return d[min(len(d)-1, int(p*float64(len(d))))].Round(time.Millisecond)
 	}
+	slices.Sort(lat)
+	slices.Sort(ttfts)
 	fmt.Printf("requests      %d ok, %d failed in %s (%.1f req/s)\n", ok, failed, elapsed.Round(time.Millisecond), float64(ok)/elapsed.Seconds())
-	fmt.Printf("latency       p50 %s  p95 %s  p99 %s\n", pct(.5).Round(time.Millisecond), pct(.95).Round(time.Millisecond), pct(.99).Round(time.Millisecond))
+	fmt.Printf("latency       p50 %s  p95 %s  p99 %s\n", pct(lat, .5), pct(lat, .95), pct(lat, .99))
+	if len(ttfts) > 0 {
+		fmt.Printf("first token   p50 %s  p95 %s  p99 %s\n", pct(ttfts, .5), pct(ttfts, .95), pct(ttfts, .99))
+	}
 	if promptTok > 0 {
 		fmt.Printf("prefix cache  %.1f%% of prompt tokens reused (%d of %d)\n", 100*float64(cachedTok)/float64(promptTok), cachedTok, promptTok)
 	}

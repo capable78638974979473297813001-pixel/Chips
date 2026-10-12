@@ -66,6 +66,8 @@ type Backend struct {
 	discovered map[string]bool
 	// discoveredAt is when discovered was last refreshed.
 	discoveredAt time.Time
+	// agentDevices narrows chipagent's report to this backend's accelerators.
+	agentDevices []string
 	// dynamicLoRA: the engine loads adapters at runtime. adapters records
 	// when this router last loaded or used each adapter here (see lora.go).
 	dynamicLoRA bool
@@ -80,7 +82,10 @@ type Backend struct {
 	// The engine's own load, from its metrics (see EngineScraper).
 	eng      *engine.Stats
 	engUntil time.Time // eng is stale after this
-	engErr   string
+	// engOurs is how many of this router's requests were in flight when
+	// eng was scraped: the engine's count beyond it is other clients' traffic.
+	engOurs int
+	engErr  string
 	// Recent generated-token counts while requests ran, for stall detection.
 	progress []progressSample
 	stalled  bool
@@ -308,6 +313,7 @@ func (b *Backend) setCapacity(cb config.Backend) {
 	b.MaxConcurrency = cb.MaxConcurrency
 	b.MaxContextTokens = cb.MaxContextTokens
 	b.dynamicLoRA = cb.DynamicLoRA
+	b.agentDevices = cb.AgentDevices
 	b.models = map[string]bool{}
 	for _, m := range cb.Models {
 		b.models[m] = true
@@ -853,6 +859,13 @@ func (p *Pool) SetHardware(b *Backend, r *hardware.Report, err error) {
 	if r.Stale && len(r.Devices) == 0 {
 		b.hwErr = "chipagent has no readings yet: " + r.CollectError
 		return // keep what we had
+	}
+	if len(b.agentDevices) > 0 {
+		all := len(r.Devices)
+		if r = r.Only(b.agentDevices); len(r.Devices) == 0 {
+			b.hwErr = fmt.Sprintf("none of the %d devices chipagent reports match agent_devices %v", all, b.agentDevices)
+			return
+		}
 	}
 	b.hw, b.hwErr = r, ""
 	if r.Stale {

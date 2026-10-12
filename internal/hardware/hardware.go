@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/capable78638974979473297813001-pixel/chips/internal/config"
@@ -87,6 +88,22 @@ func (r *Report) Faults() []Device {
 		}
 	}
 	return out
+}
+
+// Only returns a copy of r with just the devices sel names, by index or id
+// (ids compare without regard to case).
+func (r *Report) Only(sel []string) *Report {
+	out := *r
+	out.Devices = nil
+	for _, d := range r.Devices {
+		for _, s := range sel {
+			if s == strconv.Itoa(d.Index) || (d.ID != "" && strings.EqualFold(s, d.ID)) {
+				out.Devices = append(out.Devices, d)
+				break
+			}
+		}
+	}
+	return &out
 }
 
 // Accelerators are the devices that count as AI capacity.

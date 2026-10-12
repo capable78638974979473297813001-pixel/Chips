@@ -149,6 +149,19 @@ backends:
 `agent_url` also works with a fixed tier: you get the inventory, metrics and the busy-GPU
 tie-break, and your tier is kept.
 
+**One engine per GPU.** chipagent reports every accelerator on the machine. When a machine runs a
+separate engine on each GPU, give each backend its own with `agent_devices`, by index or id (an
+NVIDIA GPU's UUID, as `nvidia-smi -L` shows it). Each backend is then tiered by its own GPU's
+memory, not the machine's total, and a failed GPU takes only the engine on it out of rotation:
+
+```yaml
+  - {name: node-4-gpu0, url: http://10.0.0.14:8000, agent_url: http://10.0.0.14:9400, agent_devices: ["0"], tier: auto}
+  - {name: node-4-gpu1, url: http://10.0.0.14:8001, agent_url: http://10.0.0.14:9400, agent_devices: ["1"], tier: auto}
+```
+
+chipagent numbers NVIDIA GPUs in PCI bus order, like `nvidia-smi`. CUDA's default order can differ,
+so start engines with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, or select GPUs by UUID in both places.
+
 ### How `tier: auto` decides
 
 From the total accelerator memory on the node (summed across GPUs):

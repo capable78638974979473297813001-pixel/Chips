@@ -261,5 +261,6 @@ turned away. Requests of equal priority never displace each other.
 | `health_path` | the engine's own health endpoint |
 | `api_key_env`, `api_key_header` | the backend's credentials, and the header they go in |
 | `agent_url` | chipagent on the machine, for hardware tiers and telemetry |
+| `agent_devices` | the machine's GPUs this backend uses, when each GPU runs its own engine |
 
 Everything else is in [`examples/siliconrouter.yaml`](../examples/siliconrouter.yaml), with defaults.
