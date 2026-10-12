@@ -235,9 +235,12 @@ the C++ standard library and POSIX; it needs no CUDA, ROCm or vendor SDK to buil
 
 ## Status and roadmap
 
-Tested on real hardware so far: an NVIDIA RTX 4090 and an AMD MI300X, behind one router. The
-results, including the three bugs the run found and fixed, are in
-[docs/VALIDATION.md](docs/VALIDATION.md).
+Tested on real hardware so far: an NVIDIA RTX 4090 and an AMD MI300X behind one router, then two
+RTX 4090s with a 7B model and two A100s with a 32B model, one engine per GPU. On those, routing on
+the prefix cache gave 41–57% more throughput than routing on load alone, which was no faster than
+one GPU. A killed engine cost only the streams it was generating, a hung one was taken out of
+rotation, and LoRA-aware routing gave 33–41% more throughput. The results, and the seven bugs the
+runs found and fixed, are in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's built, what's next, and how the open-source and
 commercial editions split.
