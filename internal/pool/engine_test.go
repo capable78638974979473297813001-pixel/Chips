@@ -62,13 +62,13 @@ func TestSaturatedPrefixHolderIsSkipped(t *testing.T) {
 	p := newPool(t, Options{KVSaturated: 0.9, AffinityMaxImbalance: 1}, withMetrics(be("a", config.TierStandard, 8)), withMetrics(be("b", config.TierStandard, 8)))
 	a, b := p.Backends()[0], p.Backends()[1]
 	p.SetEngine(b, engine.Stats{Engine: "vllm", Running: 0, KVUsage: 0.5}, nil)
-	if l := acquire(t, p, Request{Preferred: "b"}); l.Backend != b || !l.Affinity {
+	if l := acquire(t, p, Request{Preferred: []string{"b"}}); l.Backend != b || !l.Affinity {
 		t.Fatalf("control: prefix holder not used")
 	} else {
 		l.Release()
 	}
 	p.SetEngine(b, engine.Stats{Engine: "vllm", Running: 0, KVUsage: 0.93}, nil)
-	if l := acquire(t, p, Request{Preferred: "b"}); l.Backend != a {
+	if l := acquire(t, p, Request{Preferred: []string{"b"}}); l.Backend != a {
 		t.Errorf("saturated prefix holder %s still chosen", l.Backend.Name)
 	}
 }

@@ -11,8 +11,8 @@ import (
 // (vLLM's --max-loras) are full, evicting another adapter that requests
 // then wait for. So a request for an adapter prefers:
 //
-//  1. a backend that has the adapter loaded, unless it is much busier than
-//     the least busy alternative (routing.affinity_max_imbalance);
+//  1. a backend that has the adapter loaded, or is loading it, unless it is
+//     much busier than the least busy alternative (routing.affinity_max_imbalance);
 //  2. a backend with a free adapter slot;
 //  3. any other backend that can serve it.
 //
@@ -57,7 +57,7 @@ func (p *Pool) loraCandidatesLocked(free []*Backend, adapter string, loads map[*
 	minLoaded := 2.0
 	for _, b := range free {
 		switch {
-		case b.hasAdapterLocked(adapter, now):
+		case b.hasAdapterLocked(adapter, now) || b.loading[adapter] > 0:
 			loaded = append(loaded, b)
 			minLoaded = min(minLoaded, loads[b])
 		case b.adapterRoomLocked(now):
@@ -82,6 +82,19 @@ func (p *Pool) NoteAdapter(b *Backend, adapter string) {
 		b.adapters = map[string]time.Time{}
 	}
 	b.adapters[adapter] = time.Now()
+}
+
+// AdapterLoadDone ends a load of adapter on b that a lease with NeedsLoad
+// started. Requests for the adapter that arrive during the load go to b as
+// if it had the adapter, and wait for the same load, instead of each
+// loading it on another backend. A successful load is noted separately
+// (NoteAdapter).
+func (p *Pool) AdapterLoadDone(b *Backend, adapter string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if b.loading[adapter]--; b.loading[adapter] <= 0 {
+		delete(b.loading, adapter)
+	}
 }
 
 // knownAdaptersLocked lists the adapters b is known to have loaded, of

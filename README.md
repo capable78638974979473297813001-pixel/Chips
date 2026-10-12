@@ -185,8 +185,10 @@ For each request, the router:
    engines use for their own caches.
 2. Filters to backends that are healthy, serve that model, have room for the context, and haven't
    already failed this request.
-3. **Cache first:** if a backend recently served the longest matching prefix and has a free slot,
-   it gets the request, unless it is much busier than the alternatives (`affinity_max_imbalance`).
+3. **Cache first:** if backends recently served the longest matching prefix and have a free slot,
+   the least busy of them gets the request, unless it is much busier than the alternatives
+   (`affinity_max_imbalance`). A prefix remembers up to four backends, so a system prompt every
+   conversation shares doesn't pin all new conversations to one server.
 4. **Then hardware fit:** large prompts try `heavy → standard → light → reserve`; small prompts try
    `light → standard → heavy → reserve`. Within a tier, the least utilized backend wins; on a tie,
    the node whose accelerators chipagent reports as less busy wins.

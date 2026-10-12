@@ -72,10 +72,12 @@ type Backend struct {
 	// when this router last loaded or used each adapter here (see lora.go).
 	dynamicLoRA bool
 	adapters    map[string]time.Time
-	lastErr     string
-	hw          *hardware.Report
-	hwErr       string
-	hwFault     bool // chipagent reports a failed accelerator: no new work
+	// loading counts this router's loads of each adapter in progress here.
+	loading map[string]int
+	lastErr string
+	hw      *hardware.Report
+	hwErr   string
+	hwFault bool // chipagent reports a failed accelerator: no new work
 	// ttft is a moving average of time to first token on streaming
 	// requests, in seconds (0 = no samples yet).
 	ttft float64
@@ -101,8 +103,9 @@ type Request struct {
 	Model        string
 	PromptTokens int
 	MaxTokens    int
-	// Preferred names the backend believed to hold this prompt's prefix in cache.
-	Preferred string
+	// Preferred names the backends believed to hold this prompt's longest
+	// cached prefix.
+	Preferred []string
 	// Exclude lists backends that already failed this request.
 	Exclude map[string]bool
 	// GRPC requires a backend with a gRPC endpoint.
@@ -124,7 +127,7 @@ type Request struct {
 // when the upstream response is finished; extra calls are ignored.
 type Lease struct {
 	Backend *Backend
-	// Affinity is true when the request went to its Preferred backend.
+	// Affinity is true when the request went to one of its Preferred backends.
 	Affinity bool
 	// Waited is how long the request queued for the slot.
 	Waited time.Duration
@@ -537,6 +540,12 @@ func (p *Pool) grantLocked(b *Backend, r Request, affinity bool, start time.Time
 	if r.Base != "" {
 		l.AdapterLoaded = b.hasAdapterLocked(r.Model, now)
 		l.NeedsLoad = !l.AdapterLoaded && b.dynamicLoRA
+		if l.NeedsLoad { // until it finishes, more requests for it come here too
+			if b.loading == nil {
+				b.loading = map[string]int{}
+			}
+			b.loading[r.Model]++
+		}
 	}
 	return l
 }
@@ -710,12 +719,19 @@ func (p *Pool) pick(r Request) (*Backend, bool, error) {
 		loads[b] = b.load(now)
 		minLoad = min(minLoad, loads[b])
 	}
-	if r.Preferred != "" {
+	// The least busy backend holding the prefix, since a prefix many requests
+	// share, like a system prompt, is cached on several; on a tie, the one
+	// that served it last, as the likeliest to still have it.
+	var holder *Backend
+	for _, name := range r.Preferred {
 		for _, b := range free {
-			if b.Name == r.Preferred && loads[b] <= minLoad+p.opts.AffinityMaxImbalance {
-				return b, true, nil
+			if b.Name == name && (holder == nil || loads[b] < loads[holder]) {
+				holder = b
 			}
 		}
+	}
+	if holder != nil && loads[holder] <= minLoad+p.opts.AffinityMaxImbalance {
+		return holder, true, nil
 	}
 	if r.Base != "" {
 		free = p.loraCandidatesLocked(free, r.Model, loads, minLoad, now)

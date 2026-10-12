@@ -206,7 +206,9 @@ func (g gatewayPicker) Pick(ctx context.Context, r *extproc.Request) extproc.Dec
 		s.queueWait.Observe(lease.Waited.Seconds())
 		b := lease.Backend
 		if lease.NeedsLoad {
-			if err := s.loadAdapter(ctx, b, adapter); err != nil {
+			err := s.loadAdapter(ctx, b, adapter)
+			s.pool.AdapterLoadDone(b, adapter.Name)
+			if err != nil {
 				lease.Release()
 				s.loraRouting.Inc("load_failed")
 				lastErr = fmt.Sprintf("%s: load LoRA adapter %s: %v", b.Name, adapter.Name, err)
@@ -272,7 +274,7 @@ func (x *gatewayExchange) ResponseHeaders(status int, h http.Header) {
 		switch {
 		case x.lease.Affinity:
 			s.cacheLookups.Inc("hit")
-		case x.req.Preferred != "":
+		case len(x.req.Preferred) > 0:
 			s.cacheLookups.Inc("rebalanced")
 		default:
 			s.cacheLookups.Inc("miss")

@@ -102,6 +102,33 @@ func TestLoadsAdapterOnDemandOnce(t *testing.T) {
 	}
 }
 
+// Concurrent first requests for an adapter on several backends all go to
+// the backend loading it, instead of each loading it on another backend. On
+// real GPUs a burst like this used to load every adapter everywhere.
+func TestConcurrentFirstRequestsShareOneBackend(t *testing.T) {
+	a, b := newLoRAFake(t, false), newLoRAFake(t, false)
+	ts, _ := setup(t, func(c *config.Config) {
+		loraConfig(c)
+		for i := range c.Backends { // room enough that load never outweighs the adapter
+			c.Backends[i].MaxConcurrency = 16
+		}
+	}, a.URL, b.URL)
+	var wg sync.WaitGroup
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if resp := chat(t, ts.URL, `{"model":"support","messages":[{"role":"user","content":"hi"}]}`); resp.StatusCode != 200 {
+				t.Errorf("status %d", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := a.loads.Load() + b.loads.Load(); n != 1 {
+		t.Errorf("adapter loaded %d times (a %d, b %d), want once", n, a.loads.Load(), b.loads.Load())
+	}
+}
+
 func TestAdapterLoadFailureTriesAnotherBackend(t *testing.T) {
 	bad, good := newLoRAFake(t, true), newLoRAFake(t, false)
 	ts, _ := setup(t, loraConfig, bad.URL, good.URL)
